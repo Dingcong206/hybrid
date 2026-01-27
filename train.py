@@ -116,52 +116,75 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_loss = 0
+
         for specs, labels in train_loader:
             specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+
             optimizer.zero_grad()
             logits = model(specs)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+
             train_loss += loss.item()
 
         scheduler.step()
 
-        # 验证与寻找最佳阈值
+        # ================= 验证 =================
         model.eval()
-        all_labels, all_probs = [], []
+        all_labels, all_probs, all_preds = [], [], []
+
         with torch.no_grad():
             for specs, labels in val_loader:
-                specs, labels = specs.to(DEVICE), labels.to(DEVICE)
-                probs = torch.sigmoid(model(specs))
+                specs = specs.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                logits = model(specs)
+                probs = torch.sigmoid(logits)
+
                 all_labels.extend(labels.cpu().numpy())
                 all_probs.extend(probs.cpu().numpy())
+                all_preds.extend((probs > 0.5).cpu().numpy())
 
-        # 在验证集寻找最佳 ICBHI 阈值
-        best_thr_score = 0
-        final_m = None
-        for thr in np.arange(0.3, 0.7, 0.05):
-            m = compute_metrics(all_labels, [1 if p > thr else 0 for p in all_probs], all_probs)
-            if m["icbhi"] > best_thr_score:
-                best_thr_score = m["icbhi"]
-                final_m = m
+        # ===== 计算指标 =====
+        acc = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds)
+        auc = roc_auc_score(all_labels, all_probs)
+
+        cm = confusion_matrix(all_labels, all_preds)
+        tn, fp, fn, tp = cm.ravel()
+
+        se = tp / (tp + fn + 1e-8)
+        sp = tn / (tn + fp + 1e-8)
+        icbhi = (se + sp) / 2
 
         print(
-            f"Epoch {epoch} | Loss: {train_loss / len(train_loader):.4f} | ICBHI: {final_m['icbhi']:.4f} (SE:{final_m['se']:.4f} SP:{final_m['sp']:.4f})")
+            f"\nEpoch [{epoch}/{EPOCHS}] "
+            f"Loss: {train_loss / len(train_loader):.4f}\n"
+            f"ACC: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}\n"
+            f"SE: {se:.4f} | SP: {sp:.4f} | ICBHI: {icbhi:.4f}"
+        )
 
-        if final_m["icbhi"] > best_icbhi:
-            best_icbhi = final_m["icbhi"]
+        # ===== 保存最优模型 =====
+        if icbhi > best_icbhi:
+            best_icbhi = icbhi
             torch.save(model.state_dict(), BEST_CKPT_PATH)
-            # 保存混淆矩阵图
+
+            # 保存混淆矩阵
             plt.figure(figsize=(6, 5))
-            sns.heatmap(final_m["cm"], annot=True, fmt="d", cmap="Blues")
-            plt.title(f"Best ICBHI: {best_icbhi:.4f}")
+            sns.heatmap(
+                cm,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                xticklabels=["Normal", "Abnormal"],
+                yticklabels=["Normal", "Abnormal"]
+            )
+            plt.title(f"Best ICBHI = {best_icbhi:.4f}")
+            plt.xlabel("Predicted")
+            plt.ylabel("Ground Truth")
+            plt.tight_layout()
             plt.savefig(CM_BEST_PATH)
             plt.close()
-            print(f"⭐ 新纪录已保存")
 
-    print(f"训练完成! 最高分: {best_icbhi:.4f}")
-
-
-if __name__ == "__main__":
-    main()
+            print("⭐ 新最优模型已保存")
