@@ -1,4 +1,6 @@
 import os
+import re
+import random
 import numpy as np
 import pandas as pd
 
@@ -7,30 +9,60 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, roc_auc_score
 
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# ================= 配置区 (与 VimA 保持一致) =================
-BASE_DIR = "/data/dingcong/hybrid"
+# ================= 配置区 (与 VimA 脚本完全对齐) =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "metadata.csv")
 NPY_DIR = os.path.join(BASE_DIR, "spec_npy_v2")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 64
+BATCH_SIZE = 32  # patch_time=1 会增加内存压力，建议 32
 EPOCHS = 50
 LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.05
+
+PATIENT_PARSE_REGEX = r"^(\d+)"
+BEST_CKPT_PATH = os.path.join(BASE_DIR, "best_bilstm_patient_split.pth")
 
 
-# ================= 1. Bi-LSTM 模型架构 =================
+# ================= 1. 数据增强与工具 =================
+def apply_spec_augment(spec, max_f=15, max_t=50):
+    f = random.randint(0, max_f)
+    f0 = random.randint(0, 128 - f)
+    spec[f0:f0 + f, :] = 0
+    t = random.randint(0, max_t)
+    t0 = random.randint(0, 1024 - t)
+    spec[:, t0:t0 + t] = 0
+    return spec
+
+
+def safe_div(a, b):
+    return float(a) / float(b) if b != 0 else 0.0
+
+
+def compute_metrics(y_true, y_pred, y_prob):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    se = safe_div(tp, tp + fn)
+    sp = safe_div(tn, tn + fp)
+    return {"acc": accuracy_score(y_true, y_pred), "se": se, "sp": sp, "icbhi": (se + sp) / 2,
+            "auc": roc_auc_score(y_true, y_prob), "cm": cm}
+
+
+# ================= 2. Bi-LSTM 模型架构 =================
 class BiLSTMBaseline(nn.Module):
-    def __init__(self, num_classes=1, d_model=128, n_layers=3, freq_bins=128, patch_time=4):
+    def __init__(self, num_classes=1, d_model=128, n_layers=3, freq_bins=128, patch_time=1):
         super().__init__()
-        # Stem：条带卷积
+        # 必须使用 patch_time=1 才能和 VimA 对齐输入的序列长度 (L=1024)
         self.proj = nn.Conv2d(1, d_model, kernel_size=(freq_bins, patch_time), stride=(freq_bins, patch_time))
         self.norm = nn.LayerNorm(d_model)
 
-        # Bi-LSTM
         self.lstm = nn.LSTM(
             input_size=d_model,
             hidden_size=d_model,
@@ -40,7 +72,6 @@ class BiLSTMBaseline(nn.Module):
             dropout=0.2 if n_layers > 1 else 0.0
         )
 
-        # 分类头
         self.head = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
@@ -49,21 +80,19 @@ class BiLSTMBaseline(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, 1, 128, 1024]
-        x = self.proj(x)                    # [B, d_model, 1, L]
-        x = x.flatten(2).transpose(1, 2)    # [B, L, d_model]
+        x = self.proj(x).flatten(2).transpose(1, 2)  # [B, L, d_model]
         x = self.norm(x)
+        lstm_out, _ = self.lstm(x)
+        out = torch.mean(lstm_out, dim=1)  # 全局平均池化
+        return self.head(out).squeeze(-1)
 
-        lstm_out, _ = self.lstm(x)          # [B, L, 2*d_model]
-        out = torch.mean(lstm_out, dim=1)   # [B, 2*d_model]
-        return self.head(out).squeeze(-1)   # [B]
 
-
-# ================= 2. 数据处理 (Dataset) =================
+# ================= 3. 数据处理 (Dataset) =================
 class ICBHIDataset(Dataset):
-    def __init__(self, df, npy_dir):
+    def __init__(self, df, npy_dir, is_train=False):
         self.df = df.reset_index(drop=True)
         self.npy_dir = npy_dir
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.df)
@@ -71,132 +100,82 @@ class ICBHIDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         npy_path = os.path.join(self.npy_dir, row["wav_name"].replace(".wav", ".npy"))
-        spec = np.load(npy_path)  # 期望 (128, 1024)
-        spec_t = torch.from_numpy(spec).float().unsqueeze(0)  # [1, 128, 1024]
-        label = torch.tensor(row["label"], dtype=torch.float)  # 0/1
+        spec = np.load(npy_path)
+        if self.is_train:
+            spec = apply_spec_augment(spec)
+        spec_t = torch.from_numpy(spec).float().unsqueeze(0)
+        label = torch.tensor(row["label"], dtype=torch.float)
         return spec_t, label
-
-
-# ================= 3. 指标计算 =================
-def safe_div(a, b):
-    return float(a) / float(b) if b != 0 else 0.0
-
-def compute_metrics(y_true, y_pred, y_prob):
-    """
-    y_true: list/np (0/1)
-    y_pred: list/np (0/1)
-    y_prob: list/np ([0,1])
-    """
-    y_true = np.asarray(y_true).astype(int)
-    y_pred = np.asarray(y_pred).astype(int)
-    y_prob = np.asarray(y_prob).astype(float)
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-
-    se = safe_div(tp, tp + fn)
-    sp = safe_div(tn, tn + fp)
-    icbhi = (se + sp) / 2.0
-
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    try:
-        auc = roc_auc_score(y_true, y_prob)
-    except ValueError:
-        # 验证集如果只出现一个类别，AUC无法定义
-        auc = float("nan")
-
-    return acc, f1, auc, se, sp, icbhi, cm, (tn, fp, fn, tp)
 
 
 # ================= 4. 主训练逻辑 =================
 def train():
     df = pd.read_csv(CSV_PATH)
-    train_df, val_df = train_test_split(
-        df, test_size=0.2, random_state=42, stratify=df["label"]
-    )
+    # 提取 Patient ID
+    df["patient_id"] = df["original_file"].apply(
+        lambda x: re.match(PATIENT_PARSE_REGEX, str(x)).group(1) if re.match(PATIENT_PARSE_REGEX, str(x)) else str(x))
 
-    train_loader = DataLoader(
-        ICBHIDataset(train_df, NPY_DIR),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        ICBHIDataset(val_df, NPY_DIR),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    # Patient Split (必须保持 random_state=42)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, val_idx = next(gss.split(df, groups=df["patient_id"]))
+    train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
 
-    model = BiLSTMBaseline().to(DEVICE)
+    train_loader = DataLoader(ICBHIDataset(train_df, NPY_DIR, is_train=True), batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4)
+    val_loader = DataLoader(ICBHIDataset(val_df, NPY_DIR, is_train=False), batch_size=BATCH_SIZE, num_workers=4)
 
-    # 若你确定平衡，可保持 1.0；否则建议用：pos_weight = neg/pos
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=DEVICE))
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    model = BiLSTMBaseline(patch_time=1).to(DEVICE)
 
-    print(f"Device: {DEVICE}")
-    print(f"开始训练 Bi-LSTM Baseline (样本数: {len(df)})...")
+    # 自动权重计算
+    pos = (train_df["label"] == 1).sum()
+    neg = (train_df["label"] == 0).sum()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg / pos], device=DEVICE))
 
-    best_score = -1.0
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    print(f"开始训练 Bi-LSTM Patient-Split 版...")
+    best_icbhi = -1.0
 
     for epoch in range(1, EPOCHS + 1):
-        # ---- Train ----
         model.train()
-        running_loss = 0.0
-        n_batches = 0
-
+        train_loss = 0.0
         for specs, labels in train_loader:
-            specs = specs.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(specs)
-            loss = criterion(logits, labels)
+            specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(specs), labels)
             loss.backward()
             optimizer.step()
+            train_loss += loss.item()
+        scheduler.step()
 
-            running_loss += loss.item()
-            n_batches += 1
-
-        train_loss = running_loss / max(n_batches, 1)
-
-        # ---- Val ----
+        # 验证 + 阈值搜索
         model.eval()
-        all_labels, all_probs, all_preds = [], [], []
-
+        all_labels, all_probs = [], []
         with torch.no_grad():
             for specs, labels in val_loader:
-                specs = specs.to(DEVICE, non_blocking=True)
-                labels = labels.to(DEVICE, non_blocking=True)
+                specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+                probs = torch.sigmoid(model(specs))
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
 
-                logits = model(specs)
-                probs = torch.sigmoid(logits)
+        best_thr_score = -1.0
+        final_m = None
+        for thr in np.arange(0.3, 0.7, 0.05):
+            m = compute_metrics(all_labels, [1 if p > thr else 0 for p in all_probs], all_probs)
+            if m["icbhi"] > best_thr_score:
+                best_thr_score = m["icbhi"]
+                final_m = m
 
-                all_labels.extend(labels.cpu().numpy().tolist())
-                all_probs.extend(probs.cpu().numpy().tolist())
-                all_preds.extend((probs > 0.5).long().cpu().numpy().tolist())
+        print(
+            f"Epoch {epoch} | Loss: {train_loss / len(train_loader):.4f} | ICBHI: {final_m['icbhi']:.4f} (SE:{final_m['se']:.4f} SP:{final_m['sp']:.4f})")
 
-        acc, f1, auc, se, sp, score, cm, (tn, fp, fn, tp) = compute_metrics(
-            all_labels, all_preds, all_probs
-        )
+        if final_m["icbhi"] > best_icbhi:
+            best_icbhi = final_m["icbhi"]
+            torch.save(model.state_dict(), BEST_CKPT_PATH)
+            print("⭐ 发现新纪录")
 
-        print(f"\n--- Epoch [{epoch}/{EPOCHS}] ---")
-        print(f"Train Loss: {train_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Validation: ACC: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
-        print(f"            SE: {se:.4f} | SP: {sp:.4f} | ICBHI Score: {score:.4f}")
-        print(f"Confusion Matrix:\n{cm}")
-        print(f"(TN={tn}, FP={fp}, FN={fn}, TP={tp})")
-
-        if score > best_score:
-            best_score = score
-            torch.save(model.state_dict(), "best_bilstm_baseline.pth")
-            print(f"⭐ 发现更高 ICBHI Score ({best_score:.4f}) 的模型，已保存权重！")
-
-    print(f"\n🏆 Bi-LSTM 最高 ICBHI Score: {best_score:.4f}")
+    print(f"\n🏆 Bi-LSTM 最高 ICBHI Score: {best_icbhi:.4f}")
 
 
 if __name__ == "__main__":
