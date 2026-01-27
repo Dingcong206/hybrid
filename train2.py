@@ -225,3 +225,5 @@ def main():
             plt.close()
 
             print("⭐ 新最优模型已保存")
+if __name__ == "__main__":
+    main()
