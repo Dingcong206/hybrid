@@ -6,6 +6,9 @@ import pandas as pd
 import os
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, confusion_matrix, recall_score
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # 导入你刚才准备好的模型文件
 from VimA_Model import VimAHybrid
@@ -80,20 +83,53 @@ for epoch in range(EPOCHS):
 
     # 验证环节
     model.eval()
-    correct, total = 0, 0
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
     with torch.no_grad():
         for specs, labels in val_loader:
             specs, labels = specs.to(DEVICE), labels.to(DEVICE)
-            outputs = torch.sigmoid(model(specs))
-            preds = (outputs > 0.5).float()
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
 
-    val_acc = correct / total
-    print(f"Epoch [{epoch + 1}/{EPOCHS}] Loss: {train_loss / len(train_loader):.4f} Val Acc: {val_acc:.4f}")
+            logits = model(specs)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
 
-    # 保存最优模型
-    if val_acc > best_acc:
-        best_acc = val_acc
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    # 计算各项指标
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_probs)
+
+    # 混淆矩阵 (tn, fp, fn, tp)
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
+
+    # 计算 SE (Sensitivity / Recall) 和 SP (Specificity)
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0  # 灵敏度（真阳率）
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0  # 特异度（真阴率）
+    icbhi_score = (se + sp) / 2
+
+    print(f"\n--- Epoch [{epoch + 1}] 详细评估 ---")
+    print(f"ACC: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
+    print(f"SE (Sensitivity): {se:.4f} | SP (Specificity): {sp:.4f}")
+    print(f"ICBHI Score: {icbhi_score:.4f}")
+
+    # 如果是最后一个 Epoch，保存混淆矩阵图片
+    if epoch == EPOCHS - 1:
+        cm = confusion_matrix(all_labels, all_preds)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title(f'Confusion Matrix - Epoch {epoch + 1}')
+        plt.savefig('confusion_matrix.png')
+        print("📊 混淆矩阵图已保存至 confusion_matrix.png")
+
+    # 根据 ICBHI Score 保存模型（比只看 Acc 更科学）
+    if icbhi_score > best_acc:
+        best_acc = icbhi_score
         torch.save(model.state_dict(), "best_vima_model.pth")
-        print("⭐ 发现更好的模型，已保存权重！")
+        print("⭐ 发现更高 ICBHI 分数的模型，已保存！")
