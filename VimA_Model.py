@@ -105,3 +105,20 @@ class VimAHybrid(nn.Module):
         x = self.norm(x)
         x = x.mean(dim=1)  # 全局平均池化
         return self.head(x).squeeze(-1)  # 输出用于 BCE 损失
+
+if __name__ == "__main__":
+        # 1. 模拟一个批次的音频输入 [Batch, Channel, Freq, Time]
+        # 对应你生成的 (128, 1024) 频谱图
+        mock_input = torch.randn(2, 1, 128, 1024)
+
+        # 2. 实例化模型
+        model = VimAHybrid(num_classes=1, d_model=192, patch_time=4)
+
+        # 3. 前向传播
+        try:
+            output = model(mock_input)
+            print(f"✅ 模型测试成功！")
+            print(f"输入形状: {mock_input.shape}")
+            print(f"输出形状: {output.shape}")  # 应该是 [2]
+        except Exception as e:
+            print(f"❌ 模型运行出错: {e}")
