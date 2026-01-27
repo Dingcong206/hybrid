@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, roc_auc_score
@@ -15,202 +15,248 @@ from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, roc_auc_
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ================= 配置区 (与 VimA 脚本完全对齐) =================
+from SSSA import VimAHybrid
+
+# =========================
+# 基本配置
+# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "metadata.csv")
 NPY_DIR = os.path.join(BASE_DIR, "spec_npy_v2")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 32  # patch_time=1 会增加内存压力，建议 32
+
+BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 1e-4
+LR = 1e-4
 WEIGHT_DECAY = 0.05
 
-PATIENT_PARSE_REGEX = r"^(\d+)"
-BEST_CKPT_PATH = os.path.join(BASE_DIR, "best_bilstm_patient_split.pth")
+BEST_MODEL_PATH = os.path.join(BASE_DIR, "best_vima_patient.pth")
+CM_SAVE_PATH = os.path.join(BASE_DIR, "confusion_matrix_best.png")
 
+PATIENT_REGEX = r"^(\d+)"
 
-# ================= 1. 数据增强与工具 =================
-def apply_spec_augment(spec, max_f=15, max_t=50):
-    f = random.randint(0, max_f)
-    f0 = random.randint(0, 128 - f)
-    spec[f0:f0 + f, :] = 0
-    t = random.randint(0, max_t)
-    t0 = random.randint(0, 1024 - t)
-    spec[:, t0:t0 + t] = 0
-    return spec
-
-
-def safe_div(a, b):
-    return float(a) / float(b) if b != 0 else 0.0
-
-
-def compute_metrics(y_true, y_pred, y_prob):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-    se = safe_div(tp, tp + fn)
-    sp = safe_div(tn, tn + fp)
-    return {"acc": accuracy_score(y_true, y_pred), "se": se, "sp": sp, "icbhi": (se + sp) / 2,
-            "auc": roc_auc_score(y_true, y_prob), "cm": cm}
-
-
-# ================= 2. Bi-LSTM 模型架构 =================
-class BiLSTMBaseline(nn.Module):
-    def __init__(self, num_classes=1, d_model=128, n_layers=3, freq_bins=128, patch_time=1):
-        super().__init__()
-        # 必须使用 patch_time=1 才能和 VimA 对齐输入的序列长度 (L=1024)
-        self.proj = nn.Conv2d(1, d_model, kernel_size=(freq_bins, patch_time), stride=(freq_bins, patch_time))
-        self.norm = nn.LayerNorm(d_model)
-
-        self.lstm = nn.LSTM(
-            input_size=d_model,
-            hidden_size=d_model,
-            num_layers=n_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2 if n_layers > 1 else 0.0
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(d_model, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)  # [B, L, d_model]
-        x = self.norm(x)
-        lstm_out, _ = self.lstm(x)
-        out = torch.mean(lstm_out, dim=1)  # 全局平均池化
-        return self.head(out).squeeze(-1)
-
-
-# ================= 3. 数据处理 (Dataset) =================
+# =========================
+# Dataset（关闭数据增强）
+# =========================
 class ICBHIDataset(Dataset):
-    def __init__(self, df, npy_dir, is_train=False):
+    """
+    flip_label: 如果 True，则将原始 label 进行翻转： y = 1 - y
+    目的：保证训练时的“正类=1”是少数类，从而 pos_weight 能正确起作用
+    """
+    def __init__(self, df, npy_dir, train=False, flip_label=False):
         self.df = df.reset_index(drop=True)
         self.npy_dir = npy_dir
-        self.is_train = is_train
+        self.train = train
+        self.flip_label = flip_label
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        npy_path = os.path.join(self.npy_dir, row["wav_name"].replace(".wav", ".npy"))
-        spec = np.load(npy_path)
-        if self.is_train:
-            spec = apply_spec_augment(spec)
-        spec_t = torch.from_numpy(spec).float().unsqueeze(0)
-        label = torch.tensor(row["label"], dtype=torch.float)
-        return spec_t, label
+        npy_name = row["wav_name"].replace(".wav", ".npy")
+        spec = np.load(os.path.join(self.npy_dir, npy_name))
+
+        # ❌ 不做数据增强
+        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
+
+        y = float(row["label"])
+        if self.flip_label:
+            y = 1.0 - y
+
+        # 让 label 形状与 logits 对齐：[1]
+        label = torch.tensor([y], dtype=torch.float32)
+        return spec, label
 
 
-# ================= 4. 主训练逻辑 =================
-def train():
-    df = pd.read_csv(CSV_PATH)
-    # 提取 Patient ID
-    df["patient_id"] = df["original_file"].apply(
-        lambda x: re.match(PATIENT_PARSE_REGEX, str(x)).group(1) if re.match(PATIENT_PARSE_REGEX, str(x)) else str(x))
+# =========================
+# 阈值搜索：最大化 ICBHI=(SE+SP)/2
+# =========================
+def find_best_threshold(labels, probs, num=401):
+    labels = np.array(labels).astype(int).reshape(-1)
+    probs = np.array(probs).reshape(-1)
 
-    # Patient Split (必须保持 random_state=42)
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, val_idx = next(gss.split(df, groups=df["patient_id"]))
-    train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
+    best_thr, best_icbhi = 0.5, -1.0
+    best_cm = None
 
-    train_loader = DataLoader(ICBHIDataset(train_df, NPY_DIR, is_train=True), batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4)
-    val_loader = DataLoader(ICBHIDataset(val_df, NPY_DIR, is_train=False), batch_size=BATCH_SIZE, num_workers=4)
-
-    model = BiLSTMBaseline(patch_time=1).to(DEVICE)
-
-    # 自动权重计算
-    pos = (train_df["label"] == 1).sum()
-    neg = (train_df["label"] == 0).sum()
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg / pos], device=DEVICE))
-
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-    print(f"开始训练 Bi-LSTM Patient-Split 版...")
-    best_icbhi = -1.0
-
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        train_loss = 0
-
-        for specs, labels in train_loader:
-            specs, labels = specs.to(DEVICE), labels.to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(specs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item()
-
-        scheduler.step()
-
-        # ================= 验证 =================
-        model.eval()
-        all_labels, all_probs, all_preds = [], [], []
-
-        with torch.no_grad():
-            for specs, labels in val_loader:
-                specs = specs.to(DEVICE)
-                labels = labels.to(DEVICE)
-
-                logits = model(specs)
-                probs = torch.sigmoid(logits)
-
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-                all_preds.extend((probs > 0.5).cpu().numpy())
-
-        # ===== 计算指标 =====
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds)
-        auc = roc_auc_score(all_labels, all_probs)
-
-        cm = confusion_matrix(all_labels, all_preds)
+    for thr in np.linspace(0.0, 1.0, num):
+        preds = (probs > thr).astype(int)
+        cm = confusion_matrix(labels, preds, labels=[0, 1])
+        if cm.size != 4:
+            continue
         tn, fp, fn, tp = cm.ravel()
-
         se = tp / (tp + fn + 1e-8)
         sp = tn / (tn + fp + 1e-8)
         icbhi = (se + sp) / 2
 
-        print(
-            f"\nEpoch [{epoch}/{EPOCHS}] "
-            f"Loss: {train_loss / len(train_loader):.4f}\n"
-            f"ACC: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}\n"
-            f"SE: {se:.4f} | SP: {sp:.4f} | ICBHI: {icbhi:.4f}"
-        )
-
-        # ===== 保存最优模型 =====
         if icbhi > best_icbhi:
             best_icbhi = icbhi
-            torch.save(model.state_dict(), BEST_CKPT_PATH)
+            best_thr = float(thr)
+            best_cm = cm
 
-            # 保存混淆矩阵
-            plt.figure(figsize=(6, 5))
-            sns.heatmap(
-                cm,
-                annot=True,
-                fmt="d",
-                cmap="Blues",
-                xticklabels=["Normal", "Abnormal"],
-                yticklabels=["Normal", "Abnormal"]
+    return best_thr, best_icbhi, best_cm
+
+
+# =========================
+# 主训练逻辑
+# =========================
+def train_proc():
+    if not os.path.exists(CSV_PATH):
+        print(f"Error: CSV not found at {CSV_PATH}")
+        return
+
+    df = pd.read_csv(CSV_PATH)
+
+    df["patient_id"] = df["original_file"].apply(
+        lambda x: re.match(PATIENT_REGEX, str(x)).group(1) if re.match(PATIENT_REGEX, str(x)) else "unknown"
+    )
+
+    # 1) Patient split
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, val_idx = next(gss.split(df, groups=df["patient_id"]))
+
+    train_df = df.iloc[train_idx].copy()
+    val_df = df.iloc[val_idx].copy()
+
+    print("Label distribution (original):")
+    print("  Train:", train_df["label"].value_counts().to_dict())
+    print("  Val  :", val_df["label"].value_counts().to_dict())
+
+    # 2) 自动判断：是否需要翻转标签以保证“1 是少数类”
+    pos = int((train_df["label"] == 1).sum())
+    neg = int((train_df["label"] == 0).sum())
+
+    flip_label = False
+    # 如果 label=1 不是少数类（pos >= neg），就翻转，让训练时的正类变成少数类
+    if pos >= neg:
+        flip_label = True
+        # 翻转后，新的 pos/neg
+        pos, neg = neg, pos
+
+    # pos_weight 应该是 neg/pos（>1 才有意义）
+    pos_weight_value = neg / (pos + 1e-8)
+
+    print(f"flip_label = {flip_label} | pos={pos}, neg={neg} | pos_weight={pos_weight_value:.4f}")
+
+    # 3) DataLoader（关闭增强：train=False/True 都不影响，因为 Dataset 里已经不做增强）
+    train_loader = DataLoader(
+        ICBHIDataset(train_df, NPY_DIR, train=True, flip_label=flip_label),
+        batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        ICBHIDataset(val_df, NPY_DIR, train=False, flip_label=flip_label),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=4
+    )
+
+    # 4) 模型
+    model = VimAHybrid(num_classes=1, d_model=192, patch_time=4, num_layers=6).to(DEVICE)
+
+    # ✅ 修正 pos_weight：让“训练时的正类=1”得到更大权重
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight_value], device=DEVICE, dtype=torch.float32)
+    )
+
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    best_score = -1.0
+    best_thr = 0.5
+
+    print(f"Starting training: Train Samples {len(train_df)}, Val Samples {len(val_df)}")
+
+    for epoch in range(1, EPOCHS + 1):
+        # -------- Train --------
+        model.train()
+        total_loss = 0.0
+
+        for specs, labels in train_loader:
+            specs = specs.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)  # [B,1]
+
+            optimizer.zero_grad()
+            logits = model(specs)  # 期望 [B,1]（若不是，请在这里 reshape）
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(1)
+
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        # -------- Val --------
+        model.eval()
+        all_labels, all_probs = [], []
+
+        with torch.no_grad():
+            for specs, labels in val_loader:
+                specs = specs.to(DEVICE, non_blocking=True)
+                labels = labels.to(DEVICE, non_blocking=True)
+
+                logits = model(specs)
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(1)
+
+                probs = torch.sigmoid(logits)  # [B,1]
+
+                all_labels.extend(labels.detach().cpu().numpy().reshape(-1))
+                all_probs.extend(probs.detach().cpu().numpy().reshape(-1))
+
+        # labels/probs 当前是“训练标签体系”（可能翻转过）
+        # 指标计算也在这个体系下做（ICBHI/阈值选择一致），这样 best_thr 才能用于推理阶段
+        # 如果你希望最后输出回“原始标签体系”，可以在输出时再反向翻转解释即可。
+
+        # 1) 阈值搜索（最大化 ICBHI）
+        thr, icbhi, cm = find_best_threshold(all_labels, all_probs, num=401)
+        tn, fp, fn, tp = cm.ravel()
+        se = tp / (tp + fn + 1e-8)
+        sp = tn / (tn + fp + 1e-8)
+
+        # 2) 其他指标（可选）
+        preds = (np.array(all_probs) > thr).astype(int)
+        acc = accuracy_score(np.array(all_labels).astype(int), preds)
+
+        # AUC：若 val 只有单一类别会报错，做个保护
+        try:
+            auc = roc_auc_score(np.array(all_labels).astype(int), np.array(all_probs))
+        except ValueError:
+            auc = float("nan")
+
+        print(
+            f"Epoch [{epoch}/{EPOCHS}] "
+            f"Loss: {total_loss / max(len(train_loader),1):.4f} | "
+            f"ICBHI: {icbhi:.4f} | SE: {se:.4f} | SP: {sp:.4f} | "
+            f"thr*: {thr:.3f} | ACC: {acc:.4f} | AUC: {auc:.4f}"
+        )
+
+        # 3) 保存最优（按 ICBHI）
+        if icbhi > best_score:
+            best_score = icbhi
+            best_thr = thr
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "flip_label": flip_label,
+                    "best_thr": best_thr,
+                    "best_icbhi": best_score,
+                    "pos_weight": pos_weight_value,
+                },
+                BEST_MODEL_PATH
             )
-            plt.title(f"Best ICBHI = {best_icbhi:.4f}")
-            plt.xlabel("Predicted")
-            plt.ylabel("Ground Truth")
+
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+            plt.title(f"Best ICBHI: {best_score:.4f} | thr*: {best_thr:.3f}")
+            plt.xlabel("Pred")
+            plt.ylabel("True")
             plt.tight_layout()
+            plt.savefig(CM_SAVE_PATH)
             plt.close()
+            print("⭐ Best model saved!")
 
-            print("⭐ 新最优模型已保存")
+
 if __name__ == "__main__":
-    train()
-
+    train_proc()
