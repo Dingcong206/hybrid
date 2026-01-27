@@ -1,186 +1,167 @@
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
-import os
-from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, confusion_matrix, recall_score, precision_score
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, roc_auc_score
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 导入你刚才准备好的模型文件
+# 确保 VimA_Model.py 在同目录
 from VimA_Model import VimAHybrid
 
-# ================= 配置区 (已适配 Linux 路径) =================
-# 获取当前脚本所在的文件夹路径 (即 /data/dingcong/hybrid)
+# ================= 配置区 =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 CSV_PATH = os.path.join(BASE_DIR, "metadata.csv")
 NPY_DIR = os.path.join(BASE_DIR, "spec_npy_v2")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 32
+BATCH_SIZE = 32  # 如果 patch_time=1 导致 OOM，请调为 16
 EPOCHS = 50
 LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.05
 
-# 正负样本权重 (根据你的混淆矩阵估算，标签 0 (正常) 有 62个，标签 1 (异常) 有 122个)
-# 如果想让模型更关注标签 0 (少数类)，可以增加其权重，或者降低标签 1 的权重。
-# pos_weight = 负样本数量 / 正样本数量 = 62 / 122 = 0.508
-# 推荐从 1.0 (默认) 调整到 0.5 ~ 0.8 之间，让模型对标签 1 的预测不那么激进
-POS_WEIGHT_VALUE = 0.7  # 从 1.0 开始尝试，然后降到 0.8, 0.7 观察效果
+# 路径解析
+PATIENT_PARSE_REGEX = r"^(\d+)"
+BEST_CKPT_PATH = os.path.join(BASE_DIR, "best_vima_patient_split.pth")
+CM_BEST_PATH = os.path.join(BASE_DIR, "confusion_matrix_best.png")
 
 
-# =============================================================
+# ================= 数据增强与工具 =================
+def apply_spec_augment(spec, max_f=15, max_t=50):
+    """ 简单的频谱增强：随机涂黑一段频率或时间 """
+    # Frequency masking
+    f = random.randint(0, max_f)
+    f0 = random.randint(0, 128 - f)
+    spec[f0:f0 + f, :] = 0
+    # Time masking
+    t = random.randint(0, max_t)
+    t0 = random.randint(0, 1024 - t)
+    spec[:, t0:t0 + t] = 0
+    return spec
 
-# 1. 定义数据加载工具
-class ICBHIDataset(torch.utils.data.Dataset):
-    def __init__(self, df, npy_dir):
-        self.df = df
+
+def compute_metrics(y_true, y_pred, y_prob):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0
+    return {"acc": accuracy_score(y_true, y_pred), "se": se, "sp": sp, "icbhi": (se + sp) / 2,
+            "auc": roc_auc_score(y_true, y_prob), "cm": cm}
+
+
+# ================= Dataset =================
+class ICBHIDataset(Dataset):
+    def __init__(self, df, npy_dir, is_train=False):
+        self.df = df.reset_index(drop=True)
         self.npy_dir = npy_dir
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # 确保文件名对应
-        npy_path = os.path.join(self.npy_dir, row['wav_name'].replace('.wav', '.npy'))
-
-        # 检查文件是否存在
-        if not os.path.exists(npy_path):
-            raise FileNotFoundError(f"在 {self.npy_dir} 中找不到文件: {npy_path}")
-
-        # 加载数据
+        npy_path = os.path.join(self.npy_dir, row["wav_name"].replace(".wav", ".npy"))
         spec = np.load(npy_path)  # (128, 1024)
-        spec_t = torch.from_numpy(spec).float().unsqueeze(0)  # 变为 (1, 128, 1024)
-        label = torch.tensor(row['label'], dtype=torch.float)
+
+        if self.is_train:
+            spec = apply_spec_augment(spec)
+
+        spec_t = torch.from_numpy(spec).float().unsqueeze(0)
+        label = torch.tensor(row["label"], dtype=torch.float)
         return spec_t, label
 
 
-# 2. 准备数据
-print("正在加载数据索引...")
-if not os.path.exists(CSV_PATH):
-    raise FileNotFoundError(f"找不到 CSV 文件: {CSV_PATH}. 请确认路径和文件名是否正确。")
-df = pd.read_csv(CSV_PATH)
+# ================= 主程序 =================
+def main():
+    df = pd.read_csv(CSV_PATH)
+    # 解析 Patient ID
+    df["patient_id"] = df["original_file"].apply(
+        lambda x: re.match(PATIENT_PARSE_REGEX, str(x)).group(1) if re.match(PATIENT_PARSE_REGEX, str(x)) else str(x))
 
-# 确保标签列存在且数据类型正确
-if 'label' not in df.columns:
-    raise ValueError("CSV 文件中缺少 'label' 列。")
-if 'wav_name' not in df.columns:
-    raise ValueError("CSV 文件中缺少 'wav_name' 列。")
+    # Patient Split
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, val_idx = next(gss.split(df, groups=df["patient_id"]))
+    train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
 
-train_df, val_df = train_test_split(df, test_size=0.2, random_state=42,
-                                    stratify=df['label'])  # 添加 stratify 确保训练集和验证集的标签分布相似
+    train_loader = DataLoader(ICBHIDataset(train_df, NPY_DIR, is_train=True), batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader = DataLoader(ICBHIDataset(val_df, NPY_DIR, is_train=False), batch_size=BATCH_SIZE, num_workers=4,
+                            pin_memory=True)
 
-train_loader = DataLoader(ICBHIDataset(train_df, NPY_DIR), batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=4)  # num_workers 可根据服务器CPU核数调整
-val_loader = DataLoader(ICBHIDataset(val_df, NPY_DIR), batch_size=BATCH_SIZE, num_workers=4)
+    # 初始化模型 (注意 patch_time=1 会显著增加序列长度)
+    model = VimAHybrid(num_classes=1, d_model=192, patch_time=1).to(DEVICE)
 
-# 3. 初始化模型、损失函数和优化器
-print(f"正在 {DEVICE} 上初始化 VimA 模型...")
-model = VimAHybrid(num_classes=1, d_model=192, patch_time=1).to(DEVICE)
+    # 自动计算正样本权重
+    pos = (train_df["label"] == 1).sum()
+    neg = (train_df["label"] == 0).sum()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg / pos], device=DEVICE))
 
-# 为 BCEWithLogitsLoss 设置正样本权重
-pos_weight_tensor = torch.tensor([POS_WEIGHT_VALUE]).to(DEVICE)
-criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.05)
-# 学习率调度器，让学习率在后期平滑下降
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    best_icbhi = 0
+    print(f"开始训练: {len(train_df)} 训练样本, {len(val_df)} 验证样本 (按患者划分)")
 
-# 4. 训练循环
-print("开始训练...")
-best_icbhi_score = 0
-best_epoch = 0
-
-for epoch in range(EPOCHS):
-    model.train()
-    train_loss = 0
-    for specs, labels in train_loader:
-        specs, labels = specs.to(DEVICE), labels.to(DEVICE)
-
-        # 前向传播
-        outputs = model(specs)  # outputs 形状为 [Batch]
-        loss = criterion(outputs, labels)  # labels 形状也为 [Batch]
-
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item()
-
-    scheduler.step()  # 每个 Epoch 结束时更新学习率
-
-    # 验证环节
-    model.eval()
-    all_labels = []
-    all_preds = []
-    all_probs = []
-
-    with torch.no_grad():
-        for specs, labels in val_loader:
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        train_loss = 0
+        for specs, labels in train_loader:
             specs, labels = specs.to(DEVICE), labels.to(DEVICE)
-
+            optimizer.zero_grad()
             logits = model(specs)
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()  # 默认阈值 0.5
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
 
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+        scheduler.step()
 
-    # 计算各项指标
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
+        # 验证与寻找最佳阈值
+        model.eval()
+        all_labels, all_probs = [], []
+        with torch.no_grad():
+            for specs, labels in val_loader:
+                specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+                probs = torch.sigmoid(model(specs))
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
 
-    # 混淆矩阵的四个元素：(tn, fp, fn, tp)
-    cm_array = confusion_matrix(all_labels, all_preds).ravel()
-    # 确保 cm_array 有四个元素，否则可能出现类别不全的情况
-    if len(cm_array) == 4:
-        tn, fp, fn, tp = cm_array
-    else:  # 只有一类被预测到或只有一类真实存在
-        # 此时需要根据实际情况手动判断，这里给出简化处理
-        print("警告: 混淆矩阵不完整，可能只有单一类别被预测或存在。")
-        # 假设真实标签中包含两类
-        if len(set(all_labels)) == 2:
-            if 0 not in all_preds:  # 全部预测为1
-                tn, fp, fn, tp = 0, len([l for l in all_labels if l == 0]), len([l for l in all_labels if l == 1]), 0
-            elif 1 not in all_preds:  # 全部预测为0
-                tn, fp, fn, tp = len([l for l in all_labels if l == 0]), 0, 0, len([l for l in all_labels if l == 1])
-            else:  # 其他情况，可能需要更复杂的处理
-                tn, fp, fn, tp = 0, 0, 0, 0  # 暂时置0，避免后续计算错误
-        else:  # 真实标签只有一类
-            tn, fp, fn, tp = 0, 0, 0, 0  # 暂时置0
+        # 在验证集寻找最佳 ICBHI 阈值
+        best_thr_score = 0
+        final_m = None
+        for thr in np.arange(0.3, 0.7, 0.05):
+            m = compute_metrics(all_labels, [1 if p > thr else 0 for p in all_probs], all_probs)
+            if m["icbhi"] > best_thr_score:
+                best_thr_score = m["icbhi"]
+                final_m = m
 
-    se = tp / (tp + fn) if (tp + fn) > 0 else 0  # 灵敏度（真阳率）
-    sp = tn / (tn + fp) if (tn + fp) > 0 else 0  # 特异度（真阴率）
-    icbhi_score = (se + sp) / 2  # ICBHI 官方分数
+        print(
+            f"Epoch {epoch} | Loss: {train_loss / len(train_loader):.4f} | ICBHI: {final_m['icbhi']:.4f} (SE:{final_m['se']:.4f} SP:{final_m['sp']:.4f})")
 
-    print(f"\n--- Epoch [{epoch + 1}/{EPOCHS}] ---")
-    print(f"Train Loss: {train_loss / len(train_loader):.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-    print(f"Validation: ACC: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
-    print(f"            SE: {se:.4f} | SP: {sp:.4f} | ICBHI Score: {icbhi_score:.4f}")
+        if final_m["icbhi"] > best_icbhi:
+            best_icbhi = final_m["icbhi"]
+            torch.save(model.state_dict(), BEST_CKPT_PATH)
+            # 保存混淆矩阵图
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(final_m["cm"], annot=True, fmt="d", cmap="Blues")
+            plt.title(f"Best ICBHI: {best_icbhi:.4f}")
+            plt.savefig(CM_BEST_PATH)
+            plt.close()
+            print(f"⭐ 新纪录已保存")
 
-    # 保存最优模型 (现在根据 ICBHI Score)
-    if icbhi_score > best_icbhi_score:
-        best_icbhi_score = icbhi_score
-        best_epoch = epoch + 1
-        torch.save(model.state_dict(), "best_vima_model.pth")
-        print(f"⭐ 发现更高 ICBHI Score ({best_icbhi_score:.4f}) 的模型，已保存权重！")
+    print(f"训练完成! 最高分: {best_icbhi:.4f}")
 
-    # 在最后一个 Epoch 绘制并保存混淆矩阵
-    if epoch == EPOCHS - 1:
-        cm = confusion_matrix(all_labels, all_preds)
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal (0)', 'Abnormal (1)'],
-                    yticklabels=['Normal (0)', 'Abnormal (1)'])
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        plt.title(f'Confusion Matrix - Epoch {epoch + 1}')
-        plt.savefig('confusion_matrix_final.png')
-        print("📊 最终混淆矩阵图已保存至 confusion_matrix_final.png")
 
-print(f"\n✅ 训练完成！最高 ICBHI Score: {best_icbhi_score:.4f} (Epoch {best_epoch})")
+if __name__ == "__main__":
+    main()
