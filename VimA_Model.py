@@ -15,26 +15,34 @@ except ImportError:
 class ConvStem(nn.Module):
     def __init__(self, embed_dim=192, patch_time=4):
         super().__init__()
-        # 第一层：捕获细微纹理 [B, 1, 128, 1024] -> [B, 64, 64, 512]
+        # 第一层：保持尺寸或轻微下采样
+        # [B, 1, 128, 1024] -> [B, 64, 64, 512]
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU()
         )
-        # 第二层：进一步下采样 [B, 64, 64, 512] -> [B, embed_dim, 1, 1024/patch_time]
-        # 注意：这里高度降为 1，宽度根据 patch_time 缩放
-        self.conv2 = nn.Conv2d(
-            64, embed_dim,
-            kernel_size=(64, 3),  # 高度覆盖剩余的 64 频点
-            stride=(64, patch_time // 2),
-            padding=(0, 1)
+
+        # 第二层：关键修复
+        # 我们要让高度从 64 变为 1
+        # 宽度（时间轴）的步长由 patch_time 决定
+        # 既然第一层已经 stride=2 了，这里只需要再 stride = patch_time // 2
+        stride_w = max(1, patch_time // 2)
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, embed_dim, kernel_size=(64, 3), stride=(64, stride_w), padding=(0, 1)),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU()
         )
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)  # [B, D, 1, L]
-        x = x.flatten(2).transpose(1, 2)  # [B, L, D]
+        x = self.conv1(x)  # 输出 H=64, W=512
+        x = self.conv2(x)  # 输出 H=1, W=512/(patch_time//2)
+
+        # 整理形状为 [B, L, D]
+        x = x.squeeze(2)  # [B, D, L]
+        x = x.transpose(1, 2)  # [B, L, D]
         return self.norm(x)
 
 
@@ -123,7 +131,7 @@ class VimAHybrid(nn.Module):
     def forward(self, x):
         # x: [B, 1, 128, 1024]
         x = self.stem(x)  # [B, L, D]
-
+        B, L, D = x.shape
         # 对齐位置编码（防止由于下采样导致的尺寸微差）
         x = x + self.pos_embed[:, :x.size(1), :]
 
