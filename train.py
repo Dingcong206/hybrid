@@ -80,7 +80,7 @@ val_loader = DataLoader(ICBHIDataset(val_df, NPY_DIR), batch_size=BATCH_SIZE, nu
 
 # 3. 初始化模型、损失函数和优化器
 print(f"正在 {DEVICE} 上初始化 VimA 模型...")
-model = VimAHybrid(num_classes=1, d_model=192, patch_time=4).to(DEVICE)
+model = VimAHybrid(num_classes=1, d_model=192, patch_time=1).to(DEVICE)
 
 # 为 BCEWithLogitsLoss 设置正样本权重
 pos_weight_tensor = torch.tensor([POS_WEIGHT_VALUE]).to(DEVICE)
