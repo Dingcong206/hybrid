@@ -24,7 +24,7 @@ BATCH_SIZE = 32
 EPOCHS = 100  # 增加上限，靠早停控制
 LR = 1e-4
 WEIGHT_DECAY = 0.05
-EARLY_STOP_PATIENCE = 10  # 10轮不更新就停止
+EARLY_STOP_PATIENCE = 30  # 10轮不更新就停止
 
 BEST_CKPT_PATH = os.path.join(BASE_DIR, "best_vima_patient.pth")
 CM_SAVE_PATH = os.path.join(BASE_DIR, "confusion_matrix_best.png")
