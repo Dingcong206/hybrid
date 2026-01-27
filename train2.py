@@ -222,7 +222,6 @@ def main():
             plt.xlabel("Predicted")
             plt.ylabel("Ground Truth")
             plt.tight_layout()
-            plt.savefig(CM_BEST_PATH)
             plt.close()
 
             print("⭐ 新最优模型已保存")
