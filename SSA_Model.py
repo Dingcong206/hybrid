@@ -9,7 +9,7 @@ except ImportError:
 
 
 # =====================================================
-# 1) ConvStem (保持和你代码一模一样)
+# 1) ConvStem (保持逻辑一致)
 # =====================================================
 class ConvStem(nn.Module):
     def __init__(self, embed_dim=192, patch_time=4):
@@ -35,58 +35,69 @@ class ConvStem(nn.Module):
 
 
 # =====================================================
-# 2) SSABlock (现在是 3个 Bi-Mamba + 1个 Attention)
+# 2) 轻量块 (LightBlock)：用于底层
 # =====================================================
-class SSABlock(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+class LightBlock(nn.Module):
+    def __init__(self, d_model, dropout=0.3):
         super().__init__()
-        # Mamba 1
-        self.ln1 = nn.LayerNorm(d_model)
-        self.m1_fwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.m1_bwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.drop1 = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(d_model)
+        self.m_fwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
+        self.m_bwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
+        self.drop = nn.Dropout(dropout)
 
-        # Mamba 2 (新增)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.m2_fwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.m2_bwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.drop2 = nn.Dropout(dropout)
-
-        # Mamba 3 (新增)
-        self.ln3 = nn.LayerNorm(d_model)
-        self.m3_fwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.m3_bwd = Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
-        self.drop3 = nn.Dropout(dropout)
-
-        # Attention 支路
-        self.ln_a = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-        self.drop_a = nn.Dropout(dropout)
-
-        # MLP 支路
         self.ln_mlp = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout)
+            nn.Linear(d_model * 4, d_model)
         )
 
     def forward(self, x):
-        # Mamba 1
-        x = x + self.drop1(self.m1_fwd(self.ln1(x)) + torch.flip(self.m1_bwd(torch.flip(self.ln1(x), [1])), [1]))
+        # 仅一层双向 Mamba + MLP
+        x = x + self.drop(self.m_fwd(self.ln(x)) + torch.flip(self.m_bwd(torch.flip(self.ln(x), [1])), [1]))
+        x = x + self.mlp(self.ln_mlp(x))
+        return x
 
-        # Mamba 2
-        x = x + self.drop2(self.m2_fwd(self.ln2(x)) + torch.flip(self.m2_bwd(torch.flip(self.ln2(x), [1])), [1]))
 
-        # Mamba 3
-        x = x + self.drop3(self.m3_fwd(self.ln3(x)) + torch.flip(self.m3_bwd(torch.flip(self.ln3(x), [1])), [1]))
+# =====================================================
+# 3) 超厚块 (HeavyBlock)：用于顶层 (3-Mamba + 1-Attention)
+# =====================================================
+class HeavyBlock(nn.Module):
+    def __init__(self, d_model, nhead=8, dropout=0.3):
+        super().__init__()
+        # 3组 Mamba
+        self.mamba_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'ln': nn.LayerNorm(d_model),
+                'fwd': Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2),
+                'bwd': Mamba(d_model=d_model, d_state=8, d_conv=4, expand=2)
+            }) for _ in range(3)
+        ])
+        self.drop = nn.Dropout(dropout)
+
+        # 1组 Attention
+        self.ln_a = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+
+        # 1组 MLP
+        self.ln_mlp = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+
+    def forward(self, x):
+        # 依次运行 3 层双向 Mamba
+        for m in self.mamba_layers:
+            x = x + self.drop(m['fwd'](m['ln'](x)) + torch.flip(m['bwd'](torch.flip(m['ln'](x), [1])), [1]))
 
         # Attention
         res = x
         x_a, _ = self.attn(self.ln_a(x), self.ln_a(x), self.ln_a(x))
-        x = res + self.drop_a(x_a)
+        x = res + self.drop(x_a)
 
         # MLP
         x = x + self.mlp(self.ln_mlp(x))
@@ -94,20 +105,26 @@ class SSABlock(nn.Module):
 
 
 # =====================================================
-# 3) SSA_Model 整体架构
+# 4) SSA_Model (非对称架构)
 # =====================================================
 class SSA_Model(nn.Module):
     def __init__(self, num_classes=1, n_layers=6, d_model=192, patch_time=4, dropout=0.3):
         super().__init__()
         self.stem = ConvStem(embed_dim=d_model, patch_time=patch_time)
 
-        # 保持和你代码一致的 pos_embed 初始化
         num_patches = 1024 // patch_time
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, d_model))
 
-        self.blocks = nn.ModuleList([
-            SSABlock(d_model=d_model, dropout=dropout) for _ in range(n_layers)
-        ])
+        # 核心修改：分层堆叠
+        self.blocks = nn.ModuleList()
+        mid = n_layers // 2
+        for i in range(n_layers):
+            if i < mid:
+                # 前半部分：轻量层
+                self.blocks.append(LightBlock(d_model, dropout))
+            else:
+                # 后半部分：厚重层
+                self.blocks.append(HeavyBlock(d_model, nhead=8, dropout=dropout))
 
         self.norm = nn.LayerNorm(d_model)
         self.pool_proj = nn.Linear(d_model, 1)
@@ -126,7 +143,7 @@ class SSA_Model(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
-        B, L, D = x.shape
+        L = x.size(1)
         x = x + self.pos_embed[:, :L, :]
 
         for block in self.blocks:
