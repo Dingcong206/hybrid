@@ -79,7 +79,7 @@ class HybridBlock(nn.Module):
 # 第三部分：整机架构 (VimA-Hybrid) - 引入 CLS Token
 # =====================================================
 class VimAHybrid(nn.Module):
-    def __init__(self, num_classes=1, n_layers=6, d_model=192, patch_time=4):
+    def __init__(self, num_classes=1, n_layers=8, d_model=192, patch_time=4):
         super().__init__()
         # 1. 卷积前端
         self.stem = AcousticStripStem(freq_bins=128, patch_time=patch_time, embed_dim=d_model)
@@ -96,6 +96,8 @@ class VimAHybrid(nn.Module):
 
         # 4. 输出头
         self.norm = nn.LayerNorm(d_model)
+        # Attention Pooling
+        self.attn_pool = nn.Linear(d_model, 1)
         self.head = nn.Linear(d_model, num_classes)
 
         # 初始化权重 (可选，有助于稳定训练)
@@ -125,4 +127,15 @@ class VimAHybrid(nn.Module):
 
         x = self.norm(x)
         # 关键：只使用 CLS Token 的输出进行分类
-        return self.head(x[:, 0]).squeeze(-1) # -> [B]
+       # return self.head(x[:, 0]).squeeze(-1) # -> [B]
+        # 去掉 CLS，只用 patch tokens
+        x = x[:, 1:]  # [B, L, D]
+
+        # 计算注意力权重
+        attn_score = self.attn_pool(x)  # [B, L, 1]
+        attn_weight = torch.softmax(attn_score, dim=1)
+
+        # 加权求和
+        feat = (x * attn_weight).sum(dim=1)  # [B, D]
+
+        return self.head(feat).squeeze(-1)
