@@ -79,7 +79,7 @@ class HybridBlock(nn.Module):
 # 第三部分：整机架构 (VimA-Hybrid) - 引入 CLS Token
 # =====================================================
 class VimAHybrid(nn.Module):
-    def __init__(self, num_classes=1, n_layers=6, d_model=192, patch_time=4):
+    def __init__(self, num_classes=1, n_layers=3, d_model=192, patch_time=4):
         super().__init__()
         # 1. 卷积前端
         self.stem = AcousticStripStem(freq_bins=128, patch_time=patch_time, embed_dim=d_model)
