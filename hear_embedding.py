@@ -32,29 +32,18 @@ if not os.path.exists(SAVE_DIR):
 # ================= 核心工具函数 =================
 
 def get_most_informative_segment(waveform, target_len=32000):
-    """
-    通过滑动窗口寻找信号能量(RMS)最大的连续片段
-    waveform shape: [1, T]
-    """
     C, T = waveform.shape
     if T <= target_len:
-        # 如果长度不足，向后补零
+        # 确保 pad 后仍然是 [1, target_len]
         return F.pad(waveform, (0, target_len - T))
 
-    # 计算能量平方
     energy = waveform.pow(2)
-
-    # 使用平均池化滑动窗口计算区间能量总和
-    # stride越小越精确但计算越慢，1600 表示每 0.1s 滑动一次
     window_sum = F.avg_pool1d(energy.unsqueeze(0), kernel_size=target_len, stride=1600)
-
-    # 找到能量最大的窗口起始位置
     best_idx = torch.argmax(window_sum).item() * 1600
-
-    # 防止截取越界
     start = min(best_idx, T - target_len)
-    return waveform[:, start: start + target_len]
 
+    # 返回 [1, target_len]
+    return waveform[:, start: start + target_len]
 
 # ================= 提取主程序 =================
 
@@ -101,7 +90,8 @@ def main():
 
                 # D. 预处理为 Spectrogram
                 # preprocess_audio 接收 [Time] 形状
-                spec = preprocess_audio(waveform_seg.squeeze(0)).to(DEVICE)
+                #spec = preprocess_audio(waveform_seg.squeeze(0)).to(DEVICE)
+                spec = preprocess_audio(waveform_seg).to(DEVICE)
 
                 # E. 【核心截取】：提取 Patch Embeddings
                 # 这一步会跳过 Transformer Encoder，直接拿到进入模型前的特征块
@@ -125,7 +115,7 @@ def main():
             except Exception as e:
                 print(f"⚠️ 处理文件 {filename} 时出错: {e}")
                 continue
-
+    print(f"DEBUG: Total samples in meta_data: {len(meta_data)}")
     # 4. 保存映射表
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
