@@ -94,7 +94,7 @@ class HybridBlock(nn.Module):
 # 3) 整机架构 VimAHybrid (移除 CLS, 采用 Attention Pooling)
 # =====================================================
 class VimAHybrid(nn.Module):
-    def __init__(self, num_classes=1, n_layers=6, d_model=192, patch_time=4, dropout=0.3):
+    def __init__(self, num_classes=1, n_layers=8, d_model=192, patch_time=4, dropout=0.3):
         super().__init__()
         # 1. 卷积前端
         self.stem = ConvStem(embed_dim=d_model, patch_time=patch_time)
