@@ -83,6 +83,9 @@ def main():
                     # --- 拦截操作：100% 还原进入 VIT 前的输入 ---
                     x = model.embeddings(spec)
                     feature_np = x.squeeze(0).cpu().numpy()  # (97, 1024)
+                    if len(meta_data) == 0:
+                        print(f"📐 HeAR 特征维度: {feature_np.shape} "
+                              f"(patches={feature_np.shape[0]}, dim={feature_np.shape[1]})")
 
                     # 唯一标识符: 原文件名_段索引
                     seg_id = f"{wav_name.replace('.wav', '')}_seg_{i}"
