@@ -147,6 +147,8 @@ def main():
 
     # 读数据
     df = pd.read_csv(CSV_PATH)
+    print("✅ CSV_PATH =", CSV_PATH)
+    print("✅ columns =", df.columns.tolist())
 
     # 生成 patient_id
     id_col = "original_wav" if "original_wav" in df.columns else "user_id"
