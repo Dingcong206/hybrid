@@ -1,115 +1,105 @@
 import os
-import sys
 import torch
-import torchaudio
-import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from tqdm import tqdm
-import torch.nn.functional as F
-from transformers import AutoModel
 
-# ================= 路径配置 =================
-BASE_DIR = "/data/dingcong/hybrid"
-WAV_DIR = os.path.join(BASE_DIR, "audio_and_txt_files")
-SAVE_DIR = os.path.join(BASE_DIR, "spec_npy_v2")
-OUT_CSV = os.path.join(BASE_DIR, "metadata.csv")
-DIAGNOSIS_CSV = os.path.join(BASE_DIR, "patient_diagnosis.csv")  # 真实标签表
-
-HEAR_PATH = os.path.join(BASE_DIR, "hear")
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TARGET_SR = 16000
-TARGET_LEN = 32000
-
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR)
+# --- 核心引用：从你的 SSA_Model.py 导入模型 ---
+# 确保 SSA_Model.py 和此脚本在同一目录下
+from SSA_Model import SSA_Model
 
 
-# ================= 工具函数 =================
-def get_most_informative_segment(waveform, target_len=32000):
-    """确保返回形状为 [1, 32000]"""
-    C, T = waveform.shape
-    if T <= target_len:
-        return F.pad(waveform, (0, target_len - T))
-    energy = waveform.pow(2)
-    window_sum = F.avg_pool1d(energy.unsqueeze(0), kernel_size=target_len, stride=1600)
-    best_idx = torch.argmax(window_sum).item() * 1600
-    start = min(best_idx, T - target_len)
-    return waveform[:, start: start + target_len]
+# =====================================================
+# 1) Dataset 类：处理 (97, 1024) 特征
+# =====================================================
+class ICBHIDataset(Dataset):
+    def __init__(self, df):
+        self.df = df
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        # 加载 HeAR 提取的特征 [97, 1024]
+        feature = np.load(row['feature_path']).astype(np.float32)
+        label = int(row['label'])
+        return torch.from_numpy(feature), torch.tensor(label, dtype=torch.float32)
 
 
-# ================= 主程序 =================
+# =====================================================
+# 2) 主训练程序
+# =====================================================
 def main():
-    # 1. 加载模型
-    model = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
-    model.to(DEVICE).eval()
+    # --- 参数配置 ---
+    CSV_PATH = "/data/dingcong/hybrid/metadata_segmented.csv"
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    BATCH_SIZE = 64
+    EPOCHS = 50
+    LR = 1e-4
 
-    import hear.python.data_processing.audio_utils as audio_utils
-    preprocess_audio = audio_utils.preprocess_audio
+    # --- 数据准备 (按 Patient ID 划分) ---
+    df = pd.read_csv(CSV_PATH)
+    # 提取 ID 前缀，确保同一个病人的数据不跨集
+    id_col = "original_wav" if "original_wav" in df.columns else "user_id"
+    df["patient_id"] = df[id_col].apply(lambda x: str(x).split('_')[0])
 
-    # 2. 预加载真实标签 (优化：先读取标签表防止最后才发现没标签)
-    if os.path.exists(DIAGNOSIS_CSV):
-        df_diag = pd.read_csv(DIAGNOSIS_CSV)
-        # 假设列名是 user_id 和 label，请根据实际修改
-        diag_map = df_diag.set_index(df_diag.columns[0])[df_diag.columns[1]].to_dict()
-        print(f"✅ 已加载诊断标签，共 {len(diag_map)} 个 ID")
-    else:
-        diag_map = {}
-        print("⚠️ 警告：未找到 patient_diagnosis.csv，标签将默认为 0")
+    unique_patients = df["patient_id"].unique()
+    train_p, val_p = train_test_split(unique_patients, test_size=0.2, random_state=42)
 
-    wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
-    meta_data = []
+    train_loader = DataLoader(ICBHIDataset(df[df["patient_id"].isin(train_p)]), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(ICBHIDataset(df[df["patient_id"].isin(val_p)]), batch_size=BATCH_SIZE, shuffle=False)
 
-    print(f"📦 开始提取 {len(wav_files)} 个文件的特征...")
+    print(f"✅ 划分完成: 训练集 {len(train_p)} 人 | 验证集 {len(val_p)} 人")
 
-    with torch.no_grad():
-        for filename in tqdm(wav_files):
-            wav_path = os.path.join(WAV_DIR, filename)
-            try:
-                waveform, sr = torchaudio.load(wav_path)
-                if sr != TARGET_SR:
-                    waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
+    # --- 模型初始化 (input_dim 设为 1024) ---
+    model = SSA_Model(input_dim=1024, d_model=256, n_layers=6).to(DEVICE)
 
-                # 保持 [1, 32000]
-                waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-                # 核心修复：送入 [1, 32000] 而不是 [32000]
-                spec = preprocess_audio(waveform_seg).to(DEVICE)
+    # --- 训练循环 ---
+    best_f1 = 0
+    for epoch in range(EPOCHS):
+        model.train()
+        t_loss = 0
+        for feats, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False):
+            feats, labels = feats.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(feats), labels)
+            loss.backward()
+            optimizer.step()
+            t_loss += loss.item()
 
-                # 提取 Embedding
-                patch_embeddings = model.embeddings(spec)
-                feature_np = patch_embeddings.squeeze(0).cpu().numpy()
+        # 验证
+        model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for feats, labels in val_loader:
+                feats, labels = feats.to(DEVICE), labels.to(DEVICE)
+                outputs = model(feats)
+                all_probs.extend(torch.sigmoid(outputs).cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
 
-                # 保存
-                save_path = os.path.join(SAVE_DIR, filename.replace(".wav", ".npy"))
-                np.save(save_path, feature_np)
+        scheduler.step()
 
-                # 关联标签
-                user_id = filename.split('_')[0]
-                label = diag_map.get(user_id, 0)  # 如果找不到 ID 则默认为 0
+        # 计算指标
+        preds = [1 if p > 0.5 else 0 for p in all_probs]
+        acc = accuracy_score(all_labels, preds)
+        f1 = f1_score(all_labels, preds)
 
-                meta_data.append({
-                    "user_id": user_id,
-                    "feature_path": save_path,
-                    "label": int(label)
-                })
+        print(f"Epoch {epoch + 1} | Loss: {t_loss / len(train_loader):.4f} | Acc: {acc:.4f} | F1: {f1:.4f}")
 
-            except Exception as e:
-                print(f"❌ 文件 {filename} 处理失败: {e}")
-
-    # 3. 保存并反馈结果
-    df = pd.DataFrame(meta_data)
-    df.to_csv(OUT_CSV, index=False)
-
-    if not df.empty:
-        sample_feat = np.load(df.iloc[0]['feature_path'])
-        print(f"\n🚀 提取成功！")
-        print(f"📌 特征维度: {sample_feat.shape} (建议 train1.py 的 input_dim 设为 {sample_feat.shape[1]})")
-        print(f"📊 正样本(1)数量: {df['label'].sum()} | 总样本: {len(df)}")
-    else:
-        print("❌ 提取失败，meta_data 为空")
+        if f1 > best_f1:
+            best_f1 = f1
+            torch.save(model.state_dict(), "best_ssa_mamba.pth")
+            print("⭐ 发现更好模型，已保存权重")
 
 
 if __name__ == "__main__":
