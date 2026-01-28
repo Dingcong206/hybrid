@@ -86,7 +86,7 @@ class ICBHIDataset(Dataset):
 def main():
     df = pd.read_csv(CSV_PATH)
     # 解析 Patient ID
-    df["patient_id"] = df["original_file"].apply(
+    df["patient_id"] = df["original_wav"].apply(
         lambda x: re.match(PATIENT_PARSE_REGEX, str(x)).group(1) if re.match(PATIENT_PARSE_REGEX, str(x)) else str(x))
 
     # Patient Split
