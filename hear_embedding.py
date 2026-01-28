@@ -20,20 +20,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-HEAR_PATH = "/data/dingcong/hear"
+HEAR_PATH = "/data/dingcong/hybrid/hear"
 if HEAR_PATH not in sys.path:
     sys.path.append(HEAR_PATH)
 
 # 2. 现在导入就不会报错了
-try:
-    import hear.python.data_processing.audio_utils as audio_utils
-    preprocess_audio = audio_utils.preprocess_audio
-    print("✅ Successfully imported HEAR utils from /data/dingcong/hear")
-except ImportError as e:
-    print(f"❌ 导入失败，请检查路径。错误信息: {e}")
-    # 打印当前 sys.path 方便排查
-    print("Current sys.path:", sys.path)
-    sys.exit(1)
+
 # ================= 提取函数 =================
 def main():
     print(f"🚀 Loading HeAR model to {DEVICE}...")
