@@ -42,13 +42,21 @@ def main():
     BATCH_SIZE = 64
     EPOCHS = 50
     LR = 1e-4
+    df = pd.read_csv(CSV_PATH)
+
+    print("📊 Label 分布：")
+    print(df["label"].value_counts())
+    print("\n📈 正负样本比例：")
+    print(df["label"].value_counts(normalize=True))
 
     # --- 数据准备 (按 Patient ID 划分) ---
     df = pd.read_csv(CSV_PATH)
     # 提取 ID 前缀，确保同一个病人的数据不跨集
     id_col = "original_wav" if "original_wav" in df.columns else "user_id"
     df["patient_id"] = df[id_col].apply(lambda x: str(x).split('_')[0])
-
+    patient_label = df.groupby("patient_id")["label"].max()
+    print("👤 病人级别 label 分布：")
+    print(patient_label.value_counts())
     unique_patients = df["patient_id"].unique()
     train_p, val_p = train_test_split(unique_patients, test_size=0.2, random_state=42)
 
