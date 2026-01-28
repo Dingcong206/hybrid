@@ -5,40 +5,79 @@ import torchaudio
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import torch.nn.functional as F
 from transformers import AutoModel
 
-# ================= 配置区 =================
-
+# ================= 路径配置 =================
 BASE_DIR = "/data/dingcong/hybrid"
 WAV_DIR = os.path.join(BASE_DIR, "audio_and_txt_files")  # 原始音频位置
-SAVE_DIR = os.path.join(BASE_DIR, "spec_npy")  # 特征保存位置
+SAVE_DIR = os.path.join(BASE_DIR, "spec_npy_v2")  # 特征保存位置
 OUT_CSV = os.path.join(BASE_DIR, "metadata.csv")  # 记录映射关系
 
+# 确保 HEAR 库能被正确加载 (根据你图片显示的目录结构)
+HEAR_PATH = os.path.join(BASE_DIR, "hear")
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+# ================= 参数配置 =================
 MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TARGET_SR = 16000  # HeAR 要求的采样率
+TARGET_LEN = 32000  # HeAR 要求的固定长度 (2秒)
 
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-HEAR_PATH = "/data/dingcong/hybrid/hear"
-if HEAR_PATH not in sys.path:
-    sys.path.append(HEAR_PATH)
 
-# 2. 现在导入就不会报错了
+# ================= 核心工具函数 =================
 
-# ================= 提取函数 =================
+def get_most_informative_segment(waveform, target_len=32000):
+    """
+    通过滑动窗口寻找信号能量(RMS)最大的连续片段
+    waveform shape: [1, T]
+    """
+    C, T = waveform.shape
+    if T <= target_len:
+        # 如果长度不足，向后补零
+        return F.pad(waveform, (0, target_len - T))
+
+    # 计算能量平方
+    energy = waveform.pow(2)
+
+    # 使用平均池化滑动窗口计算区间能量总和
+    # stride越小越精确但计算越慢，1600 表示每 0.1s 滑动一次
+    window_sum = F.avg_pool1d(energy.unsqueeze(0), kernel_size=target_len, stride=1600)
+
+    # 找到能量最大的窗口起始位置
+    best_idx = torch.argmax(window_sum).item() * 1600
+
+    # 防止截取越界
+    start = min(best_idx, T - target_len)
+    return waveform[:, start: start + target_len]
+
+
+# ================= 提取主程序 =================
+
 def main():
     print(f"🚀 Loading HeAR model to {DEVICE}...")
-    # 加载预训练模型
-    model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model.to(DEVICE).eval()
+    # 1. 加载模型 (trust_remote_code 必须为 True 以加载本地定义的层)
+    try:
+        model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model.to(DEVICE).eval()
+    except Exception as e:
+        print(f"❌ 模型加载失败，请检查网络或路径: {e}")
+        return
 
-    # 获取音频处理工具（由模型库提供）
-    import importlib
-    audio_utils = importlib.import_module("hear.python.data_processing.audio_utils")
-    preprocess_audio = audio_utils.preprocess_audio
+    # 2. 动态导入 HeAR 预处理工具
+    try:
+        import hear.python.data_processing.audio_utils as audio_utils
+        preprocess_audio = audio_utils.preprocess_audio
+        print("✅ HEAR 预处理模块加载成功")
+    except ImportError:
+        print("❌ 找不到 hear 文件夹。请确保 hear 文件夹在 /data/dingcong/hybrid 下")
+        return
 
-    # 扫描 WAV 文件
+    # 3. 扫描 WAV 文件
     wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
     meta_data = []
 
@@ -48,37 +87,53 @@ def main():
         for filename in tqdm(wav_files):
             wav_path = os.path.join(WAV_DIR, filename)
 
-            # 1. 加载音频 (假设采样率已由 preprocess_audio 处理或模型内部自适应)
-            waveform, sr = torchaudio.load(wav_path)
+            try:
+                # A. 加载音频
+                waveform, sr = torchaudio.load(wav_path)
 
-            # 2. 预处理为 Spectrogram
-            # 注意：batch_clips 需要是 [Batch, Time]
-            spec = preprocess_audio(waveform).to(DEVICE)
+                # B. 统一重采样到 16kHz
+                if sr != TARGET_SR:
+                    waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
 
-            # 3. 【核心截断步骤】：只通过 Embedding 层
-            # 在 google/hear-pytorch 中，model.embeddings 负责 Patchify 和 Positional Encoding
-            # 输出形状通常为 [Batch, Seq_Len, Hidden_Dim] (例如 [1, 512, 768])
-            patch_embeddings = model.embeddings(spec)
+                # C. 智能截取能量最大的 2 秒 (32000 个采样点)
+                # 这一步解决了 ValueError: Input audio must have 32000 samples 的报错
+                waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
 
-            # 转为 numpy
-            feature_np = patch_embeddings.squeeze(0).cpu().numpy()
+                # D. 预处理为 Spectrogram
+                # preprocess_audio 接收 [Time] 形状
+                spec = preprocess_audio(waveform_seg.squeeze(0)).to(DEVICE)
 
-            # 4. 保存文件
-            save_filename = filename.replace(".wav", ".npy")
-            save_path = os.path.join(SAVE_DIR, save_filename)
-            np.save(save_path, feature_np)
+                # E. 【核心截取】：提取 Patch Embeddings
+                # 这一步会跳过 Transformer Encoder，直接拿到进入模型前的特征块
+                patch_embeddings = model.embeddings(spec)
 
-            # 5. 记录元数据 (这里假设标签可以从文件名解析，或后续合并)
-            meta_data.append({
-                "user_id": filename.split('_')[0],
-                "feature_path": save_path,
-                "label": 0  # 需根据你的 CSV 逻辑填入真实标签
-            })
+                # F. 转换为 numpy 并保存
+                feature_np = patch_embeddings.squeeze(0).cpu().numpy()  # [Seq, Dim]
 
-    # 保存新的 CSV
+                save_filename = filename.replace(".wav", ".npy")
+                save_path = os.path.join(SAVE_DIR, save_filename)
+                np.save(save_path, feature_np)
+
+                # G. 记录到元数据
+                # 这里的 label 可以后续根据你的原始 CSV 进行 map
+                meta_data.append({
+                    "user_id": filename.split('_')[0],
+                    "feature_path": save_path,
+                    "label": 0  # 默认占位符
+                })
+
+            except Exception as e:
+                print(f"⚠️ 处理文件 {filename} 时出错: {e}")
+                continue
+
+    # 4. 保存映射表
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
-    print(f"✅ Extraction complete. Features saved in {SAVE_DIR}")
+    print(f"---")
+    print(f"✅ 特征提取完成！")
+    print(f"📂 特征保存在: {SAVE_DIR}")
+    print(f"📄 元数据保存在: {OUT_CSV}")
+    print(f"💡 下一步：请运行你的 train1.py 开始训练 SSA_Model。")
 
 
 if __name__ == "__main__":
