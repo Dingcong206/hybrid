@@ -56,7 +56,7 @@ class HeavyBlock(nn.Module):
 # 2) SSA_Model: 适配 (97, 1024) 维度的架构
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, n_layers=6, d_model=256, dropout=0.2):
+    def __init__(self, input_dim=1024, num_classes=1, n_layers=8, d_model=256, dropout=0.2):
         super().__init__()
 
         # A. 输入投影：将 1024 维降维至模型内部维度 (例如 256)
