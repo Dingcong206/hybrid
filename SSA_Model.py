@@ -128,6 +128,7 @@ class SSA_Model(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
         self.pool_proj = nn.Linear(d_model, 1)
+        self.dropout = nn.Dropout(0.2)
         self.head = nn.Linear(d_model, num_classes)
 
         nn.init.trunc_normal_(self.pos_embed, std=.02)
