@@ -11,13 +11,13 @@ from transformers import AutoModel
 # ================= 路径与参数 =================
 BASE_DIR = "/data/dingcong/hybrid"
 WAV_DIR = os.path.join(BASE_DIR, "audio_and_txt_files")
-SAVE_DIR = os.path.join(BASE_DIR, "raw_patches_v2")  # 存的是拦截后的原始补丁
+SAVE_DIR = os.path.join(BASE_DIR, "raw_patches_v3")
 OUT_CSV = os.path.join(BASE_DIR, "metadata.csv")
 
 MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TARGET_SR = 16000
-TARGET_LEN = 32000  # 2秒 (HeAR 默认输入长度)
+TARGET_LEN = 32000  # 2秒
 
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
@@ -35,22 +35,16 @@ def get_most_informative_segment(waveform, target_len=32000):
     return waveform[:, start: start + target_len]
 
 
-# ================= 拦截式提取主程序 =================
+# ================= 核心主程序 =================
 def main():
-    print(f"🚀 Loading HeAR model to {DEVICE}...")
-    try:
-        # 加载预训练模型
-        model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model.to(DEVICE).eval()
-    except Exception as e:
-        print(f"❌ 模型加载失败: {e}")
-        return
+    print(f"🚀 Loading HeAR model...")
+    model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model.to(DEVICE).eval()
 
-    # 获取 HeAR 内部的音频处理函数
     import hear.python.data_processing.audio_utils as audio_utils
     preprocess_audio = audio_utils.preprocess_audio
 
-    # --- 标签加载 ---
+    # --- 标签加载逻辑 ---
     diag_map = {}
     diagnosis_path = os.path.join(BASE_DIR, "patient_diagnosis.csv")
     if os.path.exists(diagnosis_path):
@@ -61,7 +55,7 @@ def main():
     wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
     meta_data = []
 
-    print(f"🚧 正在拦截 HeAR 前端特征 (Patch Embed + Pos Embed)...")
+    print(f"🚧 正在截获 HeAR 输入端特征 (Exact Match)...")
 
     with torch.no_grad():
         for filename in tqdm(wav_files):
@@ -71,33 +65,23 @@ def main():
                 if sr != TARGET_SR:
                     waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
 
-                # 1. 预处理成频谱图
                 waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
-                spec = preprocess_audio(waveform_seg).to(DEVICE)  # [1, 1, H, W]
+                spec = preprocess_audio(waveform_seg).to(DEVICE)
 
-                # 2. 提取 Patch Embeddings (拦截点 1)
-                # Transformers ViT 的 patch_embeddings 输出是 [1, 1024, 24, 24]
-                # 我们需要展平为序列格式 [1, 576, 1024]
-                # --- 彻底修正后的拦截操作 ---
+                # --- 100% 还原进入 VIT 之前的操作 ---
+                # 直接调用 model.embeddings()。
+                # 这个方法内部会自动完成：
+                # 1. Patch Projection (切片并投影到 1024 维)
+                # 2. 加上 CLS Token (增加 1 个长度)
+                # 3. 加上 Position Embeddings (位置编码)
+                # 这就是 Transformer Encoder 见到的第一个输入。
+                x = model.embeddings(spec)
 
-                # 1. 提取原始 Patch Embeddings
-                # spec 形状是 [1, 1, 384, 384] (取决于 HeAR 的输入分辨率)
-                # patch_embeddings 输出通常是 [1, 1024, 24, 24]
-                embeddings = model.embeddings.patch_embeddings(spec)
+                # 转换为 numpy
+                # 形状应该是 (577, 1024) -> 1 个 CLS + 576 个音频补丁
+                # 或者根据你的环境可能是 (97, 1024)
+                feature_np = x.squeeze(0).cpu().numpy()
 
-                # 2. 变换维度：从 [1, 1024, 24, 24] 变为 [1, 576, 1024]
-                # 这里的 576 是 24 * 24 个 patch
-                x = embeddings.flatten(2)  # 变为 [1, 1024, 576]
-                x = x.transpose(1, 2)  # 变为 [1, 576, 1024] <--- 这一步是关键
-
-                # 3. 加上位置编码
-                # model.embeddings.position_embeddings 形状是 [1, 577, 1024]
-                # 我们跳过第一个 (CLS token) 对应的位置编码，取剩下的 576 个
-                pos_embed = model.embeddings.position_embeddings
-                x = x + pos_embed[:, 1:, :]  # 现在维度匹配了: [1, 576, 1024] + [1, 576, 1024]
-
-                # 4. 转换为 numpy
-                feature_np = x.squeeze(0).cpu().numpy()  # 最终形状 (576, 1024)
                 save_filename = filename.replace(".wav", ".npy")
                 save_path = os.path.join(SAVE_DIR, save_filename)
                 np.save(save_path, feature_np)
@@ -108,20 +92,15 @@ def main():
                     "feature_path": save_path,
                     "label": diag_map.get(user_id, 0)
                 })
-
             except Exception as e:
-                print(f"⚠️ {filename} 处理失败: {e}")
+                print(f"⚠️ {filename} 失败: {e}")
 
-    # 保存元数据
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
 
-    print(f"\n--- 任务完成 ---")
-    print(f"✅ 特征已保存至: {SAVE_DIR}")
-    print(f"📊 样本分布: 异常(1): {df['label'].sum()} | 健康(0): {len(df) - df['label'].sum()}")
-
-    if not df.empty:
-        print(f"📏 最终验证维度: {feature_np.shape}")  # 应该是 (576, 1024)
+    print(f"\n✅ 提取完成！")
+    print(f"📐 此时生成的特征维度为: {feature_np.shape}")
+    print(f"💡 这就是 HeAR 进入第一个 Transformer Block 之前的原始输入。")
 
 
 if __name__ == "__main__":
