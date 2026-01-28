@@ -10,32 +10,39 @@ from transformers import AutoModel
 
 # ================= 路径与参数 =================
 BASE_DIR = "/data/dingcong/hybrid"
-WAV_DIR = os.path.join(BASE_DIR, "audio_and_txt_files")
-SAVE_DIR = os.path.join(BASE_DIR, "raw_patches_v3")
-OUT_CSV = os.path.join(BASE_DIR, "metadata.csv")
+WAV_DIR = os.path.join(BASE_DIR, "audio_and_txt_files")  # 存放 wav 和 txt 的地方
+SAVE_DIR = os.path.join(BASE_DIR, "segmented_patches_v1")  # 保存 6898 个特征
+OUT_CSV = os.path.join(BASE_DIR, "metadata_segmented.csv")
 
 MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TARGET_SR = 16000
-TARGET_LEN = 32000  # 2秒
+FIXED_LEN = 32000  # HeAR 偏好 2 秒输入
 
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
 
-# ================= 工具函数 =================
-def get_most_informative_segment(waveform, target_len=32000):
-    C, T = waveform.shape
-    if T <= target_len:
-        return F.pad(waveform, (0, target_len - T))
-    energy = waveform.pow(2)
-    window_sum = F.avg_pool1d(energy.unsqueeze(0), kernel_size=target_len, stride=1600)
-    best_idx = torch.argmax(window_sum).item() * 1600
-    start = min(best_idx, T - target_len)
-    return waveform[:, start: start + target_len]
+# ================= 核心工具：对齐补丁 =================
+def process_segment(waveform, sr, start_t, end_t):
+    # 1. 裁剪音频
+    start_sample = int(start_t * sr)
+    end_sample = int(end_t * sr)
+    chunk = waveform[:, start_sample:end_sample]
+
+    # 2. 统一重采样到 16k
+    if sr != TARGET_SR:
+        chunk = torchaudio.functional.resample(chunk, sr, TARGET_SR)
+
+    # 3. 填充或截断至 2 秒 (32000个采样点)
+    if chunk.shape[1] < FIXED_LEN:
+        chunk = F.pad(chunk, (0, FIXED_LEN - chunk.shape[1]))
+    else:
+        chunk = chunk[:, :FIXED_LEN]
+    return chunk
 
 
-# ================= 核心主程序 =================
+# ================= 提取主程序 =================
 def main():
     print(f"🚀 Loading HeAR model...")
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -44,63 +51,64 @@ def main():
     import hear.python.data_processing.audio_utils as audio_utils
     preprocess_audio = audio_utils.preprocess_audio
 
-    # --- 标签加载逻辑 ---
-    diag_map = {}
-    diagnosis_path = os.path.join(BASE_DIR, "patient_diagnosis.csv")
-    if os.path.exists(diagnosis_path):
-        df_diag = pd.read_csv(diagnosis_path, header=None)
-        for _, row in df_diag.iterrows():
-            diag_map[str(row[0]).strip()] = 0 if str(row[1]).strip().upper() == "HEALTHY" else 1
-
     wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
     meta_data = []
 
-    print(f"🚧 正在截获 HeAR 输入端特征 (Exact Match)...")
+    print(f"📦 正在解析标注并提取 6898 个呼吸段...")
 
     with torch.no_grad():
-        for filename in tqdm(wav_files):
-            wav_path = os.path.join(WAV_DIR, filename)
+        for wav_name in tqdm(wav_files):
+            # 找到对应的 txt 标注文件
+            txt_name = wav_name.replace(".wav", ".txt")
+            txt_path = os.path.join(WAV_DIR, txt_name)
+            wav_path = os.path.join(WAV_DIR, wav_name)
+
+            if not os.path.exists(txt_path): continue
+
+            # 读取音频
+            waveform, sr = torchaudio.load(wav_path)
+
+            # 读取 txt 标注 (Start, End, Crackles, Wheezes)
             try:
-                waveform, sr = torchaudio.load(wav_path)
-                if sr != TARGET_SR:
-                    waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
+                # ICBHI txt 通常是以 tab 分隔
+                annotations = pd.read_csv(txt_path, sep='\t', header=None)
 
-                waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
-                spec = preprocess_audio(waveform_seg).to(DEVICE)
+                for i, row in annotations.iterrows():
+                    start_t, end_t, crackle, wheeze = row[0], row[1], int(row[2]), int(row[3])
 
-                # --- 100% 还原进入 VIT 之前的操作 ---
-                # 直接调用 model.embeddings()。
-                # 这个方法内部会自动完成：
-                # 1. Patch Projection (切片并投影到 1024 维)
-                # 2. 加上 CLS Token (增加 1 个长度)
-                # 3. 加上 Position Embeddings (位置编码)
-                # 这就是 Transformer Encoder 见到的第一个输入。
-                x = model.embeddings(spec)
+                    # 裁剪并预处理
+                    chunk = process_segment(waveform, sr, start_t, end_t)
+                    spec = preprocess_audio(chunk).to(DEVICE)
 
-                # 转换为 numpy
-                # 形状应该是 (577, 1024) -> 1 个 CLS + 576 个音频补丁
-                # 或者根据你的环境可能是 (97, 1024)
-                feature_np = x.squeeze(0).cpu().numpy()
+                    # --- 拦截操作：100% 还原进入 VIT 前的输入 ---
+                    x = model.embeddings(spec)
+                    feature_np = x.squeeze(0).cpu().numpy()  # (97, 1024)
 
-                save_filename = filename.replace(".wav", ".npy")
-                save_path = os.path.join(SAVE_DIR, save_filename)
-                np.save(save_path, feature_np)
+                    # 唯一标识符: 原文件名_段索引
+                    seg_id = f"{wav_name.replace('.wav', '')}_seg_{i}"
+                    save_path = os.path.join(SAVE_DIR, f"{seg_id}.npy")
+                    np.save(save_path, feature_np)
 
-                user_id = filename.split('_')[0].strip()
-                meta_data.append({
-                    "user_id": user_id,
-                    "feature_path": save_path,
-                    "label": diag_map.get(user_id, 0)
-                })
+                    # 标签逻辑：只要有病(Wheeze 或 Crackle)就记为 1
+                    label = 1 if (wheeze == 1 or crackle == 1) else 0
+
+                    meta_data.append({
+                        "original_wav": wav_name,
+                        "segment_id": seg_id,
+                        "feature_path": save_path,
+                        "label": label
+                    })
             except Exception as e:
-                print(f"⚠️ {filename} 失败: {e}")
+                print(f"⚠️ 跳过文件 {wav_name}: {e}")
 
+    # 保存新的元数据
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
 
-    print(f"\n✅ 提取完成！")
-    print(f"📐 此时生成的特征维度为: {feature_np.shape}")
-    print(f"💡 这就是 HeAR 进入第一个 Transformer Block 之前的原始输入。")
+    print(f"\n--- 提取完成 ---")
+    print(f"✅ 成功生成呼吸段特征数: {len(df)}")
+    print(f"📊 标签分布: 异常(1): {df['label'].sum()} | 正常(0): {len(df) - df['label'].sum()}")
+    print(f"💡 现在你可以用这个 CSV 开始训练了！")
 
 
 if __name__ == "__main__":
