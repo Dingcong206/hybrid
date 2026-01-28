@@ -108,7 +108,7 @@ class HeavyBlock(nn.Module):
 # 4) SSA_Model (非对称架构)
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, num_classes=1, n_layers=10, d_model=192, patch_time=4, dropout=0.3):
+    def __init__(self, num_classes=1, n_layers=8, d_model=128, patch_time=4, dropout=0.3):
         super().__init__()
         self.stem = ConvStem(embed_dim=d_model, patch_time=patch_time)
 
