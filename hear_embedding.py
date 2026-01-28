@@ -46,7 +46,6 @@ def get_most_informative_segment(waveform, target_len=32000):
     return waveform[:, start: start + target_len]
 
 # ================= 提取主程序 =================
-
 def main():
     print(f"🚀 Loading HeAR model to {DEVICE}...")
     # 1. 加载模型 (trust_remote_code 必须为 True 以加载本地定义的层)
@@ -66,7 +65,27 @@ def main():
         print("❌ 找不到 hear 文件夹。请确保 hear 文件夹在 /data/dingcong/hybrid 下")
         return
 
-    # 3. 扫描 WAV 文件
+    # 3. 预加载真实标签 (防止 label 全是 0)
+    # 假设你的诊断表路径是 DIAGNOSIS_CSV = "/data/dingcong/hybrid/patient_diagnosis.csv"
+    diag_map = {}
+    diagnosis_path = os.path.join(BASE_DIR, "patient_diagnosis.csv")
+    if os.path.exists(diagnosis_path):
+        try:
+            df_diag = pd.read_csv(diagnosis_path)
+            # 自动获取前两列：第一列 ID，第二列 Label
+            id_col = df_diag.columns[0]
+            label_col = df_diag.columns[1]
+            # 清理 ID 空格并建立字典映射
+            for _, row in df_diag.iterrows():
+                clean_id = str(row[id_col]).strip()
+                diag_map[clean_id] = int(row[label_col])
+            print(f"✅ 成功关联诊断表，已记录 {len(diag_map)} 个病人的标签")
+        except Exception as e:
+            print(f"⚠️ 读取诊断表失败，标签将默认设为 0: {e}")
+    else:
+        print("⚠️ 未找到 patient_diagnosis.csv，生成的 CSV 标签将全是 0")
+
+    # 4. 扫描 WAV 文件
     wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
     meta_data = []
 
@@ -85,16 +104,14 @@ def main():
                     waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
 
                 # C. 智能截取能量最大的 2 秒 (32000 个采样点)
-                # 这一步解决了 ValueError: Input audio must have 32000 samples 的报错
+                # 这一步返回 [1, 32000] 的张量
                 waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
 
                 # D. 预处理为 Spectrogram
-                # preprocess_audio 接收 [Time] 形状
-                #spec = preprocess_audio(waveform_seg.squeeze(0)).to(DEVICE)
+                # 修复 rank 1 报错：直接送入 [1, 32000] 的 waveform_seg
                 spec = preprocess_audio(waveform_seg).to(DEVICE)
 
-                # E. 【核心截取】：提取 Patch Embeddings
-                # 这一步会跳过 Transformer Encoder，直接拿到进入模型前的特征块
+                # E. 【核心截断】：提取 Patch Embeddings
                 patch_embeddings = model.embeddings(spec)
 
                 # F. 转换为 numpy 并保存
@@ -104,26 +121,50 @@ def main():
                 save_path = os.path.join(SAVE_DIR, save_filename)
                 np.save(save_path, feature_np)
 
-                # G. 记录到元数据
-                # 这里的 label 可以后续根据你的原始 CSV 进行 map
+                # G. 记录到元数据并匹配标签
+                user_id = filename.split('_')[0].strip()
+
+                # 尝试从字典获取真实标签，找不到则默认 0
+                label = diag_map.get(user_id)
+                if label is None:
+                    # 容错处理：尝试将 ID 转为数字后再匹配 (处理 001 vs 1)
+                    try:
+                        label = diag_map.get(str(int(user_id)), 0)
+                    except:
+                        label = 0
+
                 meta_data.append({
-                    "user_id": filename.split('_')[0],
+                    "user_id": user_id,
                     "feature_path": save_path,
-                    "label": 0  # 默认占位符
+                    "label": int(label)
                 })
 
             except Exception as e:
                 print(f"⚠️ 处理文件 {filename} 时出错: {e}")
                 continue
+
     print(f"DEBUG: Total samples in meta_data: {len(meta_data)}")
-    # 4. 保存映射表
+
+    # 5. 保存映射表
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
-    print(f"---")
-    print(f"✅ 特征提取完成！")
-    print(f"📂 特征保存在: {SAVE_DIR}")
-    print(f"📄 元数据保存在: {OUT_CSV}")
-    print(f"💡 下一步：请运行你的 train1.py 开始训练 SSA_Model。")
+
+    # 6. 最后的维度自检 (非常重要，用于修改 train1.py)
+    if not df.empty:
+        sample_feat = np.load(df.iloc[0]['feature_path'])
+        print(f"---")
+        print(f"✅ 特征提取完成！")
+        print(f"📊 样本总数: {len(df)} | 正样本(1)数量: {df['label'].sum()}")
+        print(f"📐 特征维度: {sample_feat.shape} (建议 train1.py 的 input_dim 设为 {sample_feat.shape[1]})")
+        print(f"📂 特征保存在: {SAVE_DIR}")
+        print(f"📄 元数据保存在: {OUT_CSV}")
+
+        if df['label'].sum() == 0:
+            print("❗ 警告：检测到 label 全是 0。请检查 patient_diagnosis.csv 的 ID 是否与文件名开头匹配。")
+    else:
+        print("❌ 提取失败，未保存任何数据。")
+
+    print(f"💡 下一步：请根据打印的特征维度修改 train1.py 并开始训练。")
 
 
 if __name__ == "__main__":
