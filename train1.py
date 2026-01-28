@@ -25,21 +25,25 @@ class SegDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        feat = np.load(row["feature_path"]).astype(np.float32)  # (T, D) e.g. (97,1024)
+        feat = np.load(row["feature_path"]).astype(np.float32)  # (T, D), e.g. (97,1024)
         label = float(row["label"])
         return torch.from_numpy(feat), torch.tensor(label, dtype=torch.float32)
 
 
 # =========================
-# 阈值搜索：按 F1 / ACC / ICBHI 选最佳阈值
+# 阈值搜索：按 ICBHI / F1 / ACC 选择最优阈值
 # =========================
-def search_best_threshold(y_true, y_prob, metric="f1"):
+def search_best_threshold(y_true, y_prob, metric="icbhi", thr_low=0.20, thr_high=0.80, steps=121):
+    """
+    thr_low~thr_high 用来避免搜到极低阈值导致“全判1”
+    metric: "icbhi" / "f1" / "acc"
+    """
     y_true = np.array(y_true).astype(int)
     y_prob = np.array(y_prob).reshape(-1)
 
     best = {"thr": 0.5, "score": -1.0}
 
-    for thr in np.linspace(0.05, 0.95, 181):
+    for thr in np.linspace(thr_low, thr_high, steps):
         y_pred = (y_prob >= thr).astype(int)
         cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
         tn, fp, fn, tp = cm.ravel()
@@ -82,8 +86,14 @@ def main():
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
 
-    BEST_BY = "f1"  # "f1" / "acc" / "icbhi"
+    # ✅ 改动重点：按 ICBHI 选阈值 + 保存 best
+    BEST_BY = "icbhi"  # "icbhi" / "f1" / "acc"
     SAVE_PATH = f"best_ssa_recording_split_{BEST_BY}.pth"
+
+    # ✅ 阈值搜索范围（避免过低阈值导致 SP 崩）
+    THR_LOW = 0.20
+    THR_HIGH = 0.80
+    THR_STEPS = 121
 
     # ===== 读 CSV =====
     df = pd.read_csv(CSV_PATH)
@@ -94,13 +104,13 @@ def main():
         raise ValueError(f"CSV 缺少列: {miss}，当前 columns={df.columns.tolist()}")
 
     print("✅ CSV columns =", df.columns.tolist())
-    print("📊 label dist:\n", df["label"].value_counts())
-    print("📈 label ratio:\n", df["label"].value_counts(normalize=True))
+    print("📊 전체 label dist:\n", df["label"].value_counts())
+    print("📈 전체 label ratio:\n", df["label"].value_counts(normalize=True))
 
     # ===== 方案二：按 original_wav 划分 =====
     recs = df["original_wav"].unique()
 
-    # 尽量做“录音级别的分层划分”：每条录音用其segment的max(label)当录音标签
+    # 录音级分层：每条录音的标签取该录音 segment label 的 max（只要有异常段就算异常录音）
     rec_label = df.groupby("original_wav")["label"].max().reindex(recs).values
     stratify = rec_label if len(np.unique(rec_label)) > 1 else None
 
@@ -117,6 +127,9 @@ def main():
     print(f"\n✅ Recording split done")
     print(f"Train recordings={len(train_r)} | Val recordings={len(val_r)}")
     print(f"Train segments={len(train_df)} | Val segments={len(val_df)}")
+
+    print("\n📊 Train label dist:\n", train_df["label"].value_counts())
+    print("📊 Val label dist:\n", val_df["label"].value_counts())
 
     train_loader = DataLoader(
         SegDataset(train_df),
@@ -136,7 +149,7 @@ def main():
     # ===== 模型 =====
     model = SSA_Model(input_dim=1024, d_model=256, n_layers=6).to(DEVICE)
 
-    # 你的 segment-level label 近似平衡：默认不加 pos_weight
+    # 你目前现象是“几乎全判1”，先不要加 pos_weight（会更偏向1）
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -177,14 +190,26 @@ def main():
                 all_probs.extend(probs.tolist())
                 all_labels.extend(labels.numpy().astype(int).tolist())
 
-        best = search_best_threshold(all_labels, all_probs, metric=BEST_BY)
+        best = search_best_threshold(
+            all_labels,
+            all_probs,
+            metric=BEST_BY,
+            thr_low=THR_LOW,
+            thr_high=THR_HIGH,
+            steps=THR_STEPS
+        )
+
+        # 额外输出：预测为1的比例（判断是否“全判异常”）
+        y_pred_best = (np.array(all_probs) >= best["thr"]).astype(int)
+        pred_pos_ratio = float(y_pred_best.mean())
 
         print(
             f"\nEpoch {epoch}/{EPOCHS} | Loss: {avg_loss:.4f} | "
             f"[SEG|recording_split] AUC: {best['auc']:.4f} | "
             f"ACC: {best['acc']:.4f} | F1: {best['f1']:.4f} | "
             f"SE: {best['se']:.4f} | SP: {best['sp']:.4f} | "
-            f"ICBHI: {best['icbhi']:.4f} | Thr*: {best['thr']:.3f}"
+            f"ICBHI: {best['icbhi']:.4f} | Thr*: {best['thr']:.3f} | "
+            f"Pred1%: {pred_pos_ratio*100:.1f}%"
         )
         print("Confusion Matrix (segment-level):\n", best["cm"])
 
