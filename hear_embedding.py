@@ -48,123 +48,93 @@ def get_most_informative_segment(waveform, target_len=32000):
 # ================= 提取主程序 =================
 def main():
     print(f"🚀 Loading HeAR model to {DEVICE}...")
-    # 1. 加载模型 (trust_remote_code 必须为 True 以加载本地定义的层)
     try:
         model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
         model.to(DEVICE).eval()
     except Exception as e:
-        print(f"❌ 模型加载失败，请检查网络或路径: {e}")
+        print(f"❌ 模型加载失败: {e}")
         return
 
-    # 2. 动态导入 HeAR 预处理工具
-    try:
-        import hear.python.data_processing.audio_utils as audio_utils
-        preprocess_audio = audio_utils.preprocess_audio
-        print("✅ HEAR 预处理模块加载成功")
-    except ImportError:
-        print("❌ 找不到 hear 文件夹。请确保 hear 文件夹在 /data/dingcong/hybrid 下")
-        return
+    import hear.python.data_processing.audio_utils as audio_utils
+    preprocess_audio = audio_utils.preprocess_audio
 
-    # 3. 预加载真实标签 (防止 label 全是 0)
-    # 假设你的诊断表路径是 DIAGNOSIS_CSV = "/data/dingcong/hybrid/patient_diagnosis.csv"
+    # --- 核心修改：针对 ICBHI 的标签转换逻辑 ---
     diag_map = {}
     diagnosis_path = os.path.join(BASE_DIR, "patient_diagnosis.csv")
     if os.path.exists(diagnosis_path):
         try:
-            df_diag = pd.read_csv(diagnosis_path)
-            # 自动获取前两列：第一列 ID，第二列 Label
-            id_col = df_diag.columns[0]
-            label_col = df_diag.columns[1]
-            # 清理 ID 空格并建立字典映射
+            # 读取 CSV，假设没有表头，第一列是 ID，第二列是诊断文本
+            df_diag = pd.read_csv(diagnosis_path, header=None)
             for _, row in df_diag.iterrows():
-                clean_id = str(row[id_col]).strip()
-                diag_map[clean_id] = int(row[label_col])
-            print(f"✅ 成功关联诊断表，已记录 {len(diag_map)} 个病人的标签")
-        except Exception as e:
-            print(f"⚠️ 读取诊断表失败，标签将默认设为 0: {e}")
-    else:
-        print("⚠️ 未找到 patient_diagnosis.csv，生成的 CSV 标签将全是 0")
+                p_id = str(row[0]).strip()
+                diag_text = str(row[1]).strip().upper()
 
-    # 4. 扫描 WAV 文件
+                # 定义分类逻辑：Healthy 为 0，其他所有病理状态（COPD, URTI, Asthma 等）为 1
+                label = 0 if diag_text == "HEALTHY" else 1
+                diag_map[p_id] = label
+
+            print(f"✅ 标签转换完成: Healthy -> 0, Others -> 1. 共记录 {len(diag_map)} 个病人")
+        except Exception as e:
+            print(f"⚠️ 标签表解析失败: {e}")
+    # ---------------------------------------
+
     wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
     meta_data = []
 
-    print(f"📦 Found {len(wav_files)} files. Starting Patch Embedding extraction...")
+    print(f"📦 正在处理 {len(wav_files)} 个 ICBHI 音频文件...")
 
     with torch.no_grad():
         for filename in tqdm(wav_files):
             wav_path = os.path.join(WAV_DIR, filename)
-
             try:
-                # A. 加载音频
                 waveform, sr = torchaudio.load(wav_path)
-
-                # B. 统一重采样到 16kHz
                 if sr != TARGET_SR:
                     waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
 
-                # C. 智能截取能量最大的 2 秒 (32000 个采样点)
-                # 这一步返回 [1, 32000] 的张量
+                # 能量搜索截断 2 秒
                 waveform_seg = get_most_informative_segment(waveform, TARGET_LEN)
 
-                # D. 预处理为 Spectrogram
-                # 修复 rank 1 报错：直接送入 [1, 32000] 的 waveform_seg
+                # 预处理 (确保 rank 2)
                 spec = preprocess_audio(waveform_seg).to(DEVICE)
 
-                # E. 【核心截断】：提取 Patch Embeddings
+                # 提取 HeAR Embedding
                 patch_embeddings = model.embeddings(spec)
+                feature_np = patch_embeddings.squeeze(0).cpu().numpy()
 
-                # F. 转换为 numpy 并保存
-                feature_np = patch_embeddings.squeeze(0).cpu().numpy()  # [Seq, Dim]
-
+                # 保存 .npy
                 save_filename = filename.replace(".wav", ".npy")
                 save_path = os.path.join(SAVE_DIR, save_filename)
                 np.save(save_path, feature_np)
 
-                # G. 记录到元数据并匹配标签
+                # 匹配标签：取文件名前 3 位 ID
                 user_id = filename.split('_')[0].strip()
-
-                # 尝试从字典获取真实标签，找不到则默认 0
-                label = diag_map.get(user_id)
-                if label is None:
-                    # 容错处理：尝试将 ID 转为数字后再匹配 (处理 001 vs 1)
-                    try:
-                        label = diag_map.get(str(int(user_id)), 0)
-                    except:
-                        label = 0
+                # 即使文件名是 101，诊断表可能是 101，通过 strip() 确保匹配
+                final_label = diag_map.get(user_id, 0)
 
                 meta_data.append({
                     "user_id": user_id,
                     "feature_path": save_path,
-                    "label": int(label)
+                    "label": final_label
                 })
 
             except Exception as e:
-                print(f"⚠️ 处理文件 {filename} 时出错: {e}")
-                continue
+                print(f"⚠️ 处理 {filename} 失败: {e}")
 
-    print(f"DEBUG: Total samples in meta_data: {len(meta_data)}")
-
-    # 5. 保存映射表
+    # 保存并打印自检信息
     df = pd.DataFrame(meta_data)
     df.to_csv(OUT_CSV, index=False)
 
-    # 6. 最后的维度自检 (非常重要，用于修改 train1.py)
     if not df.empty:
+        pos_count = df['label'].sum()
+        print(f"\n--- 提取总结 ---")
+        print(f"✅ 总样本: {len(df)}")
+        print(f"🔥 正样本 (异常): {pos_count} | 负样本 (健康): {len(df) - pos_count}")
+
         sample_feat = np.load(df.iloc[0]['feature_path'])
-        print(f"---")
-        print(f"✅ 特征提取完成！")
-        print(f"📊 样本总数: {len(df)} | 正样本(1)数量: {df['label'].sum()}")
-        print(f"📐 特征维度: {sample_feat.shape} (建议 train1.py 的 input_dim 设为 {sample_feat.shape[1]})")
-        print(f"📂 特征保存在: {SAVE_DIR}")
-        print(f"📄 元数据保存在: {OUT_CSV}")
-
-        if df['label'].sum() == 0:
-            print("❗ 警告：检测到 label 全是 0。请检查 patient_diagnosis.csv 的 ID 是否与文件名开头匹配。")
+        print(f"📐 特征维度: {sample_feat.shape}")
+        print(f"💡 请确保 train1.py 中的 input_dim = {sample_feat.shape[1]}")
     else:
-        print("❌ 提取失败，未保存任何数据。")
-
-    print(f"💡 下一步：请根据打印的特征维度修改 train1.py 并开始训练。")
+        print("❌ 错误：未能生成任何有效特征")
 
 
 if __name__ == "__main__":
