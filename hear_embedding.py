@@ -78,18 +78,26 @@ def main():
                 # 2. 提取 Patch Embeddings (拦截点 1)
                 # Transformers ViT 的 patch_embeddings 输出是 [1, 1024, 24, 24]
                 # 我们需要展平为序列格式 [1, 576, 1024]
+                # --- 彻底修正后的拦截操作 ---
+
+                # 1. 提取原始 Patch Embeddings
+                # spec 形状是 [1, 1, 384, 384] (取决于 HeAR 的输入分辨率)
+                # patch_embeddings 输出通常是 [1, 1024, 24, 24]
                 embeddings = model.embeddings.patch_embeddings(spec)
-                x = embeddings.flatten(2).transpose(1, 2)
 
-                # 3. 加上位置编码 (拦截点 2)
-                # model.embeddings.position_embeddings 是 [1, 577, 1024]
-                # 其中第一个是 CLS token 的位置，我们取后面的 576 个
+                # 2. 变换维度：从 [1, 1024, 24, 24] 变为 [1, 576, 1024]
+                # 这里的 576 是 24 * 24 个 patch
+                x = embeddings.flatten(2)  # 变为 [1, 1024, 576]
+                x = x.transpose(1, 2)  # 变为 [1, 576, 1024] <--- 这一步是关键
+
+                # 3. 加上位置编码
+                # model.embeddings.position_embeddings 形状是 [1, 577, 1024]
+                # 我们跳过第一个 (CLS token) 对应的位置编码，取剩下的 576 个
                 pos_embed = model.embeddings.position_embeddings
-                x = x + pos_embed[:, 1:, :]
+                x = x + pos_embed[:, 1:, :]  # 现在维度匹配了: [1, 576, 1024] + [1, 576, 1024]
 
-                # 4. 转换为 numpy 并保存
-                feature_np = x.squeeze(0).cpu().numpy()  # 结果为 (576, 1024)
-
+                # 4. 转换为 numpy
+                feature_np = x.squeeze(0).cpu().numpy()  # 最终形状 (576, 1024)
                 save_filename = filename.replace(".wav", ".npy")
                 save_path = os.path.join(SAVE_DIR, save_filename)
                 np.save(save_path, feature_np)
