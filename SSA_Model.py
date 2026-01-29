@@ -5,13 +5,12 @@ from mamba_ssm import Mamba
 
 
 # =====================================================
-# 1) BiMambaBlock: 双向扫描核心单元 (基础零件)
+# 1) BiMambaBlock: 保持双向逻辑
 # =====================================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.3):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
-        # 前向与后向 Mamba
         self.fwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
         self.bwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
         self.drop = nn.Dropout(dropout)
@@ -19,105 +18,124 @@ class BiMambaBlock(nn.Module):
     def forward(self, x):
         res = x
         x_norm = self.ln(x)
-        # 并行计算双向特征
         f_out = self.fwd_mamba(x_norm)
         b_out = torch.flip(self.bwd_mamba(torch.flip(x_norm, [1])), [1])
         return res + self.drop(f_out + b_out)
 
 
 # =====================================================
-# 2) SSA_Layer: 1个 1D卷积 + 3个 BiMamba + 1个 Attention
+# 2) SSA_Layer: 增强卷积表达与门控连接
 # =====================================================
 class SSA_Layer(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
 
-        # A. 局部特征聚合 (1D Convolution)
-        # 放在 Mamba 之前，每一层都先重新梳理局部邻域特征
+        # A. 改进卷积：增大感受野，不使用 groups 以增强通道间交互
         self.conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
             nn.Conv1d(d_model, d_model, kernel_size=1),
             nn.Dropout(dropout)
         )
 
-        # B. 内部堆叠 3 层 BiMamba (时序特征挖掘)
         self.bimamba_stack = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout)
             for _ in range(3)
         ])
 
-        # C. 内部 1 层全局 Attention (全局关联精炼)
         self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.drop = nn.Dropout(dropout)
 
+        # 门控：动态调节当前层特征贡献
+        self.gate = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
+
     def forward(self, x):
-        # 1. 先进行一维卷积处理 (维度转换 [B, L, C] -> [B, C, L])
         res_conv = x
         x_conv = x.transpose(1, 2)
-        x = self.conv(x_conv).transpose(1, 2)
-        x = x + res_conv  # 残差连接
+        x_c = self.conv(x_conv).transpose(1, 2)
+        x = res_conv + x_c
 
-        # 2. 连续经过 3 个 BiMamba
         for bimamba in self.bimamba_stack:
             x = bimamba(x)
 
-        # 3. 经过 1 个 Attention
         res_attn = x
         x_norm = self.attn_ln(x)
         x_attn, _ = self.attn(x_norm, x_norm, x_norm)
-        x = res_attn + self.drop(x_attn)
+        x_out = res_attn + self.drop(x_attn)
 
-        return x
+        # 应用门控
+        g = self.gate(x_out.mean(dim=1, keepdim=True))
+        return res_conv + g * x_out
 
 
 # =====================================================
-# 3) SSA_Model: 顶层架构 (堆叠 4 个 SSA_Layer)
+# 3) SSA_Model: 顶层架构 (引入 Top-K 池化与三路融合)
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=4):
+    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=4, seq_len=96):
         super().__init__()
 
-        # A. 输入投影层：将 HeAR 的 1024 维映射到 d_model 维度
         self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        self.pos_drop = nn.Dropout(dropout)
 
-        # B. 核心架构堆叠：4 个 SSA_Layer
-        # 每个大层内部结构：[Conv -> 3xBiMamba -> Attention]
         self.layers = nn.ModuleList([
             SSA_Layer(d_model, nhead=8, dropout=dropout)
             for _ in range(n_layers)
         ])
 
-        # C. 归一化与分类头
         self.norm = nn.LayerNorm(d_model)
-        self.pool_proj = nn.Linear(d_model, 1)
 
-        self.head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model // 2),
+        # 非线性池化投射
+        self.pool_proj = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_classes)
+            nn.Linear(d_model // 4, 1)
         )
 
-    def forward(self, x):
-        # 1. 投影层
-        x = self.input_proj(x)
+        # 分类头：支持三路特征融合 (d_model * 3)
+        self.head = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_classes)
+        )
 
-        # 2. 依次通过 4 个 SSA_Layer 大层
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x):
+        x = self.input_proj(x) + self.pos_embed
+        x = self.pos_drop(x)
+
         for layer in self.layers:
             x = layer(x)
 
-        # 3. 最终归一化
         x = self.norm(x)
 
-        # 4. 混合池化 (Attention Pooling + Global Max Pooling)
-        # 这种方式对呼吸音中的突发杂音（爆裂音）非常有效
-        weights = torch.softmax(self.pool_proj(x), dim=1)
-        attn_feat = torch.sum(x * weights, dim=1)
-        max_feat, _ = torch.max(x, dim=1)
+        # --- 核心改进：Top-K 选通注意力池化 ---
+        attn_logits = self.pool_proj(x)  # [B, L, 1]
 
-        feat = torch.cat([attn_feat, max_feat], dim=-1)  # [B, d_model * 2]
+        # 增加温度系数 0.5 使权重更集中
+        weights = torch.softmax(attn_logits / 0.5, dim=1)
+
+        # 只取注意力最强的 16 个 Patch (Top-K)
+        _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=16, dim=1)
+        # 掩码逻辑：将非 Top-K 的权重设为极小
+        mask = torch.zeros_like(attn_logits).fill_(-1e9)
+        mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
+        topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)
+
+        # 三路特征提取
+        attn_feat = torch.sum(x * topk_weights, dim=1)  # Top-K 注意力聚合
+        max_feat, _ = torch.max(x, dim=1)  # 全局最大特征
+        avg_feat = torch.mean(x, dim=1)  # 全局平均背景
+
+        # 融合特征
+        feat = torch.cat([attn_feat, max_feat, avg_feat], dim=-1)  # [B, d_model * 3]
 
         return self.head(feat).squeeze(-1)
