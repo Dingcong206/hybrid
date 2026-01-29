@@ -68,6 +68,15 @@ def main():
                     audio_chunk = waveform[:, start_sample:end_sample]
                     if sr != 16000:
                         audio_chunk = torchaudio.functional.resample(audio_chunk, sr, 16000)
+                        current_len = audio_chunk.shape[1]
+                        if current_len < 32000:
+                            # 如果短了，补零 (Padding)
+                            audio_chunk = F.pad(audio_chunk, (0, 32000 - current_len))
+                        else:
+                            # 如果长了，截断 (Truncating)
+                            # 建议取中间的 2 秒，这样更能抓到呼吸核心特征
+                            start_idx = (current_len - 32000) // 2
+                            audio_chunk = audio_chunk[:, start_idx: start_idx + 32000]
 
                     # 2. 调用 HeAR 官方预处理
                     # 这里会执行 HeAR 的健康声学检测重采样、2秒对齐等所有官方步骤
