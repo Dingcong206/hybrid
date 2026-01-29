@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from transformers import AutoModel
+import torch.nn.functional as F
 import hear.python.data_processing.audio_utils as audio_utils
 
 # ================= 路径与参数 =================
