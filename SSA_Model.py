@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+from mamba_ssm import Mamba
 # =====================================================
 # 1) MambaBlock: 纯粹的 Mamba 时序建模块
 # =====================================================
