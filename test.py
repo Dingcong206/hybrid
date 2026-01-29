@@ -1,31 +1,17 @@
-import numpy as np
+import pandas as pd
 import os
 
-# 1. 随意取一个文件
-data_dir = "/data/dingcong/hybrid/segmented_patches_v1"
-files = [f for f in os.listdir(data_dir) if f.endswith('.npy')]
+# 路径
+CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/combined_data.csv"
 
-if not files:
-    print("目录里没找到文件！")
-else:
-    sample_file = files[0]
-    file_path = os.path.join(data_dir, sample_file)
+# 尝试用更鲁棒的方式读取
+df = pd.read_csv(CSV_PATH)
 
-    # 2. 加载数据
-    data = np.load(file_path)
+# 查看前几行 ID 和 状态，确认列名是否正确
+print("列名列表:", df.columns.tolist())
+print("\n前 5 行数据预览:")
+print(df[['id', 'covid_status']].head())
 
-    print(f"--- 文件检查报告 ---")
-    print(f"文件名: {sample_file}")
-    print(f"特征维度 (Shape): {data.shape}")
-
-    # 3. 维度验证逻辑
-    if data.shape == (97, 1024):
-        print("✅ 维度正确：这是 97 个 Raw Patch，符合进入 ViT 之前的特征。")
-    elif data.shape == (98, 1024):
-        print("⚠️ 包含 CLS Token：维度是 98，后续 Mamba 训练时记得用 data[1:, :]。")
-    else:
-        print(f"❌ 维度异常：拿到的维度是 {data.shape}，请检查提取拦截点。")
-
-    # 4. 数值检查（确保不是全 0 或空值）
-    print(f"数值均值: {data.mean():.4f}")
-    print(f"数值标准差: {data.std():.4f}")
+# 查看所有的标签类型（这很重要，因为 Coswara 有多种状态）
+print("\n所有标签分布:")
+print(df['covid_status'].value_counts())
