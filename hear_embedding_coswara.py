@@ -7,7 +7,7 @@ from tqdm import tqdm
 from transformers import AutoModel
 import torch.nn.functional as F
 
-# ================= 1. 配置还原 =================
+# ================= 配置 =================
 BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"
 COSWARA_CSV = os.path.join(BASE_DIR, "combined_data.csv")
 SAVE_DIR = os.path.join(BASE_DIR, "coswara_hear_patches_v1")
@@ -23,62 +23,83 @@ LABEL_MAP = {'healthy': 0, 'positive_mild': 1, 'positive_moderate': 1, 'positive
 
 
 def main():
-    print(f"🚀 正在还原 HeAR 论文预处理流程 (ViT 前馈拦截)...")
-    # trust_remote_code 是必须的，因为 HeAR 的 Spectrogram 转换逻辑写在远程脚本里
+    # 1. 加载模型
+    print(f"🚀 加载 HeAR 模型...")
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
     model.to(DEVICE).eval()
 
-    # --- 第一步：解析元数据 ---
+    # 2. 检查 CSV
+    if not os.path.exists(COSWARA_CSV):
+        print(f"❌ 错误：找不到 CSV 文件：{COSWARA_CSV}")
+        return
+
     df_raw = pd.read_csv(COSWARA_CSV)
     df_raw['id'] = df_raw['id'].astype(str).str.strip()
     label_lookup = {row['id']: row['covid_status'] for _, row in df_raw.iterrows()}
+    print(f"📋 CSV 加载完成，共有 {len(label_lookup)} 个 ID 映射。")
 
-    # --- 第二步：扫描全量音频 (5.7万样本) ---
+    # 3. 扫描文件 (优化路径逻辑)
     audio_tasks = []
+    print(f"🔍 扫描音频文件中...")
     for root, dirs, files in os.walk(BASE_DIR):
-        if "coswara_hear_patches" in root: continue
         for f in files:
             if f.endswith(('.wav', '.webm')):
-                u_id = os.path.basename(root).strip()
-                if len(u_id) < 15: continue
-                status = label_lookup.get(u_id)
-                if status in LABEL_MAP:
-                    audio_tasks.append(
-                        {"u_id": u_id, "f_name": f, "path": os.path.join(root, f), "label": LABEL_MAP[status]})
+                # 寻找路径中符合 ID 特征的部分（长字符串）
+                parts = root.split(os.sep)
+                u_id = None
+                for p in parts:
+                    if len(p) > 20:  # Coswara ID 通常很长
+                        u_id = p.strip()
+                        break
 
-    # --- 第三步：核心提取 ---
+                if u_id and u_id in label_lookup:
+                    status = label_lookup[u_id]
+                    if status in LABEL_MAP:
+                        audio_tasks.append({
+                            "u_id": u_id,
+                            "f_name": f,
+                            "path": os.path.join(root, f),
+                            "label": LABEL_MAP[status]
+                        })
+
+    if not audio_tasks:
+        print("❌ 扫描结果为 0！请检查音频文件是否在 BASE_DIR 下，以及文件夹名是否为 ID。")
+        # 打印一个示例路径帮自己排查
+        return
+
+    print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始提取...")
+
+    #
+
+    # 4. 提取循环
     meta_data = []
-    pbar = tqdm(total=len(audio_tasks), desc="论文级特征提取")
+    fail_reasons = {}
+    pbar = tqdm(total=len(audio_tasks))
 
     with torch.no_grad():
         for task in audio_tasks:
             try:
-                # 1. 信号对齐论文：16kHz 单声道
                 waveform, sr = torchaudio.load(task["path"])
+
+                # 预处理
                 if waveform.shape[0] > 1:
                     waveform = torch.mean(waveform, dim=0, keepdim=True)
                 if sr != 16000:
                     waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
 
-                # 2. 窗口对齐：强制 2.0s (论文核心参数)
-                # 论文提到 313M 的 2s 片段。对于长录音，取中心 2s 是保留呼吸/咳嗽核心的最稳妥办法
+                # 2秒窗口
                 if waveform.shape[1] > 32000:
                     start = (waveform.shape[1] - 32000) // 2
                     waveform = waveform[:, start:start + 32000]
                 else:
                     waveform = F.pad(waveform, (0, 32000 - waveform.shape[1]))
 
-                # 3. 维度对齐：确保 Rank 2 [1, 32000]
                 audio_input = waveform.to(DEVICE)
 
-                # 4. 拦截：进入 ViT Block 之前的 Embedding
-                # 此函数包含：Waveform -> Mel-Spec -> Linear Projection -> + Positional Embedding
+                # 进入 ViT 前的 Embedding
                 output = model.embeddings(audio_input)
-
-                # 论文中 embeddings 返回通常是 (tensor, metadata)
                 x = output[0] if isinstance(output, (tuple, list)) else output
 
-                # 5. 保存 [97, 1024]
                 feature_np = x.squeeze(0).cpu().numpy()
                 save_name = f"{task['u_id']}_{task['f_name'].replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
@@ -91,14 +112,23 @@ def main():
                     "label": task["label"]
                 })
 
-            except Exception:
-                continue
+            except Exception as e:
+                err_type = type(e).__name__
+                fail_reasons[err_type] = fail_reasons.get(err_type, 0) + 1
+
             finally:
                 pbar.update(1)
 
     pbar.close()
-    pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
-    print(f"\n✨ 还原完成！共处理 {len(meta_data)} 个样本。")
+
+    # 5. 结果汇报
+    if meta_data:
+        pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
+        print(f"✅ 提取大功告成！生成文件：{len(meta_data)}")
+        if fail_reasons:
+            print(f"⚠️ 失败统计：{fail_reasons}")
+    else:
+        print("❌ 最终没有生成任何文件。请检查音频读取权限。")
 
 
 if __name__ == "__main__":
