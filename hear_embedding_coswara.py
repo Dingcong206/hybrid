@@ -7,11 +7,17 @@ from tqdm import tqdm
 from transformers import AutoModel
 import torch.nn.functional as F
 
-# ================= 配置 =================
+# 必须引入官方工具包，这是检测器的核心
+try:
+    import hear.python.data_processing.audio_utils as audio_utils
+except ImportError:
+    print("❌ 错误：未找到 hear 官方工具包。请确保 sys.path 包含 hear 源码路径。")
+
+# ================= 1. 环境配置 =================
 BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"
 COSWARA_CSV = os.path.join(BASE_DIR, "combined_data.csv")
-SAVE_DIR = os.path.join(BASE_DIR, "coswara_hear_patches_v1")
-OUT_CSV = os.path.join(BASE_DIR, "coswara_metadata_segmented.csv")
+SAVE_DIR = os.path.join(BASE_DIR, "coswara_hear_patches_expert")
+OUT_CSV = os.path.join(BASE_DIR, "coswara_metadata_expert.csv")
 
 MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,83 +29,64 @@ LABEL_MAP = {'healthy': 0, 'positive_mild': 1, 'positive_moderate': 1, 'positive
 
 
 def main():
-    # 1. 加载模型
-    print(f"🚀 加载 HeAR 模型...")
+    print(f"🚀 初始化 HeAR 专家模式 (声学检测器 + ViT 拦截)...")
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
     model.to(DEVICE).eval()
 
-    # 2. 检查 CSV
-    if not os.path.exists(COSWARA_CSV):
-        print(f"❌ 错误：找不到 CSV 文件：{COSWARA_CSV}")
-        return
-
+    # --- 第一步：解析元数据 ---
     df_raw = pd.read_csv(COSWARA_CSV)
     df_raw['id'] = df_raw['id'].astype(str).str.strip()
     label_lookup = {row['id']: row['covid_status'] for _, row in df_raw.iterrows()}
-    print(f"📋 CSV 加载完成，共有 {len(label_lookup)} 个 ID 映射。")
 
-    # 3. 扫描文件 (优化路径逻辑)
+    # --- 第二步：扫描文件 ---
     audio_tasks = []
-    print(f"🔍 扫描音频文件中...")
     for root, dirs, files in os.walk(BASE_DIR):
+        if "coswara_hear_patches" in root: continue
         for f in files:
             if f.endswith(('.wav', '.webm')):
-                # 寻找路径中符合 ID 特征的部分（长字符串）
                 parts = root.split(os.sep)
-                u_id = None
-                for p in parts:
-                    if len(p) > 20:  # Coswara ID 通常很长
-                        u_id = p.strip()
-                        break
-
+                u_id = next((p for p in parts if len(p) > 20), None)
                 if u_id and u_id in label_lookup:
                     status = label_lookup[u_id]
                     if status in LABEL_MAP:
-                        audio_tasks.append({
-                            "u_id": u_id,
-                            "f_name": f,
-                            "path": os.path.join(root, f),
-                            "label": LABEL_MAP[status]
-                        })
+                        audio_tasks.append(
+                            {"u_id": u_id, "f_name": f, "path": os.path.join(root, f), "label": LABEL_MAP[status]})
 
-    if not audio_tasks:
-        print("❌ 扫描结果为 0！请检查音频文件是否在 BASE_DIR 下，以及文件夹名是否为 ID。")
-        # 打印一个示例路径帮自己排查
-        return
+    print(f"📊 扫描完成：共 {len(audio_tasks)} 条录音。开始专家级提取...")
 
-    print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始提取...")
-
-    #
-
-    # 4. 提取循环
+    # --- 第三步：核心提取逻辑 ---
     meta_data = []
-    fail_reasons = {}
     pbar = tqdm(total=len(audio_tasks))
+
+    # 统计跳过原因
+    stats = {"detector_skip": 0, "file_error": 0, "success": 0}
 
     with torch.no_grad():
         for task in audio_tasks:
             try:
+                # 1. 安全加载（处理读取权限或损坏问题）
+                if not os.access(task["path"], os.R_OK):
+                    stats["file_error"] += 1
+                    continue
+
                 waveform, sr = torchaudio.load(task["path"])
 
-                # 预处理
-                if waveform.shape[0] > 1:
-                    waveform = torch.mean(waveform, dim=0, keepdim=True)
-                if sr != 16000:
-                    waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+                # 2. 论文核心：调用官方声学检测器
+                # preprocess_audio 内部会进行：
+                # 检测声学事件 -> 截取最有意义的段 -> 重采样至 16k -> 对齐至 32000 点
+                spec = audio_utils.preprocess_audio(waveform)
 
-                # 2秒窗口
-                if waveform.shape[1] > 32000:
-                    start = (waveform.shape[1] - 32000) // 2
-                    waveform = waveform[:, start:start + 32000]
-                else:
-                    waveform = F.pad(waveform, (0, 32000 - waveform.shape[1]))
+                if spec is None:
+                    # 这就是为什么之前会“提取失败”：检测器认为这段音频是废片（纯静音或纯噪音）
+                    stats["detector_skip"] += 1
+                    continue
 
-                audio_input = waveform.to(DEVICE)
-
-                # 进入 ViT 前的 Embedding
+                # 3. 提取 Patch Embeddings (拦截进入 ViT 之前)
+                audio_input = spec.to(DEVICE)
                 output = model.embeddings(audio_input)
                 x = output[0] if isinstance(output, (tuple, list)) else output
 
+                # 4. 保存 [97, 1024]
                 feature_np = x.squeeze(0).cpu().numpy()
                 save_name = f"{task['u_id']}_{task['f_name'].replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
@@ -111,31 +98,25 @@ def main():
                     "feature_path": save_path,
                     "label": task["label"]
                 })
+                stats["success"] += 1
 
             except Exception as e:
-                err_type = type(e).__name__
-                fail_reasons[err_type] = fail_reasons.get(err_type, 0) + 1
-
+                stats["file_error"] += 1
+                continue
             finally:
                 pbar.update(1)
 
     pbar.close()
 
-    # 5. 结果汇报
+    # --- 第四步：保存统计 ---
     if meta_data:
         pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
-        print(f"✅ 提取大功告成！生成文件：{len(meta_data)}")
-        if fail_reasons:
-            print(f"⚠️ 失败统计：{fail_reasons}")
+        print(f"\n✨ 提取总结:")
+        print(f"✅ 成功生成: {stats['success']} 个特征")
+        print(f"🚫 检测器过滤 (无意义音频): {stats['detector_skip']} 个")
+        print(f"⚠️ 文件读取错误/权限问题: {stats['file_error']} 个")
     else:
-        print("❌ 最终没有生成任何文件。请检查音频读取权限。")
-        # 在 main 函数结束前加入
-        if meta_data:
-            df_out = pd.DataFrame(meta_data)
-            print("\n📊 提取统计（按音频类型）:")
-            # 假设文件名中包含类型信息，如 cough-heavy
-            df_out['audio_type'] = df_out['original_wav'].apply(lambda x: x.split('.')[0])
-            print(df_out['audio_type'].value_counts())
+        print("❌ 任务结束，未生成任何特征。请检查检测器逻辑。")
 
 
 if __name__ == "__main__":
