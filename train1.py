@@ -88,7 +88,7 @@ def train():
     CSV_PATH = "/data/dingcong/hybrid/metadata_segmented.csv"
     BATCH_SIZE = 64
     LR = 1e-4
-    EPOCHS = 50
+    EPOCHS = 100
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- 数据加载与采样策略 ---
