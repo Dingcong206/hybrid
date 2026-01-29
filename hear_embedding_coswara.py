@@ -4,8 +4,22 @@ import torchaudio
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import os
+import torch
+import torchaudio
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 import torch.nn.functional as F
 from transformers import AutoModel
+import sys
+
+import tempfile
+import subprocess
+import soundfile as sf
+import torch.nn.functional as F
+from transformers import AutoModel
+
 import sys
 def load_audio_ffmpeg(path, target_sr=16000):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
