@@ -66,6 +66,8 @@ def main():
                     start_sample = int(start_t * sr)
                     end_sample = int(end_t * sr)
                     audio_chunk = waveform[:, start_sample:end_sample]
+                    if sr != 16000:
+                        audio_chunk = torchaudio.functional.resample(audio_chunk, sr, 16000)
 
                     # 2. 调用 HeAR 官方预处理
                     # 这里会执行 HeAR 的健康声学检测重采样、2秒对齐等所有官方步骤
