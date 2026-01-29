@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from transformers import AutoModel
-import traceback
+import torch.nn.functional as F
 
 # ================= 1. 路径与参数 =================
 BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"
@@ -19,108 +19,73 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-# 标签映射 (严格对应你的 cut 结果)
 STRICT_LABEL_MAP = {
-    'healthy': 0,
-    'positive_mild': 1,
-    'positive_moderate': 1,
-    'positive_asymp': 1
+    'healthy': 0, 'positive_mild': 1, 'positive_moderate': 1, 'positive_asymp': 1
 }
 
 
 def main():
-    print(f"🚀 正在加载 HeAR 官方模型 (Device: {DEVICE})...")
-    # trust_remote_code 是调用官方健康声学预处理逻辑的关键
+    print(f"🚀 正在加载 HeAR 官方模型...")
+    # 必须保证 trust_remote_code=True
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
     model.to(DEVICE).eval()
 
     # --- 第一步：解析元数据 ---
-    if not os.path.exists(COSWARA_CSV):
-        print(f"❌ 未找到标签文件: {COSWARA_CSV}")
-        return
     df_raw = pd.read_csv(COSWARA_CSV)
     df_raw['id'] = df_raw['id'].astype(str).str.strip()
     label_lookup = {row['id']: row['covid_status'] for _, row in df_raw.iterrows()}
 
     # --- 第二步：深度扫描音频 ---
     audio_tasks = []
-    print(f"🔍 正在扫描全量音频文件...")
-
     for root, dirs, files in os.walk(BASE_DIR):
         if "coswara_hear_patches" in root: continue
-
         for f in files:
             if f.endswith(('.wav', '.webm')):
-                # 提取 User ID (当前文件夹名)
                 u_id = os.path.basename(root).strip()
-
-                # 过滤掉非 ID 的日期文件夹 (ID 长度通常较长)
                 if len(u_id) < 15: continue
-
                 status = label_lookup.get(u_id)
                 if status in STRICT_LABEL_MAP:
-                    audio_tasks.append({
-                        "user_id": u_id,
-                        "file_name": f,
-                        "path": os.path.join(root, f),
-                        "label": STRICT_LABEL_MAP[status],
-                        "status": status
-                    })
+                    audio_tasks.append((u_id, f, os.path.join(root, f), STRICT_LABEL_MAP[status], status))
 
-    if len(audio_tasks) == 0:
-        print("❌ 扫描完成但未发现匹配 ID。请检查文件夹名是否为 ID 字符串。")
-        return
+    print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始提取...")
 
-    print(f"📊 匹配成功：共发现 {len(audio_tasks)} 个有效音频。开始提取...")
-
-    # --- 第三步：特征提取 (核心纠错版) ---
-    # --- 第三步：特征提取 (稳健版) ---
+    # --- 第三步：特征提取 (核心修正) ---
     meta_data = []
-    pbar = tqdm(total=len(audio_tasks), desc="特征提取进度")
+    pbar = tqdm(total=len(audio_tasks), desc="提取进度")
 
     with torch.no_grad():
-        for task in audio_tasks:
-            u_id = task["user_id"]
-            wav_path = task["path"]
-            f_name = task["file_name"]
-
+        for u_id, f_name, wav_path, label, status in audio_tasks:
             try:
-                # 1. 加载音频并重采样至 16kHz (HeAR 必须要求 16k)
+                # 1. 加载并强制重采样到 16000Hz
                 waveform, sr = torchaudio.load(wav_path)
                 if sr != 16000:
-                    resampler = torchaudio.transforms.Resample(sr, 16000)
-                    waveform = resampler(waveform)
+                    waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
 
-                # 2. 替代 preprocess_audio 的逻辑
-                # 如果 model.preprocess_audio 报错，我们手动处理输入
+                # 2. 核心：手动处理输入长度（HeAR 期望 32000 个采样点）
+                if waveform.shape[1] > 32000:
+                    waveform = waveform[:, :32000]
+                else:
+                    waveform = F.pad(waveform, (0, 32000 - waveform.shape[1]))
+
+                # 将音频放入 GPU
+                audio_input = waveform.to(DEVICE)
+
+                # 3. 关键修正：直接获取 Patch Embeddings
+                # 不再使用 model.preprocess_audio 或 model()
+                # 而是使用 HeAR 专门提供的 embeddings 接口
                 try:
-                    # 尝试原方法
-                    processed = model.preprocess_audio(waveform, 16000).to(DEVICE)
-                except AttributeError:
-                    # 如果原方法不存在，手动对齐音频长度（HeAR 期望 2秒 = 32000 个采样点）
-                    # 简单填充或截断到 32000
-                    if waveform.shape[1] > 32000:
-                        waveform = waveform[:, :32000]
-                    elif waveform.shape[1] < 32000:
-                        waveform = torch.nn.functional.pad(waveform, (0, 32000 - waveform.shape[1]))
+                    # 尝试官方提供的 patch embedding 接口
+                    embeddings = model.embeddings(audio_input)
+                except:
+                    # 如果上面还错，直接跑 forward 并取第一个输出（通常是 embeddings）
+                    outputs = model(audio_input)
+                    # 这里的 outputs 可能是 (embeddings, logits)
+                    embeddings = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
-                    # 模拟 preprocess_audio 的关键步骤：获取 Log-Mel Spectrogram
-                    # 这里的处理如果复杂，可以直接尝试 model 内部的 call
-                    processed = waveform.to(DEVICE)
-
-                # 3. 提取特征
-                # 如果 model.embeddings 也不行，使用通用 forward
-                try:
-                    embeddings = model.embeddings(processed)
-                except AttributeError:
-                    # 最后的兜底逻辑：直接调用 forward
-                    # 注意：有些版本的 forward 直接返回的就是 patch embeddings
-                    outputs = model(processed)
-                    embeddings = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
-
+                # 4. 转换并保存
+                # 确保形状是 (97, 1024)
                 feat_np = embeddings.squeeze(0).cpu().numpy()
 
-                # 4. 保存 (代码同前...)
                 save_name = f"{u_id}_{f_name.replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
                 np.save(save_path, feat_np)
@@ -129,8 +94,8 @@ def main():
                     "user_id": u_id,
                     "original_wav": f_name,
                     "feature_path": save_path,
-                    "label": task["label"],
-                    "covid_status": task["status"]
+                    "label": label,
+                    "covid_status": status
                 })
 
             except Exception as e:
@@ -138,15 +103,13 @@ def main():
 
             pbar.update(1)
 
-    # --- 第四步：保存结果 ---
-    if len(meta_data) > 0:
-        df_out = pd.DataFrame(meta_data)
-        df_out.to_csv(OUT_CSV, index=False)
-        print(f"\n✨ 任务圆满完成！")
-        print(f"✅ 成功提取特征数: {len(df_out)}")
-        print(f"📄 索引文件已生成: {OUT_CSV}")
+    pbar.close()
+
+    if meta_data:
+        pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
+        print(f"✅ 完成！提取样本数: {len(meta_data)}")
     else:
-        print("\n❌ 提取失败：虽然扫描到了音频，但提取过程中全部报错。请检查 GPU 显存或 torchaudio 版本。")
+        print("❌ 提取失败，样本数为 0")
 
 
 if __name__ == "__main__":
