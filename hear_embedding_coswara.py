@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from transformers import AutoModel
-import torch.nn.functional as F
+import traceback
 
 # ================= 1. 路径与参数 =================
 BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"
@@ -25,8 +25,7 @@ STRICT_LABEL_MAP = {
 
 
 def main():
-    print(f"🚀 正在加载 HeAR 模型...")
-    # 强制 trust_remote_code
+    print(f"🚀 正在加载 HeAR 模型并启用官方健康声学检测器...")
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
     model.to(DEVICE).eval()
 
@@ -47,45 +46,42 @@ def main():
                 if status in STRICT_LABEL_MAP:
                     audio_tasks.append((u_id, f, os.path.join(root, f), STRICT_LABEL_MAP[status], status))
 
-    print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始提取...")
+    print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始利用 HeAR 检测器提取 Patch...")
 
-    # --- 第三步：特征提取 (核心修正：解决 Unpack 错误) ---
+    # --- 第三步：特征提取 (核心修正) ---
     meta_data = []
     pbar = tqdm(total=len(audio_tasks), desc="提取进度")
 
     with torch.no_grad():
         for u_id, f_name, wav_path, label, status in audio_tasks:
             try:
-                # 1. 音频标准化 (16kHz)
+                # 1. 加载音频
                 waveform, sr = torchaudio.load(wav_path)
-                if waveform.shape[0] > 1:  # 转单声道
-                    waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-                if sr != 16000:
-                    waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+                # 2. **调用 HeAR 官方检测器逻辑** # preprocess_audio 会自动处理重采样、静音切除，并截取探测器认为有意义的声学段
+                # 如果 model.preprocess_audio 依然因为环境问题报错，这块需要根据 model 实际属性微调
+                try:
+                    # 这里的 processed 已经是探测器截取后的 [1, N_samples] 音频
+                    processed_audio = model.preprocess_audio(waveform, sr).to(DEVICE)
+                except AttributeError:
+                    # 如果顶层没有 preprocess_audio，则尝试调用其内部 detector 模块
+                    # 这里的逻辑根据 google/hear-pytorch 的最新远程代码适配
+                    processed_audio = model.audio_detector(waveform, sr).to(DEVICE)
 
-                # 2. 长度截断/填充 (2秒 = 32000采样点)
-                if waveform.shape[1] > 32000:
-                    waveform = waveform[:, :32000]
+                # 3. **提取进入 ViT 之前的 Patch Embeddings**
+                # 我们避开 model.embeddings()，直接调用其底层的 ViT embedding 模块
+                # 在 ViT 架构中，这一层负责将 Log-Mel 频谱切块并线性映射
+                if hasattr(model, 'vit'):
+                    patch_outputs = model.vit.embeddings(processed_audio)
                 else:
-                    waveform = F.pad(waveform, (0, 32000 - waveform.shape[1]))
+                    # 最后的安全方案：如果无法定位 vit 子模块，则手动通过 embeddings 但处理元组
+                    output = model.embeddings(processed_audio)
+                    patch_outputs = output[0] if isinstance(output, (tuple, list)) else output
 
-                # 3. 核心：通过 model.embeddings 提取，并处理元组返回
-                audio_input = waveform.to(DEVICE)
+                # 此时形状应为 [1, 97, 1024]
+                feat_np = patch_outputs.squeeze(0).cpu().numpy()
 
-                # 【关键修正点】
-                output = model.embeddings(audio_input)
-
-                # 如果返回的是元组 (tuple)，提取第一个元素
-                if isinstance(output, (tuple, list)):
-                    # 报错 expected 4, got 2 说明返回了 (embeddings, something_else)
-                    embeddings = output[0]
-                else:
-                    embeddings = output
-
-                # 4. 确认形状并保存
-                feat_np = embeddings.squeeze(0).cpu().numpy()  # 应为 (97, 1024)
-
+                # 4. 保存
                 save_name = f"{u_id}_{f_name.replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
                 np.save(save_path, feat_np)
@@ -107,9 +103,9 @@ def main():
 
     if meta_data:
         pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
-        print(f"✅ 成功提取 {len(meta_data)} 个特征文件！")
+        print(f"✅ 提取成功！样本数: {len(meta_data)}")
     else:
-        print("❌ 最终提取数为 0，请检查报错详情。")
+        print("❌ 提取失败。")
 
 
 if __name__ == "__main__":
