@@ -7,7 +7,26 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from transformers import AutoModel
 import sys
+def load_audio_ffmpeg(path, target_sr=16000):
+    """
+    使用 ffmpeg 解码任意音频（webm / wav / ogg）
+    输出: waveform [1, T], sr
+    """
+    tmp_wav = "/tmp/tmp_audio.wav"
 
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", str(target_sr), tmp_wav],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    audio, sr = sf.read(tmp_wav)
+    audio = torch.tensor(audio).float()
+
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+
+    return audio, sr
 # 必须确保你能导入 hear 源码里的工具包
 # 如果 hear 文件夹在 /data/dingcong/hybrid/hear，请确保它在路径里
 sys.path.append("/data/dingcong/hybrid")
@@ -74,7 +93,7 @@ def main():
 
                 # 针对损坏文件做一次 try，避免中断整个循环
                 try:
-                    waveform, sr = torchaudio.load(task["path"])
+                    waveform, sr = load_audio_ffmpeg(task["path"])
                 except Exception:
                     stats["file_broken"] += 1
                     continue
