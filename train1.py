@@ -1,150 +1,149 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import pandas as pd
 import numpy as np
-from sklearn.metrics import confusion_matrix, roc_auc_score, recall_score, accuracy_score
+from sklearn.metrics import confusion_matrix, roc_auc_score, accuracy_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import os
 
+# 这里假设你的 SSA_Model 定义在 SSA_Model.py 文件中
+from SSA_Model import SSA_Model
 
-# 导入你刚才定义的模型
-# from SSA_Model import SSA_Model
 
 # =====================================================
-# 1) Focal Loss: 强迫模型关注难学的异常样本
+# 1) 损失函数：Focal Loss (针对医疗数据类别不平衡)
 # =====================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2):
-        super(FocalLoss, self).__init__()
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
     def forward(self, inputs, targets):
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
-        return F_loss.mean()
+        return (self.alpha * (1 - pt) ** self.gamma * BCE_loss).mean()
 
 
 # =====================================================
-# 2) Dataset: 加载你提取的 (97, 1024) 特征
+# 2) 数据集类：读取 HeAR 提取好的 .npy
 # =====================================================
 class ICBHIDataset(Dataset):
     def __init__(self, csv_file):
-        self.data = pd.read_csv(csv_file)
+        self.df = pd.read_csv(csv_file)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.df)
 
     def __getitem__(self, idx):
-        path = self.data.iloc[idx]['feature_path']
-        label = self.data.iloc[idx]['label']
-        # 加载 HeAR 特征
-        features = np.load(path).astype(np.float32)
-        # 如果维度是 (98, 1024)，截断为 (97, 1024)
-        if features.shape[0] == 98:
-            features = features[1:, :]
-        return torch.from_numpy(features), torch.tensor(label, dtype=torch.float32)
+        row = self.df.iloc[idx]
+        # 加载特征
+        feat = np.load(row['feature_path']).astype(np.float32)
+        # 统一形状：确保是 (97, 1024)，去掉可能存在的 CLS token
+        if feat.shape[0] == 98:
+            feat = feat[1:, :]
+
+        label = torch.tensor(row['label'], dtype=torch.float32)
+        return torch.from_numpy(feat), label
 
 
 # =====================================================
-# 3) 核心训练与指标计算函数
+# 3) 指标计算：Se, Sp, ACC, AUC, ICBHI Score
 # =====================================================
-def calculate_icbhi_score(y_true, y_pred_bin, y_prob):
-    cm = confusion_matrix(y_true, y_pred_bin)
-    # 处理可能的单类别情况
+def compute_metrics(y_true, y_prob):
+    y_pred = (y_prob > 0.5).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+
+    # 鲁棒性处理：防止 cm 只有 1 个类别
     if cm.size == 4:
         tn, fp, fn, tp = cm.ravel()
     else:
-        tn = fp = fn = tp = 0  # 异常处理
+        # 如果验证集太小或模型预测全是一类，手动补齐
+        tp = np.sum((y_true == 1) & (y_pred == 1))
+        tn = np.sum((y_true == 0) & (y_pred == 0))
+        fp = np.sum((y_true == 0) & (y_pred == 1))
+        fn = np.sum((y_true == 1) & (y_pred == 0))
 
-    se = tp / (tp + fn) if (tp + fn) > 0 else 0  # Sensitivity / Recall
-    sp = tn / (tn + fp) if (tn + fp) > 0 else 0  # Specificity
-    acc = accuracy_score(y_true, y_pred_bin)
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0
+    acc = accuracy_score(y_true, y_pred)
 
     try:
         auc = roc_auc_score(y_true, y_prob)
     except:
         auc = 0.5
 
-    score = (se + sp) / 2
-    return se, sp, acc, auc, score, cm
+    icbhi_score = (se + sp) / 2
+    return se, sp, acc, auc, icbhi_score, cm
 
 
+# =====================================================
+# 4) 训练主流程
+# =====================================================
 def train():
-    # --- 配置 ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    EPOCHS = 50
-    LR = 1e-4
-    BATCH_SIZE = 64
+    # --- 参数配置 ---
     CSV_PATH = "/data/dingcong/hybrid/metadata_segmented.csv"
+    BATCH_SIZE = 64
+    LR = 1e-4
+    EPOCHS = 50
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- 数据准备 ---
-    full_dataset = ICBHIDataset(CSV_PATH)
+    # --- 数据加载与采样策略 ---
+    dataset = ICBHIDataset(CSV_PATH)
+    train_idx, val_idx = train_test_split(range(len(dataset)), test_size=0.2, random_state=42)
 
-    # 建议按病人 ID 划分，这里简化演示使用随机划分
-    train_idx, val_idx = train_test_split(range(len(full_dataset)), test_size=0.2, random_state=42)
-    train_ds = torch.utils.data.Subset(full_dataset, train_idx)
-    val_ds = torch.utils.data.Subset(full_dataset, val_idx)
+    # 解决不平衡：Weighted Sampler
+    train_labels = dataset.df.iloc[train_idx]['label'].values
+    class_counts = np.bincount(train_labels.astype(int))
+    weights = 1. / class_counts
+    samples_weights = torch.from_numpy(weights[train_labels.astype(int)])
+    sampler = WeightedRandomSampler(samples_weights, len(samples_weights))
 
-    # 类别权重处理（针对数据不平衡）
-    labels = [full_dataset.data.iloc[i]['label'] for i in train_idx]
-    class_sample_count = np.array([len(np.where(labels == t)[0]) for t in np.unique(labels)])
-    weight = 1. / class_sample_count
-    samples_weight = torch.from_numpy(np.array([weight[int(t)] for t in labels]))
-    sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
+    train_loader = DataLoader(torch.utils.data.Subset(dataset, train_idx), batch_size=BATCH_SIZE, sampler=sampler)
+    val_loader = DataLoader(torch.utils.data.Subset(dataset, val_idx), batch_size=BATCH_SIZE, shuffle=False)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    # --- 模型初始化 ---
-    model = SSA_Model(input_dim=1024, d_model=256).to(device)
-    criterion = FocalLoss()  # 使用 Focal Loss 提升敏感度
+    # --- 初始化 ---
+    model = SSA_Model(input_dim=1024, d_model=256).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
+    criterion = FocalLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    # --- 循环 ---
-    best_score = 0
+    # --- 训练循环 ---
+    best_icbhi = 0
     for epoch in range(EPOCHS):
         model.train()
-        train_loss = 0
-        for feat, label in tqdm(train_loader, desc=f"Epoch {epoch + 1}"):
-            feat, label = feat.to(device), label.to(device)
+        total_loss = 0
+        for feats, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}"):
+            feats, labels = feats.to(DEVICE), labels.to(DEVICE)
+
             optimizer.zero_grad()
-            output = model(feat)
-            loss = criterion(output, label)
+            logits = model(feats)
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
+            total_loss += loss.item()
 
-        # 验证
+        # --- 验证 ---
         model.eval()
-        all_labels = []
-        all_probs = []
+        all_labels, all_probs = [], []
         with torch.no_grad():
-            for feat, label in val_loader:
-                feat = feat.to(device)
-                prob = torch.sigmoid(model(feat))
-                all_labels.extend(label.cpu().numpy())
-                all_probs.extend(prob.cpu().numpy())
+            for feats, labels in val_loader:
+                probs = torch.sigmoid(model(feats.to(DEVICE)))
+                all_labels.extend(labels.numpy())
+                all_probs.extend(probs.cpu().numpy())
 
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-        all_preds = (all_probs > 0.5).astype(int)
-
-        se, sp, acc, auc, score, cm = calculate_icbhi_score(all_labels, all_preds, all_probs)
+        se, sp, acc, auc, score, cm = compute_metrics(np.array(all_labels), np.array(all_probs))
 
         print(f"\n📊 [Epoch {epoch + 1}] Val Results:")
-        print(f"Loss: {train_loss / len(train_loader):.4f} | Acc: {acc:.4f} | AUC: {auc:.4f}")
-        print(f"Se (Recall): {se:.4f} | Sp: {sp:.4f}")
-        print(f"✨ ICBHI Score: {score:.4f}")
+        print(f"Loss: {total_loss / len(train_loader):.4f} | Se: {se:.4f} | Sp: {sp:.4f}")
+        print(f"Acc: {acc:.4f} | AUC: {auc:.4f} | ✨ ICBHI Score: {score:.4f}")
         print(f"Confusion Matrix:\n{cm}")
 
-        if score > best_score:
-            best_score = score
+        if score > best_icbhi:
+            best_icbhi = score
             torch.save(model.state_dict(), "best_ssa_model.pth")
             print("🏆 New Best Score! Model Saved.")
 
