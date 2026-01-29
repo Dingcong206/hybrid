@@ -71,7 +71,7 @@ def main():
                     # 这里会执行 HeAR 的健康声学检测重采样、2秒对齐等所有官方步骤
                     # 注意：model.preprocess_audio 是 HeAR 封装的官方入口
                     #spec = model.preprocess_audio(audio_chunk, sr).to(DEVICE)
-                    spec = audio_utils.preprocess_audio(audio_chunk, sr).to(DEVICE)
+                    spec = audio_utils.preprocess_audio(audio_chunk).to(DEVICE)
 
                     # 3. 拦截：进入 ViT 之前的 Embedding 层
                     # 这一步拿到的就是经过 HeAR 官方 Patchify 和 Positional Encoding 后的特征
