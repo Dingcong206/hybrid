@@ -2,7 +2,7 @@ import numpy as np
 import os
 
 # 随机读取一个提取好的文件
-feature_path = "/data/dingcong/hybrid/segmented_patches_v1/某一个文件名.npy"
+feature_path = "/data/dingcong/hybrid/segmented_patches_v1/101_1b1_Al_sc_Meditron_seg_0.npy"
 data = np.load(feature_path)
 
 print(f"特征形状: {data.shape}")
