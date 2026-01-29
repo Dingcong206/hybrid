@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
-git
 # =====================================================
 # 2) SSA_Layer: 3个 BiMamba + 1个 Attention (大层单元)
 # =====================================================
