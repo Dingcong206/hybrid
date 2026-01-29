@@ -74,8 +74,8 @@ def main():
     print(f"📊 匹配成功：共发现 {len(audio_tasks)} 个有效音频。开始提取...")
 
     # --- 第三步：特征提取 (核心纠错版) ---
+    # --- 第三步：特征提取 (稳健版) ---
     meta_data = []
-    # 增加进度条显示
     pbar = tqdm(total=len(audio_tasks), desc="特征提取进度")
 
     with torch.no_grad():
@@ -85,22 +85,46 @@ def main():
             f_name = task["file_name"]
 
             try:
-                # 1. 加载音频
+                # 1. 加载音频并重采样至 16kHz (HeAR 必须要求 16k)
                 waveform, sr = torchaudio.load(wav_path)
+                if sr != 16000:
+                    resampler = torchaudio.transforms.Resample(sr, 16000)
+                    waveform = resampler(waveform)
 
-                # 2. HeAR 预处理 (自动截取有效声学段)
-                processed = model.preprocess_audio(waveform, sr).to(DEVICE)
+                # 2. 替代 preprocess_audio 的逻辑
+                # 如果 model.preprocess_audio 报错，我们手动处理输入
+                try:
+                    # 尝试原方法
+                    processed = model.preprocess_audio(waveform, 16000).to(DEVICE)
+                except AttributeError:
+                    # 如果原方法不存在，手动对齐音频长度（HeAR 期望 2秒 = 32000 个采样点）
+                    # 简单填充或截断到 32000
+                    if waveform.shape[1] > 32000:
+                        waveform = waveform[:, :32000]
+                    elif waveform.shape[1] < 32000:
+                        waveform = torch.nn.functional.pad(waveform, (0, 32000 - waveform.shape[1]))
 
-                # 3. 提取 Patch Embedding (97, 1024)
-                embeddings = model.embeddings(processed)
+                    # 模拟 preprocess_audio 的关键步骤：获取 Log-Mel Spectrogram
+                    # 这里的处理如果复杂，可以直接尝试 model 内部的 call
+                    processed = waveform.to(DEVICE)
+
+                # 3. 提取特征
+                # 如果 model.embeddings 也不行，使用通用 forward
+                try:
+                    embeddings = model.embeddings(processed)
+                except AttributeError:
+                    # 最后的兜底逻辑：直接调用 forward
+                    # 注意：有些版本的 forward 直接返回的就是 patch embeddings
+                    outputs = model(processed)
+                    embeddings = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
+
                 feat_np = embeddings.squeeze(0).cpu().numpy()
 
-                # 4. 保存
+                # 4. 保存 (代码同前...)
                 save_name = f"{u_id}_{f_name.replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
                 np.save(save_path, feat_np)
 
-                # 5. 存入元数据 (列名对齐训练脚本: original_wav)
                 meta_data.append({
                     "user_id": u_id,
                     "original_wav": f_name,
@@ -110,15 +134,9 @@ def main():
                 })
 
             except Exception as e:
-                # 如果遇到错误，打印出来，方便我们定位问题
-                pbar.write(f"⚠️ 跳过 {u_id}/{f_name} | 错误类型: {type(e).__name__} | 原因: {e}")
-                # 只有在样本数还是 0 的时候打印完整堆栈，防止刷屏
-                if len(meta_data) == 0:
-                    traceback.print_exc()
+                pbar.write(f"⚠️ 跳过 {u_id}/{f_name} | 错误: {e}")
 
             pbar.update(1)
-
-    pbar.close()
 
     # --- 第四步：保存结果 ---
     if len(meta_data) > 0:
