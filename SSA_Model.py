@@ -3,28 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
-
-# =====================================================
-# 1) BiMambaBlock: 双向扫描核心单元
-# =====================================================
-class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.3):
-        super().__init__()
-        self.ln = nn.LayerNorm(d_model)
-        # 前向与后向 Mamba
-        self.fwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.bwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        res = x
-        x_norm = self.ln(x)
-        # 并行计算双向特征
-        f_out = self.fwd_mamba(x_norm)
-        b_out = torch.flip(self.bwd_mamba(torch.flip(x_norm, [1])), [1])
-        return res + self.drop(f_out + b_out)
-
-
+git
 # =====================================================
 # 2) SSA_Layer: 3个 BiMamba + 1个 Attention (大层单元)
 # =====================================================
