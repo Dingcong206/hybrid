@@ -25,8 +25,8 @@ STRICT_LABEL_MAP = {
 
 
 def main():
-    print(f"🚀 正在加载 HeAR 官方模型...")
-    # 必须保证 trust_remote_code=True
+    print(f"🚀 正在加载 HeAR 模型...")
+    # 强制 trust_remote_code
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
     model.to(DEVICE).eval()
 
@@ -49,42 +49,42 @@ def main():
 
     print(f"📊 匹配成功：{len(audio_tasks)} 个音频。开始提取...")
 
-    # --- 第三步：特征提取 (核心修正) ---
+    # --- 第三步：特征提取 (核心修正：解决 Unpack 错误) ---
     meta_data = []
     pbar = tqdm(total=len(audio_tasks), desc="提取进度")
 
     with torch.no_grad():
         for u_id, f_name, wav_path, label, status in audio_tasks:
             try:
-                # 1. 加载并强制重采样到 16000Hz
+                # 1. 音频标准化 (16kHz)
                 waveform, sr = torchaudio.load(wav_path)
+                if waveform.shape[0] > 1:  # 转单声道
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+
                 if sr != 16000:
                     waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
 
-                # 2. 核心：手动处理输入长度（HeAR 期望 32000 个采样点）
+                # 2. 长度截断/填充 (2秒 = 32000采样点)
                 if waveform.shape[1] > 32000:
                     waveform = waveform[:, :32000]
                 else:
                     waveform = F.pad(waveform, (0, 32000 - waveform.shape[1]))
 
-                # 将音频放入 GPU
+                # 3. 核心：通过 model.embeddings 提取，并处理元组返回
                 audio_input = waveform.to(DEVICE)
 
-                # 3. 关键修正：直接获取 Patch Embeddings
-                # 不再使用 model.preprocess_audio 或 model()
-                # 而是使用 HeAR 专门提供的 embeddings 接口
-                try:
-                    # 尝试官方提供的 patch embedding 接口
-                    embeddings = model.embeddings(audio_input)
-                except:
-                    # 如果上面还错，直接跑 forward 并取第一个输出（通常是 embeddings）
-                    outputs = model(audio_input)
-                    # 这里的 outputs 可能是 (embeddings, logits)
-                    embeddings = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                # 【关键修正点】
+                output = model.embeddings(audio_input)
 
-                # 4. 转换并保存
-                # 确保形状是 (97, 1024)
-                feat_np = embeddings.squeeze(0).cpu().numpy()
+                # 如果返回的是元组 (tuple)，提取第一个元素
+                if isinstance(output, (tuple, list)):
+                    # 报错 expected 4, got 2 说明返回了 (embeddings, something_else)
+                    embeddings = output[0]
+                else:
+                    embeddings = output
+
+                # 4. 确认形状并保存
+                feat_np = embeddings.squeeze(0).cpu().numpy()  # 应为 (97, 1024)
 
                 save_name = f"{u_id}_{f_name.replace('.', '_')}.npy"
                 save_path = os.path.join(SAVE_DIR, save_name)
@@ -107,9 +107,9 @@ def main():
 
     if meta_data:
         pd.DataFrame(meta_data).to_csv(OUT_CSV, index=False)
-        print(f"✅ 完成！提取样本数: {len(meta_data)}")
+        print(f"✅ 成功提取 {len(meta_data)} 个特征文件！")
     else:
-        print("❌ 提取失败，样本数为 0")
+        print("❌ 最终提取数为 0，请检查报错详情。")
 
 
 if __name__ == "__main__":
