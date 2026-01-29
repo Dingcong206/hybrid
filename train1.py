@@ -14,7 +14,7 @@ from SSA_Model import SSA_Model
 
 
 # =====================================================
-# 1) 损失函数：Focal Loss 处理类别不平衡
+# 1) Focal Loss
 # =====================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0):
@@ -32,7 +32,7 @@ class FocalLoss(nn.Module):
 
 
 # =====================================================
-# 2) Dataset：适配 Coswara 的 User-level 读取
+# 2) Dataset：返回 user_id（新增）
 # =====================================================
 class CoswaraDataset(Dataset):
     def __init__(self, df: pd.DataFrame):
@@ -45,16 +45,16 @@ class CoswaraDataset(Dataset):
         row = self.df.iloc[idx]
         feat = np.load(row["feature_path"]).astype(np.float32)
 
-        # HeAR 输出 97 token: (1 CLS + 96 patches)
         if feat.shape[0] == 97:
             feat = feat[1:, :]  # (96, 1024)
 
         label = torch.tensor(float(row["label"]), dtype=torch.float32)
-        return torch.from_numpy(feat), label
+        user_id = row["user_id"]
+        return torch.from_numpy(feat), label, user_id
 
 
 # =====================================================
-# 3) 基础指标（给定阈值）
+# 3) 指标
 # =====================================================
 def compute_metrics(y_true, y_prob, thr=0.5):
     y_true = np.asarray(y_true).astype(int).reshape(-1)
@@ -77,31 +77,15 @@ def compute_metrics(y_true, y_prob, thr=0.5):
     return se, sp, acc, auc, f1, cm
 
 
-# =====================================================
-# 4) 扫阈值找 best F1（核心修改）
-# =====================================================
 def find_best_f1_threshold(y_true, y_prob, thresholds=None):
-    """
-    返回：
-    best_thr, best_f1, best_se, best_sp, best_acc, auc, best_cm
-    """
     if thresholds is None:
-        # 比较细一点就用 0.01 步长；想快点可改成 0.02/0.05
         thresholds = np.linspace(0.0, 1.0, 101)
 
-    best = {
-        "thr": 0.5,
-        "f1": -1.0,
-        "se": 0.0,
-        "sp": 0.0,
-        "acc": 0.0,
-        "auc": 0.5,
-        "cm": None
-    }
+    best = {"thr": 0.5, "f1": -1.0, "se": 0.0, "sp": 0.0, "acc": 0.0, "auc": 0.5, "cm": None}
 
-    # AUC 与阈值无关，先算一次
     y_true_np = np.asarray(y_true).astype(int).reshape(-1)
     y_prob_np = np.asarray(y_prob).reshape(-1)
+
     try:
         auc = roc_auc_score(y_true_np, y_prob_np) if len(np.unique(y_true_np)) > 1 else 0.5
     except Exception:
@@ -109,25 +93,42 @@ def find_best_f1_threshold(y_true, y_prob, thresholds=None):
 
     for thr in thresholds:
         se, sp, acc, _, f1, cm = compute_metrics(y_true_np, y_prob_np, thr=float(thr))
-
-        # 选 best F1；若 F1 相同，优先 SE 更高（筛查更友好），再优先 SP
         if (f1 > best["f1"]) or (np.isclose(f1, best["f1"]) and se > best["se"]) or \
            (np.isclose(f1, best["f1"]) and np.isclose(se, best["se"]) and sp > best["sp"]):
-            best.update({
-                "thr": float(thr),
-                "f1": float(f1),
-                "se": float(se),
-                "sp": float(sp),
-                "acc": float(acc),
-                "auc": float(auc),
-                "cm": cm
-            })
+            best.update({"thr": float(thr), "f1": float(f1), "se": float(se), "sp": float(sp),
+                         "acc": float(acc), "auc": float(auc), "cm": cm})
 
     return best["thr"], best["f1"], best["se"], best["sp"], best["acc"], best["auc"], best["cm"]
 
 
 # =====================================================
-# 5) 训练主程序 (User-level Split)
+# 4) 用户级聚合（新增）
+# =====================================================
+def aggregate_user_probs(user_ids, y_true, y_prob, mode="mean"):
+    """
+    将同一 user 的多个样本概率聚合成一个概率，然后按 user 评估
+    mode: "mean" or "max"
+    返回: user_true, user_prob
+    """
+    df_tmp = pd.DataFrame({
+        "user_id": user_ids,
+        "y_true": np.asarray(y_true).astype(int),
+        "y_prob": np.asarray(y_prob).astype(float)
+    })
+
+    # user 的标签取 max（只要该用户有一次阳性，就算阳性）
+    user_true = df_tmp.groupby("user_id")["y_true"].max()
+
+    if mode == "max":
+        user_prob = df_tmp.groupby("user_id")["y_prob"].max()
+    else:
+        user_prob = df_tmp.groupby("user_id")["y_prob"].mean()
+
+    return user_true.values, user_prob.values
+
+
+# =====================================================
+# 5) Train
 # =====================================================
 def train():
     CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/coswara_hear_patches.csv"
@@ -138,31 +139,29 @@ def train():
     EPOCHS = 100
     WEIGHT_DECAY = 1e-5
 
-    SAVE_PATH_BESTF1 = "best_hear_ssa_coswara_bestf1.pth"
-    SAVE_PATH_BESTAUC = "best_hear_ssa_coswara_bestaUc.pth"  # 可删
+    # ✅ 改：按“用户级 bestF1”保存更符合你的任务
+    SAVE_PATH_BESTF1_USER = "best_hear_ssa_coswara_user_bestf1.pth"
+    SAVE_PATH_BESTAUC_USER = "best_hear_ssa_coswara_user_bestaUc.pth"
 
     df = pd.read_csv(CSV_PATH)
     users = df["user_id"].unique()
-
     user_labels = df.groupby("user_id")["label"].max().reindex(users).values.astype(int)
 
     train_users, val_users = train_test_split(
-        users,
-        test_size=0.2,
-        random_state=42,
-        stratify=user_labels
+        users, test_size=0.2, random_state=42, stratify=user_labels
     )
 
     train_df = df[df["user_id"].isin(train_users)].copy()
     val_df = df[df["user_id"].isin(val_users)].copy()
 
-    print(f"✅ 数据划分完成:")
+    print("✅ 数据划分完成:")
     print(f"   训练集: {len(train_users)} 用户, {len(train_df)} 样本")
     print(f"   验证集: {len(val_users)} 用户, {len(val_df)} 样本")
 
     train_ds = CoswaraDataset(train_df)
     val_ds = CoswaraDataset(val_df)
 
+    # 类别不平衡：Sampler
     train_labels = train_df["label"].values.astype(int)
     counts = np.bincount(train_labels, minlength=2)
     weights = 1.0 / (counts + 1e-6)
@@ -177,14 +176,13 @@ def train():
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_f1 = -1.0
-    best_auc = -1.0
+    best_user_f1 = -1.0
+    best_user_auc = -1.0
 
     for epoch in range(1, EPOCHS + 1):
+        # -------- Train --------
         model.train()
-        train_loss = 0.0
-
-        for feats, labels in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
+        for feats, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
             feats = feats.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
 
@@ -194,41 +192,44 @@ def train():
             loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
-
-        # -----------------
-        # 验证：收集 prob
-        # -----------------
+        # -------- Val: collect sample probs + user ids --------
         model.eval()
-        all_labels, all_probs = [], []
+        all_labels, all_probs, all_uids = [], [], []
         with torch.no_grad():
-            for feats, labels in val_loader:
+            for feats, labels, uids in val_loader:
                 feats = feats.to(DEVICE, non_blocking=True)
                 logits = model(feats).view(-1)
                 probs = torch.sigmoid(logits).detach().cpu().numpy()
 
                 all_probs.extend(probs.tolist())
                 all_labels.extend(labels.numpy().tolist())
+                all_uids.extend(list(uids))
 
-        # ✅ 扫阈值得到 best F1
-        best_thr, epoch_best_f1, se, sp, acc, auc, cm = find_best_f1_threshold(all_labels, all_probs)
+        # (1) sample-level bestF1（保留输出，方便你看）
+        s_thr, s_f1, s_se, s_sp, s_acc, s_auc, s_cm = find_best_f1_threshold(all_labels, all_probs)
 
-        print(f"\n📊 [Epoch {epoch}] Val Results (Best-F1 Threshold Search):")
-        print(f"   AUC: {auc:.4f} | BestF1: {epoch_best_f1:.4f} | SE: {se:.4f} | SP: {sp:.4f} | ACC: {acc:.4f}")
-        print(f"   Best Threshold: {best_thr:.2f}")
-        print(f"   Confusion Matrix:\n{cm}")
+        # (2) user-level (mean) bestF1（✅ 主要看这个）
+        user_y, user_p = aggregate_user_probs(all_uids, all_labels, all_probs, mode="mean")
+        u_thr, u_f1, u_se, u_sp, u_acc, u_auc, u_cm = find_best_f1_threshold(user_y, user_p)
 
-        # ✅ 按 best F1 保存
-        if epoch_best_f1 > best_f1:
-            best_f1 = epoch_best_f1
-            torch.save(model.state_dict(), SAVE_PATH_BESTF1)
-            print(f"🏆 Best-F1 提升！已保存至 {SAVE_PATH_BESTF1} (F1={best_f1:.4f}, thr={best_thr:.2f})")
+        print(f"\n📊 [Epoch {epoch}] Val Results")
+        print(f"   [Sample] AUC: {s_auc:.4f} | BestF1: {s_f1:.4f} | SE: {s_se:.4f} | SP: {s_sp:.4f} | Thr: {s_thr:.2f}")
+        print(f"   [Sample] CM:\n{s_cm}")
 
-        # （可选）保留 best AUC 版本
-        if auc > best_auc:
-            best_auc = auc
-            torch.save(model.state_dict(), SAVE_PATH_BESTAUC)
-            print(f"⭐ Best-AUC 提升！已保存至 {SAVE_PATH_BESTAUC} (AUC={best_auc:.4f})")
+        print(f"   [UserMean] AUC: {u_auc:.4f} | BestF1: {u_f1:.4f} | SE: {u_se:.4f} | SP: {u_sp:.4f} | Thr: {u_thr:.2f}")
+        print(f"   [UserMean] CM:\n{u_cm}")
+
+        # ✅ 按 user-level best F1 保存
+        if u_f1 > best_user_f1:
+            best_user_f1 = u_f1
+            torch.save(model.state_dict(), SAVE_PATH_BESTF1_USER)
+            print(f"🏆 UserBest-F1 提升！已保存至 {SAVE_PATH_BESTF1_USER} (F1={best_user_f1:.4f}, thr={u_thr:.2f})")
+
+        # ✅ 按 user-level best AUC 保存（可选）
+        if u_auc > best_user_auc:
+            best_user_auc = u_auc
+            torch.save(model.state_dict(), SAVE_PATH_BESTAUC_USER)
+            print(f"⭐ UserBest-AUC 提升！已保存至 {SAVE_PATH_BESTAUC_USER} (AUC={best_user_auc:.4f})")
 
         scheduler.step()
 
