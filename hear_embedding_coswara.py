@@ -129,6 +129,13 @@ def main():
             print(f"⚠️ 失败统计：{fail_reasons}")
     else:
         print("❌ 最终没有生成任何文件。请检查音频读取权限。")
+        # 在 main 函数结束前加入
+        if meta_data:
+            df_out = pd.DataFrame(meta_data)
+            print("\n📊 提取统计（按音频类型）:")
+            # 假设文件名中包含类型信息，如 cough-heavy
+            df_out['audio_type'] = df_out['original_wav'].apply(lambda x: x.split('.')[0])
+            print(df_out['audio_type'].value_counts())
 
 
 if __name__ == "__main__":
