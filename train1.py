@@ -86,7 +86,7 @@ def compute_metrics(y_true, y_prob, thr=0.5):
 def train():
     # --- 配置路径 ---
     # 这里的 CSV 应该是你上一步提取特征后生成的 coswara_metadata_segmented.csv
-    CSV_PATH = "/data/dingcong/hybrid/coswara_metadata_segmented.csv"
+    CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/coswara_hear_patches.csv"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- 超参数 ---
