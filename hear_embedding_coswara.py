@@ -18,8 +18,8 @@ from transformers import AutoModel
 # =========================
 BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"
 COSWARA_CSV = os.path.join(BASE_DIR, "combined_data.csv")  # 你已有的标签表
-SAVE_DIR = os.path.join(BASE_DIR, "coswara_hear_patch_tokens")
-OUT_CSV = os.path.join(BASE_DIR, "coswara_hear_patches.csv")
+SAVE_DIR = os.path.join(BASE_DIR, "coswara_hear_patch_tokens2")
+OUT_CSV = os.path.join(BASE_DIR, "coswara_hear_patches2.csv")
 
 MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -167,47 +167,33 @@ def main():
     stats_run = {"success": 0, "ffmpeg_fail": 0, "other_fail": 0}
     rows = []
 
+    # ============ 修正后的核心循环 ============
     with torch.no_grad():
         for task in tqdm(audio_tasks):
             try:
-                wav = load_audio_ffmpeg(task["path"], TARGET_SR)   # [1, T]
-                wav = fix_length(wav, TARGET_LEN)                  # [1, 32000]
+                # 1. 解码得到完整波形 (不要先切 2 秒，让 AED 自己选)
+                wav = load_audio_ffmpeg(task["path"], TARGET_SR)
 
-                # HeAR 官方 preprocess：输出 spec [1,1,192,128]
+                # 2. 调用 AED (preprocess_audio 内部会处理重采样和对齐 2 秒)
                 spec = preprocess_audio(wav)
 
-                # 前向：取 hidden_states[0] 作为 “ViT block 之前”的 token
+                # 3. 必须判断 None！否则遇到静音录音会报错
+                if spec is None:
+                    stats_run["other_fail"] += 1  # 或者是专门的 "no_event_fail"
+                    continue
+
+                # 4. 进入模型
+                # 注意：spec 已经是 tensor，且已经在 preprocess 内部处理好了形状
                 out = model(spec.to(DEVICE), return_dict=True, output_hidden_states=True)
 
-                tokens = out.hidden_states[0]   # [1, 97, 1024]
-                patch = tokens[:, 1:, :]        # 去 CLS -> [1, 96, 1024]
-
-                feat = patch.squeeze(0).cpu().numpy()  # (96, 1024)
-
-                save_name = f"{task['user_id']}_{task['fname'].replace('.', '_')}.npy"
-                save_path = os.path.join(SAVE_DIR, save_name)
-                np.save(save_path, feat)
-
-                rows.append({
-                    "user_id": task["user_id"],
-                    "audio_file": task["fname"],
-                    "audio_path": task["path"],
-                    "covid_status": task["status"],
-                    "label": task["label"],
-                    "feature_path": save_path,
-                    "feature_shape": str(feat.shape)
-                })
-                stats_run["success"] += 1
-
-            except RuntimeError as e:
-                # ffmpeg decode failed
-                if "ffmpeg decode failed" in str(e):
-                    stats_run["ffmpeg_fail"] += 1
-                else:
-                    stats_run["other_fail"] += 1
-
-            except Exception:
+                # 5. 提取进入第一个 block 之前的状态
+                tokens = out.hidden_states[0]  # [1, 97, 1024]
+                # 建议保留 CLS，以便后续分类任务使用
+                feat = tokens.squeeze(0).cpu().numpy()  # (97, 1024)
+            except Exception as e:
+                print(f"提取失败: {task['path']}, 错误原因: {e}")
                 stats_run["other_fail"] += 1
+
 
     # 保存 CSV
     if rows:
