@@ -235,7 +235,7 @@ def train():
 
         # ----- Early stop -----
         if early.step(icbhi):
-            print(f"\n🛑 Early stopping：ICBHI 连续 {PATIENCE} 轮未提升（min_delta={MIN_DELTA}）。")
+            print(f"\nEarly stopping：ICBHI 连续 {PATIENCE} 轮未提升（min_delta={MIN_DELTA}）。")
             print(f"✅ Best ICBHI = {best_icbhi:.4f} @ epoch {best_epoch}")
             break
 
