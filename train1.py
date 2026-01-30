@@ -131,7 +131,7 @@ def aggregate_user_probs(user_ids, y_true, y_prob, mode="mean"):
 # 5) Train
 # =====================================================
 def train():
-    CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/coswara_hear_patches.csv"
+    CSV_PATH = "coswara_hear_patches_yamnet.csv"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     BATCH_SIZE = 64
