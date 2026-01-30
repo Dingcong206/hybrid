@@ -96,37 +96,34 @@ class SSA_Layer(nn.Module):
 # 3) SSA_Model: 顶层封装
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=2, seq_len=96):
+    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.3, n_layers=2, seq_len=96):
         super().__init__()
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
         self.pos_drop = nn.Dropout(dropout)
 
-        # 保持 SSA_Layer 不变
         self.layers = nn.ModuleList([
             SSA_Layer(d_model, nhead=8, dropout=dropout)
             for _ in range(n_layers)
         ])
 
-        # 为每一层的输出准备一个 Norm，防止浅层和深层数值差距过大
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(d_model) for _ in range(n_layers)
-        ])
+        # 可学习的层权重：让模型自己决定第一层和第二层谁更重要
+        self.layer_weights = nn.Parameter(torch.ones(n_layers))
 
-        # 池化组件
         self.pool_proj = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
             nn.Linear(d_model // 4, 1)
         )
 
-        # 分类头：因为拼接了 n_layers 层，所以输入维度要乘以 n_layers
-        # 且原本就有 3 路池化 (Attn, Max, Avg)，所以是 d_model * 3 * n_layers
+        # 增加 Std Pooling 后，每一层有 4 路特征 (Attn, Max, Avg, Std)
+        # 4路 * d_model = 1024 维
         self.head = nn.Sequential(
-            nn.Linear(d_model * 3 * n_layers, d_model),
+            nn.Linear(d_model * 4, d_model),
+            nn.BatchNorm1d(d_model),  # 增加 BN 防止过拟合
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.5),  # 提高 Dropout 到 0.5
             nn.Linear(d_model, num_classes)
         )
 
@@ -136,34 +133,33 @@ class SSA_Model(nn.Module):
         x = self.input_proj(x) + self.pos_embed
         x = self.pos_drop(x)
 
-        all_layer_features = []
+        # 用于存储加权后的融合特征
+        weighted_fusion = 0
+        layer_soft_weights = torch.softmax(self.layer_weights, dim=0)
 
-        # 1. 逐层前传，并收集每一层的特征
         for i, layer in enumerate(self.layers):
             x = layer(x)
-            # 对当前层输出做池化前处理
-            layer_output = self.layer_norms[i](x)
 
-            # 2. 对每一层分别进行 Top-K + Max + Avg 池化
-            # (这样能捕捉到每一层认为“最重要”的时刻)
-            attn_logits = self.pool_proj(layer_output)
+            # 池化操作
+            attn_logits = self.pool_proj(x)
+            # 使用 Top-K (K=16) 增强局部鲁棒性
             _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=16, dim=1)
             mask = torch.zeros_like(attn_logits).fill_(-1e9)
             mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
             topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)
 
-            attn_f = torch.sum(layer_output * topk_weights, dim=1)
-            max_f, _ = torch.max(layer_output, dim=1)
-            avg_f = torch.mean(layer_output, dim=1)
+            attn_f = torch.sum(x * topk_weights, dim=1)
+            max_f, _ = torch.max(x, dim=1)
+            avg_f = torch.mean(x, dim=1)
+            std_f = torch.std(x, dim=1)  # 捕捉声音的波动特征
 
-            # 每一层贡献的特征向量：[B, d_model * 3]
-            combined_f = torch.cat([attn_f, max_f, avg_f], dim=-1)
-            all_layer_features.append(combined_f)
+            # 拼接当前层的 4 路特征
+            layer_combined = torch.cat([attn_f, max_f, avg_f, std_f], dim=-1)
 
-        # 3. 将所有层的特征拼接在一起：[B, d_model * 3 * n_layers]
-        final_feat = torch.cat(all_layer_features, dim=-1)
+            # 按可学习权重累加
+            weighted_fusion += layer_soft_weights[i] * layer_combined
 
-        return self.head(final_feat).squeeze(-1)
+        return self.head(weighted_fusion).squeeze(-1)
 
 def build_model(input_dim=1024, d_model=256, dropout=0.15, num_classes=1, seq_len=96):
     return SSA_Model(input_dim, num_classes, d_model, dropout, n_layers=2, seq_len=seq_len)
