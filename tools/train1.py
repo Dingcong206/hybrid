@@ -93,11 +93,8 @@ def train():
         batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
     )
 
-    # -------------------
-    # 初始化
-    # -------------------
     # 建议 d_model 设为 512 如果显存允许
-    model = build_model(input_dim=1024, d_model=256, dropout=DROPOUT).to(DEVICE)
+    model = build_model(input_dim=1024, d_model=512, dropout=DROPOUT).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=MAX_LR / 10, weight_decay=WEIGHT_DECAY)
 
     counts = np.bincount(train_df["label"].values.astype(int))
@@ -149,32 +146,29 @@ def train():
 
         u_auc, u_best = user_metrics(val_df, seg_probs, mode=METRIC_MODE, min_sp=MIN_SP)
 
-        print(f"\n📊 Epoch {epoch} User-Level: AUC={u_auc:.4f}, F1={u_best['f1']:.4f}, SP={u_best['sp']:.4f}")
-
+        print(f"\n Epoch {epoch} User-Level: AUC={u_auc:.4f}, F1={u_best['f1']:.4f}, SP={u_best['sp']:.4f}")
+        print(f"   Confusion Matrix:\n{u_best['cm']}")
         # -------------------
         # 保存逻辑
         # -------------------
-        improved = False
-        if u_auc > best_user_auc:
-            best_user_auc = u_auc
-            torch.save(model.state_dict(), SAVE_PATH_AUC)
-            improved = True
-
+        improved_f1 = False
         if u_best["f1"] > best_user_f1:
             best_user_f1 = u_best["f1"]
             torch.save(model.state_dict(), SAVE_PATH_F1)
-            no_improve = 0
-            improved = True
+            improved_f1 = True
+            no_improve = 0  # 只有 F1 进步才重置早停
+            print(f"🔥 New Best F1: {best_user_f1:.4f} -> Saved to {SAVE_PATH_F1}")
         else:
             no_improve += 1
 
-        if improved:
-            print(f"🌟 New Best! AUC: {best_user_auc:.4f}, F1: {best_user_f1:.4f}")
+        if u_auc > best_user_auc:
+            best_user_auc = u_auc
+            torch.save(model.state_dict(), SAVE_PATH_AUC)
+            print(f"✨ New Best AUC: {best_user_auc:.4f} -> Saved to {SAVE_PATH_AUC}")
 
         if no_improve >= PATIENCE:
-            print(f"🛑 Early Stopping at Epoch {epoch}")
+            print(f"🛑 Early Stopping at Epoch {epoch}. Best F1: {best_user_f1:.4f}")
             break
-
 
 if __name__ == "__main__":
     train()
