@@ -104,7 +104,7 @@ class SSA_Layer(nn.Module):
 # 3) SSA_Model: 顶层架构
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=6, seq_len=96):
+    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=2, seq_len=96):
         super().__init__()
 
         self.input_proj = nn.Linear(input_dim, d_model)
