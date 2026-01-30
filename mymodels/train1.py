@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +8,7 @@ from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score, accuracy_
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from SSA_Model import SSA_Model
+from mymodels.model import SSA_Model
 
 
 # =====================================================
@@ -242,7 +241,7 @@ def train():
             early_stop_counter += 1
 
         if early_stop_counter >= PATIENCE:
-            print(f"🛑 Early stop: {PATIENCE} epochs no USER-F1 improvement. best USER-AUC={best_user_auc:.4f}, best USER-F1={best_user_f1:.4f}")
+            print(f"  Early stop: {PATIENCE} epochs no USER-F1 improvement. best USER-AUC={best_user_auc:.4f}, best USER-F1={best_user_f1:.4f}")
             break
 
 
