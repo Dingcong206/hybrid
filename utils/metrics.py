@@ -47,12 +47,38 @@ def segment_metrics(y_true, y_prob, mode="f1_sp", min_sp=0.65):
     best = _scan_best(y_true, y_prob, mode=mode, min_sp=min_sp)
     return auc, best
 
-def user_metrics(df, probs, mode="f1_sp", min_sp=0.65):
-    tmp = df.copy()
-    tmp["prob"] = probs
-    user_df = tmp.groupby("user_id").agg({"prob": "mean", "label": "max"}).reset_index()
-    y_true = user_df["label"].values
-    y_prob = user_df["prob"].values
-    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
-    best = _scan_best(y_true, y_prob, mode=mode, min_sp=min_sp)
-    return auc, best
+def user_metrics(val_df, seg_probs, mode="f1_sp", min_sp=0.65, k=3):
+        """
+        k: 取每个用户概率最高的 k 个片段进行平均。
+           如果 k=1，等同于 Max Pooling；
+           如果 k=len(group)，等同于 Mean Pooling。
+        """
+        user_results = []
+        # 确保索引一致
+        val_df = val_df.reset_index(drop=True)
+
+        for uid, group in val_df.groupby("user_id"):
+            indices = group.index.values
+            probs = seg_probs[indices]
+
+            # --- 核心改进：Top-K 聚合 ---
+            if len(probs) >= k:
+                topk_probs = np.sort(probs)[-k:]
+            else:
+                topk_probs = probs  # 如果片段数不足 k，则取全部
+
+            agg_prob = np.mean(topk_probs)
+            target = group["label"].max()  # 用户级标签：只要有一个片段是正例，用户就是正例
+
+            user_results.append({
+                "user_id": uid,
+                "prob": agg_prob,
+                "target": target
+            })
+
+        user_df = pd.DataFrame(user_results)
+        y_true = user_df["target"].values
+        y_prob = user_df["prob"].values
+        auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+        best = _scan_best(y_true, y_prob, mode=mode, min_sp=min_sp)
+        return auc, best
