@@ -8,19 +8,30 @@ from mamba_ssm import Mamba
 # 1) BiMambaBlock: 保持双向逻辑
 # =====================================================
 class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.4):
+    def __init__(self, d_model, dropout=0.2, mlp_ratio=4):
         super().__init__()
-        self.ln = nn.LayerNorm(d_model)
-        self.fwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.bwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.fwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.bwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
         self.drop = nn.Dropout(dropout)
 
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * mlp_ratio, d_model),
+            nn.Dropout(dropout),
+        )
+
     def forward(self, x):
-        res = x
-        x_norm = self.ln(x)
-        f_out = self.fwd_mamba(x_norm)
-        b_out = torch.flip(self.bwd_mamba(torch.flip(x_norm, [1])), [1])
-        return res + self.drop(f_out + b_out)
+        # Mamba 残差
+        h = self.ln1(x)
+        h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
+        x = x + self.drop(h)
+        # FFN 残差
+        x = x + self.mlp(self.ln2(x))
+        return x
 
 
 # =====================================================
