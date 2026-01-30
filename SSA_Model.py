@@ -8,7 +8,7 @@ from mamba_ssm import Mamba
 # 1) BiMambaBlock: 保持双向逻辑
 # =====================================================
 class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.3):
+    def __init__(self, d_model, dropout=0.4):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
         self.fwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
