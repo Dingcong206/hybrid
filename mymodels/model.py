@@ -62,7 +62,7 @@ class SSA_Layer(nn.Module):
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.attn_drop = nn.Dropout(dropout)
 
-        # D. 新增：Post-Attention Mamba 堆栈 (继续添加的3层)
+        # D. 新增：Post-Attention Mamba 堆栈
         self.post_mamba_stack = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout)
             for _ in range(3)
