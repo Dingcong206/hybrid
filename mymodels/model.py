@@ -5,24 +5,15 @@ from mamba_ssm import Mamba
 
 
 # =====================================================
-# 1) VisionMambaBlock: 模仿 MambaVision 的改进块
+# 1) BiMambaBlock: 双向 Mamba 核心块
 # =====================================================
-class VisionMambaBlock(nn.Module):
+class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2, mlp_ratio=4):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-
-        # 核心改进：Mamba 内部集成 dw_conv (通过 Mamba 原生 d_conv 参数)
-        # 加上我们自定义的并行 DW-Conv 路径增强局部感知
-        self.fwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.bwd_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-
-        # 深度可分离卷积分支：专门抓取声谱图细微纹理
-        self.dw_conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
-            nn.BatchNorm1d(d_model),
-            nn.GELU()
-        )
+        self.fwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.bwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.drop = nn.Dropout(dropout)
 
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
@@ -34,82 +25,86 @@ class VisionMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        # --- 序列处理分支 ---
-        res = x
-        x_norm = self.ln1(x)
-
-        # 1. 双向 Mamba 路径
-        mamba_feat = self.fwd_mamba(x_norm) + torch.flip(self.bwd_mamba(torch.flip(x_norm, [1])), [1])
-
-        # 2. 局部卷积路径 (DW-Conv)
-        local_feat = self.dw_conv(x_norm.transpose(1, 2)).transpose(1, 2)
-
-        # 融合残差
-        x = res + mamba_feat + local_feat
-
-        # --- 前馈网络分支 ---
+        # Mamba 残差分支
+        h = self.ln1(x)
+        # 双向融合：前向 + 翻转后的后向再翻转回来
+        h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
+        x = x + self.drop(h)
+        # FFN 残差分支
         x = x + self.mlp(self.ln2(x))
         return x
 
 
 # =====================================================
-# 2) SSA_Layer: 并行混合层 (MambaVision 核心思想)
+# 2) SSA_Layer: 空间-频谱-注意力层 (核心修改处)
 # =====================================================
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    def __init__(self, d_model, nhead=12, dropout=0.3):
         super().__init__()
 
-        self.norm = nn.LayerNorm(d_model)
+        # A. 卷积层：提取局部纹理
+        self.conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.Dropout(dropout)
+        )
 
-        # 分支 A: Mamba 序列建模堆栈 (3层)
-        self.mamba_stack = nn.Sequential(*[
-            VisionMambaBlock(d_model, dropout=dropout) for _ in range(3)
+        # B. Pre-Attention Mamba 堆栈 (3层)
+        self.bimamba_stack = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout)
+            for _ in range(3)
         ])
 
-        # 分支 B: Multi-Head Attention 全局检索
+        # C. Attention 层
+        self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.attn_drop = nn.Dropout(dropout)
 
-        # 分支 C: 额外的 Post-Mamba Refining (你要求的 3 层追加)
-        self.post_mamba = nn.Sequential(*[
-            VisionMambaBlock(d_model, dropout=dropout) for _ in range(3)
+        # D. 新增：Post-Attention Mamba 堆栈 (继续添加的3层)
+        self.post_mamba_stack = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout)
+            for _ in range(3)
         ])
 
-        # 融合门控：动态决定 Mamba 和 Attention 的权重
-        self.fusion_gate = nn.Parameter(torch.ones(d_model) * 0.5)
-
-        self.layer_gate = nn.Sequential(
+        # E. 门控机制
+        self.gate = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        res_layer = x
-        x_norm = self.norm(x)
+        res_layer = x  # 大残差
 
-        # 1. 并行处理：Mamba vs Attention
-        # Mamba 负责捕捉时间因果关系
-        x_m = self.mamba_stack(x_norm)
+        # 1. 卷积：处理局部信息
+        x_conv = x.transpose(1, 2)
+        x = x + self.conv(x_conv).transpose(1, 2)
 
-        # Attention 负责捕捉全局病理证据
-        x_a, _ = self.attn(x_norm, x_norm, x_norm)
+        # 2. Pre-Attention Mamba：时序初步建模
+        for bimamba in self.bimamba_stack:
+            x = bimamba(x)
 
-        # 2. 动态融合
-        gate = torch.sigmoid(self.fusion_gate)
-        x_combined = x_m * gate + x_a * (1 - gate)
+        # 3. Attention：全局特征检索
+        res_attn = x
+        x_norm = self.attn_ln(x)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        x_out = res_attn + self.attn_drop(x_attn)
 
-        # 3. 后置处理：再次通过 Mamba 精炼特征
-        x_refined = self.post_mamba(x_combined)
+        # 4. Post-Attention Mamba：追加的 3 层 Mamba 进行精炼
+        for post_bimamba in self.post_mamba_stack:
+            x_out = post_bimamba(x_out)
 
-        # 4. 门控残差输出
-        g = self.layer_gate(x_refined.mean(dim=1, keepdim=True))
-        return res_layer + g * x_refined
+        # 5. 应用门控
+        g = self.gate(x_out.mean(dim=1, keepdim=True))
+        return res_layer + g * x_out
 
 
 # =====================================================
-# 3) SSA_Model: 顶层模型架构 (Top-K 证据检索)
+# 3) SSA_Model: 顶层架构
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=4, seq_len=96):
+    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=6, seq_len=96):
         super().__init__()
 
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -123,7 +118,6 @@ class SSA_Model(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-        # 池化权重生成
         self.pool_proj = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
@@ -140,28 +134,22 @@ class SSA_Model(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
     def forward(self, x):
-        # 初始投影
         x = self.input_proj(x) + self.pos_embed
         x = self.pos_drop(x)
 
-        # 逐层演进
         for layer in self.layers:
             x = layer(x)
 
         x = self.norm(x)
 
-        # --- Top-K Evidence Attention (基于你的设想改进) ---
-        attn_logits = self.pool_proj(x)  # [B, L, 1]
-
-        # 只选取注意力最高的前 16 个“证据 Patch”
+        # Top-K 选通注意力池化
+        attn_logits = self.pool_proj(x)
         _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=16, dim=1)
-        mask = torch.full_like(attn_logits, -1e9)
+        mask = torch.zeros_like(attn_logits).fill_(-1e9)
         mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
-
-        # 证据聚合权重 (温度系数 0.5 让模型更果断)
         topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)
 
-        # 三路融合：聚合特征、局部最大、全局平均
+        # 三路融合
         attn_feat = torch.sum(x * topk_weights, dim=1)
         max_feat, _ = torch.max(x, dim=1)
         avg_feat = torch.mean(x, dim=1)
@@ -171,9 +159,6 @@ class SSA_Model(nn.Module):
         return self.head(feat).squeeze(-1)
 
 
-# =====================================================
-# 构建函数
-# =====================================================
 def build_model(input_dim=1024, d_model=256, dropout=0.15, num_classes=1, seq_len=96):
     return SSA_Model(
         input_dim=input_dim,
