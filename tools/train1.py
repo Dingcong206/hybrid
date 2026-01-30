@@ -157,17 +157,17 @@ def train():
             torch.save(model.state_dict(), SAVE_PATH_F1)
             improved_f1 = True
             no_improve = 0  # 只有 F1 进步才重置早停
-            print(f"🔥 New Best F1: {best_user_f1:.4f} -> Saved to {SAVE_PATH_F1}")
+            print(f"New Best F1: {best_user_f1:.4f} -> Saved to {SAVE_PATH_F1}")
         else:
             no_improve += 1
 
         if u_auc > best_user_auc:
             best_user_auc = u_auc
             torch.save(model.state_dict(), SAVE_PATH_AUC)
-            print(f"✨ New Best AUC: {best_user_auc:.4f} -> Saved to {SAVE_PATH_AUC}")
+            print(f" New Best AUC: {best_user_auc:.4f} -> Saved to {SAVE_PATH_AUC}")
 
         if no_improve >= PATIENCE:
-            print(f"🛑 Early Stopping at Epoch {epoch}. Best F1: {best_user_f1:.4f}")
+            print(f"Early Stopping at Epoch {epoch}. Best F1: {best_user_f1:.4f}")
             break
 
 if __name__ == "__main__":
