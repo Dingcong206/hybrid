@@ -164,3 +164,6 @@ class SSA_Model(nn.Module):
         final_feat = torch.cat(all_layer_features, dim=-1)
 
         return self.head(final_feat).squeeze(-1)
+
+def build_model(input_dim=1024, d_model=256, dropout=0.15, num_classes=1, seq_len=96):
+    return SSA_Model(input_dim, num_classes, d_model, dropout, n_layers=2, seq_len=seq_len)
