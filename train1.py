@@ -134,6 +134,7 @@ def train():
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    print("Train label distribution:", np.bincount(train_labels))
 
     # 3. 初始化
     model = SSA_Model(input_dim=1024, d_model=256, dropout=0.3).to(DEVICE)
