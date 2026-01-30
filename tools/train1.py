@@ -1,8 +1,15 @@
-
-import os
+# tools/train1.py
 import sys
 from pathlib import Path
 
+# ✅ 必须放在任何自定义包 import 之前
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+print("✅ PROJECT_ROOT =", PROJECT_ROOT)
+print("✅ sys.path[0]  =", sys.path[0])
+
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,12 +19,10 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# ✅ 保证无论从哪里运行都能 import mymodels/utils
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+# ✅ 用最硬的导入方式（不依赖 __init__.py）
+from mymodels.model import build_model
+from utils.metrics import segment_metrics, user_metrics
 
-from mymodels import build_model
-from utils import segment_metrics, user_metrics
 
 class CoswaraDataset(Dataset):
     def __init__(self, df: pd.DataFrame):
