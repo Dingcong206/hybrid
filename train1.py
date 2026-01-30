@@ -131,7 +131,8 @@ def aggregate_user_probs(user_ids, y_true, y_prob, mode="mean"):
 # 5) Train
 # =====================================================
 def train():
-    CSV_PATH = "coswara_hear_patches_yamnet.csv"
+    BASE_DIR = "/data/dingcong/hybrid/Coswara-Data"  # 你数据所在目录
+    CSV_PATH = os.path.join(BASE_DIR, "coswara_hear_patches_yamnet.csv")  # 注意是 yamnet
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     BATCH_SIZE = 64
