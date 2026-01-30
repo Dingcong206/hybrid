@@ -2,12 +2,12 @@
 import sys
 from pathlib import Path
 
-# ✅ 必须放在任何自定义包 import 之前
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-print("✅ PROJECT_ROOT =", PROJECT_ROOT)
-print("✅ sys.path[0]  =", sys.path[0])
+print("PROJECT_ROOT =", PROJECT_ROOT)
+print("sys.path[0]  =", sys.path[0])
 
 import os
 import torch
