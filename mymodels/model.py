@@ -150,3 +150,18 @@ class SSA_Model(nn.Module):
         feat = torch.cat([attn_feat, max_feat, avg_feat], dim=-1)  # [B, d_model * 3]
 
         return self.head(feat).squeeze(-1)
+
+def build_model(
+            input_dim=1024,
+            d_model=256,
+            dropout=0.15,
+            num_classes=1,
+            seq_len=96,
+    ):
+        return SSA_Model(
+            input_dim=input_dim,
+            d_model=d_model,
+            dropout=dropout,
+            num_classes=num_classes,
+            seq_len=seq_len,
+        )
