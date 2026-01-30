@@ -8,7 +8,8 @@ from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score, accuracy_
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from mymodels.model import SSA_Model
+from mymodels.model import build_model
+
 
 
 # =====================================================
@@ -152,7 +153,13 @@ def train():
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # ---- 模型/优化器/loss ----
-    model = SSA_Model(input_dim=1024, d_model=256, dropout=DROPOUT).to(DEVICE)
+    model = build_model(
+        input_dim=1024,
+        d_model=256,
+        dropout=0.15
+    ).to(device)
+
+    #model = SSA_Model(input_dim=1024, d_model=256, dropout=DROPOUT).to(DEVICE)
 
     optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
 
