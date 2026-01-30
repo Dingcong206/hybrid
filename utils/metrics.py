@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score, accuracy_score
 
 def _scan_best(y_true, y_prob, mode="f1_sp", min_sp=0.65, beta=1.0):
