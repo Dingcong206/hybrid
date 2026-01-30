@@ -38,7 +38,7 @@ class BiMambaBlock(nn.Module):
 # 2) SSA_Layer: 增强卷积表达与门控连接
 # =====================================================
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    def __init__(self, d_model, nhead=12, dropout=0.3):
         super().__init__()
 
         # A. 改进卷积：增大感受野，不使用 groups 以增强通道间交互
