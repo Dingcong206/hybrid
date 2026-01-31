@@ -33,7 +33,7 @@ MODEL_ID = "google/hear-pytorch"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TARGET_SR = 16000
-TARGET_LEN = 32000  # 2 seconds @ 16k
+TARGET_LEN = 32000  # 2 seconds  16k
 
 LABEL_MAP = {
     "healthy": 0,
@@ -50,7 +50,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # =========================
 def import_hear_preprocess():
     """
-    依赖：你的 hear 源码在 /data/dingcong/hybrid/hear/...
+    依赖： hear 源码在 /data/dingcong/hybrid/hear/...
     通过把 /data/dingcong/hybrid 加到 sys.path 来 import
     """
     sys.path.insert(0, "/data/dingcong/hybrid")
