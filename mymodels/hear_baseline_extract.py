@@ -7,7 +7,7 @@ from tqdm import tqdm  # 进度条库
 
 # 1. 配置路径 (请根据你的实际路径修改)
 # 这里的路径应该是你存放 920 个 wav 文件的那个文件夹
-DATASET_DIR = "/data/dingcong/hybrid/audio_and txt_files"
+DATASET_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
 OUTPUT_DIR = "/data/dingcong/hybrid/features/hear_icbhi"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
