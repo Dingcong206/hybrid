@@ -2,7 +2,7 @@ import sys
 import os
 from pathlib import Path
 
-# 环境配置
+# 环境配置：确保能找到 mymodels 和 utils
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -22,7 +22,7 @@ from utils.metrics import user_metrics
 
 
 # =====================================================
-# 1) Dataset：增加 user_id 返回，用于验证聚合
+# 1) 增强型 Dataset：支持多段特征加载
 # =====================================================
 class CoswaraMultiDataset(Dataset):
     def __init__(self, df: pd.DataFrame, is_train=True):
@@ -35,31 +35,33 @@ class CoswaraMultiDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         try:
+            # 加载 (96, 1024) 的 HeAR 特征
             feat = np.load(row["feature_path"]).astype(np.float32)
             if feat.shape != (96, 1024):
                 feat = np.resize(feat, (96, 1024)).astype(np.float32)
         except Exception:
             feat = np.zeros((96, 1024), dtype=np.float32)
 
-        # 训练集数据增强：双向 Masking
+        # 数据增强 (仅训练集)
         if self.is_train:
+            # Time Masking
             if np.random.rand() < 0.4:
                 t_mask = np.random.randint(5, 15)
                 t0 = np.random.randint(0, 96 - t_mask)
                 feat[t0: t0 + t_mask, :] = 0
+            # Feature Masking
             if np.random.rand() < 0.3:
                 f_mask = np.random.randint(50, 150)
                 f0 = np.random.randint(0, 1024 - f_mask)
                 feat[:, f0: f0 + f_mask] = 0
 
         label = torch.tensor(float(row["label"]), dtype=torch.float32)
-        # 返回 user_id 字符串，方便验证时分组
         return torch.from_numpy(feat), label, row["user_id"]
 
 
-# =========================
-# 2) 损失函数：Focal Loss
-# =========================
+# =====================================================
+# 2) 损失函数：Focal Loss (处理类别不平衡)
+# =====================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.35, gamma=2.0, label_smoothing=0.08):
         super().__init__()
@@ -68,6 +70,7 @@ class FocalLoss(nn.Module):
         self.ls = label_smoothing
 
     def forward(self, inputs, targets):
+        # 标签平滑
         targets = targets * (1 - self.ls) + 0.5 * self.ls
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
@@ -75,26 +78,30 @@ class FocalLoss(nn.Module):
         return F_loss.mean()
 
 
-# =========================
-# 3) 训练主函数
-# =========================
+# =====================================================
+# 3) 核心训练流程
+# =====================================================
 def train():
-    # 注意这里使用你新生成的多段 CSV
+    # 路径配置
     CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/coswara_hear_multi_segments.csv"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    OUT_DIR = PROJECT_ROOT / "outputs"
+    OUT_DIR.mkdir(exist_ok=True)
+    SAVE_PATH = str(OUT_DIR / "best_multi_user_auc.pth")
+
     # 超参数
-    BATCH_SIZE = 64  # 片段多，可以稍微增大 batch
+    BATCH_SIZE = 64
     EPOCHS = 80
     MAX_LR = 5e-5
     WEIGHT_DECAY = 1e-3
     PATIENCE = 15
+    MIN_SP = 0.65  # 你的指标底线
 
-    # 加载数据并按【用户】划分
+    # 1. 加载数据并执行【用户级】划分 (严防泄露)
     df = pd.read_csv(CSV_PATH)
     unique_users = df[["user_id", "label"]].drop_duplicates()
 
-    # 严格按照用户 ID 进行划分，防止数据泄露
     train_u, val_u = train_test_split(
         unique_users["user_id"],
         test_size=0.2,
@@ -105,65 +112,94 @@ def train():
     train_df = df[df["user_id"].isin(train_u)]
     val_df = df[df["user_id"].isin(val_u)]
 
-    train_loader = DataLoader(CoswaraMultiDataset(train_df, True), batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(CoswaraMultiDataset(val_df, False), batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    # 2. DataLoader
+    train_loader = DataLoader(
+        CoswaraMultiDataset(train_df, is_train=True),
+        batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True
+    )
+    # 验证集绝对不能 shuffle，否则 probs 顺序会乱
+    val_loader = DataLoader(
+        CoswaraMultiDataset(val_df, is_train=False),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
+    )
 
-    # 模型与优化器
+    # 3. 初始化
     model = build_model(input_dim=1024, d_model=512, dropout=0.35).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
     criterion = FocalLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-    best_auc = -1.0
+    best_user_auc = -1.0
     no_improve = 0
 
+    print(f"🚀 开始训练 | 训练集用户: {len(train_u)} | 验证集用户: {len(val_u)}")
+
     for epoch in range(1, EPOCHS + 1):
+        # --- 训练阶段 ---
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+
         for feats, labels, _ in pbar:
             feats, labels = feats.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(feats).view(-1), labels)
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = model(feats).view(-1)
+            loss = criterion(logits, labels)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-        scheduler.step()
+            total_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
 
-        # --- 验证阶段：多段预测聚合 ---
+        scheduler.step(epoch)
+
+        # --- 验证阶段 (对接你的 user_metrics) ---
         model.eval()
-        results = []  # 存储 (user_id, prob, label)
-
+        seg_probs = []
         with torch.no_grad():
-            for feats, labels, uids in val_loader:
+            for feats, _, _ in val_loader:
                 logits = model(feats.to(DEVICE)).view(-1)
-                probs = torch.sigmoid(logits).cpu().numpy()
-                for i in range(len(uids)):
-                    results.append({"user_id": uids[i], "prob": probs[i], "label": labels[i].item()})
+                seg_probs.extend(torch.sigmoid(logits).cpu().numpy())
 
-        # 将片段预测聚合为用户预测
-        res_df = pd.DataFrame(results)
-        user_pred_df = res_df.groupby("user_id").agg({"prob": "mean", "label": "first"}).reset_index()
+        seg_probs = np.asarray(seg_probs)
 
-        # 计算指标 (使用你原本的 user_metrics 函数)
+        # 调用你的 metrics.py 逻辑
         u_auc, u_best = user_metrics(
-            val_df,  # 这里传入原验证集df供函数内部关联
-            res_df["prob"].values,  # 传入片段级概率，user_metrics内部通常会处理聚合
+            val_df,
+            seg_probs,
             mode="f1_sp",
-            min_sp=0.65
+            min_sp=MIN_SP
         )
 
-        print(f"Epoch {epoch} | User AUC: {u_auc:.4f} | F1: {u_best['f1']:.4f}")
+        # --- 打印结果与混淆矩阵 ---
+        print(f"\n" + "—" * 45)
+        print(f"📈 [Epoch {epoch}] User-Level Result:")
+        print(f"AUC: {u_auc:.4f} | F1: {u_best['f1']:.4f} | SE: {u_best['se']:.4f} | SP: {u_best['sp']:.4f}")
+        print(f"Best Threshold: {u_best['thr']:.2f}")
 
-        if u_auc > best_auc:
-            best_auc = u_auc
-            torch.save(model.state_dict(), "best_multi_model.pth")
+        if u_best['cm'] is not None:
+            tn, fp, fn, tp = u_best['cm'].ravel()
+            print(f"\nConfusion Matrix:")
+            print(f"             Pred Neg    Pred Pos")
+            print(f"Actual Neg     {tn:<10}  {fp:<10}")
+            print(f"Actual Pos     {fn:<10}  {tp:<10}")
+        print("—" * 45 + "\n")
+
+        # --- 保存逻辑 ---
+        if u_auc > best_user_auc:
+            best_user_auc = u_auc
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"🌟 New Best User AUC: {best_user_auc:.4f} (Saved to {SAVE_PATH})")
             no_improve = 0
-            print("🔥 New Best AUC!")
         else:
             no_improve += 1
 
-        if no_improve >= PATIENCE: break
+        if no_improve >= PATIENCE:
+            print(f"Early Stopping! Best AUC: {best_user_auc:.4f}")
+            break
 
 
 if __name__ == "__main__":
