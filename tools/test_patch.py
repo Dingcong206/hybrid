@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-
+import numpy as np
 
 def verify_patch_visually(npy_path):
     data = np.load(npy_path)  # 加载 (N, 190, 256)
