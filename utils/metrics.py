@@ -51,7 +51,7 @@ def user_metrics(df, probs, mode="f1_sp", min_sp=0.65):
     tmp = df.copy()
     tmp["prob"] = probs
     # 聚合逻辑：你可以试着将 mean 改为 max 看看 F1 是否会更高
-    user_df = tmp.groupby("user_id").agg({"prob": "mean", "label": "max"}).reset_index()
+    user_df = tmp.groupby("user_id").agg({"prob": "max", "label": "max"}).reset_index()
 
     y_true = user_df["label"].values
     y_prob = user_df["prob"].values
