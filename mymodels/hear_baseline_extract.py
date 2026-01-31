@@ -3,36 +3,49 @@ import numpy as np
 import tensorflow as tf
 from huggingface_hub import from_pretrained_keras
 import librosa
+from tqdm import tqdm  # 进度条库
 
-# 1. 加载模型（会自动使用你下载好的缓存）
-print("🔗 正在从缓存加载 HeAR 模型...")
+# 1. 配置路径 (请根据你的实际路径修改)
+# 这里的路径应该是你存放 920 个 wav 文件的那个文件夹
+DATASET_DIR = "/data/dingcong/hybrid/audio_and txt_files"
+OUTPUT_DIR = "/data/dingcong/hybrid/features/hear_icbhi"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 2. 加载模型 (RTX 4090 加速)
+print("🔗 正在加载 HeAR 模型到 GPU...")
 model = from_pretrained_keras("google/hear")
-# 获取推理签名
 infer = model.signatures["serving_default"]
 
 
-# 2. 定义处理函数
-def extract_features(audio_path):
-    # HeAR 通常要求 16000Hz 采样率
-    audio, _ = librosa.load(audio_path, sr=16000)
-    # 增加 batch 维度并转换为 tensor
-    audio_tensor = tf.convert_to_tensor(audio[np.newaxis, :], dtype=tf.float32)
+def extract_and_save():
+    # 获取文件夹下所有的 .wav 文件
+    wav_files = [f for f in os.listdir(DATASET_DIR) if f.endswith('.wav')]
+    print(f"📂 发现 {len(wav_files)} 个音频文件。开始提取...")
 
-    # 进行推理
-    output = infer(audio_tensor)
+    for filename in tqdm(wav_files):
+        try:
+            audio_path = os.path.join(DATASET_DIR, filename)
 
-    # HeAR 会输出多种特征，通常我们取 'embedding' (1024维)
-    # 具体 key 名取决于模型，刚才检查脚本输出过
-    embedding = output['embedding'].numpy()
-    return embedding
+            # 读取音频 (16kHz)
+            audio, _ = librosa.load(audio_path, sr=16000)
+
+            # 转换为 Tensor 并增加 batch 维度
+            audio_tensor = tf.convert_to_tensor(audio[np.newaxis, :], dtype=tf.float32)
+
+            # 推理 (HeAR 特征提取)
+            output = infer(audio_tensor)
+
+            # 提取 embedding (通常是 1024 维)
+            feat = output['embedding'].numpy()
+
+            # 保存为 npy 文件，文件名保持一致 (例如 101_1b1.wav -> 101_1b1.npy)
+            save_name = filename.replace('.wav', '.npy')
+            np.save(os.path.join(OUTPUT_DIR, save_name), feat)
+
+        except Exception as e:
+            print(f"❌ 处理 {filename} 出错: {e}")
 
 
-# 3. 测试运行
-test_file = "audio_and_txt_files"  # 确保这个路径有音频文件
-if os.path.exists(test_file):
-    feat = extract_features(test_file)
-    print(f"✅ 特征提取成功！形状为: {feat.shape}")
-    # 保存特征
-    np.save("test_feature.npy", feat)
-else:
-    print("❌ 未找到测试音频，请检查路径。")
+if __name__ == "__main__":
+    extract_and_save()
+    print(f"✅ 所有特征已保存至: {OUTPUT_DIR}")
