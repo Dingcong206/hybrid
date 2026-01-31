@@ -4,82 +4,94 @@ import tensorflow as tf
 import librosa
 from tqdm import tqdm
 
-# --- 1. 路径配置 (使用你 GitHub 仓库中的本地模型) ---
-REPO_BASE_DIR = "/data/dingcong/hybrid/hear"
+# --- 1. 严格配置模型路径 (根据你的 image_d7d3c6.png 定制) ---
+# 这是你 snapshots 文件夹的绝对路径
+MODEL_ROOT = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
+
+# 根据 ls 结果，子模型文件夹名称略有不同
+FRONTEND_PATH = os.path.join(MODEL_ROOT, "spectrogram_frontend")
+ENCODER_PATH = MODEL_ROOT  # 根目录通常是 Encoder
+# 官方提供 large 和 small 两个检测器，这里默认用 large
+DETECTOR_PATH = os.path.join(MODEL_ROOT, "event_detector_large")
+
+# 数据路径
 DATASET_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-OUTPUT_DIR = "/data/dingcong/hybrid/features/icbhi_official_binary"
+OUTPUT_DIR = "/data/dingcong/hybrid/features/icbhi_hear_official"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 加载官方组件
-hear_model = tf.saved_model.load(REPO_BASE_DIR)
-hear_func = hear_model.signatures["serving_default"]
-frontend_func = tf.saved_model.load(os.path.join(REPO_BASE_DIR, "frontend")).signatures["serving_default"]
-detector_func = tf.saved_model.load(os.path.join(REPO_BASE_DIR, "event_detector")).signatures["serving_default"]
+# --- 2. 加载官方组件 ---
+print("🔗 正在从本地缓存加载 HeAR 官方组件...")
+frontend_model = tf.saved_model.load(FRONTEND_PATH)
+hear_encoder = tf.saved_model.load(ENCODER_PATH)
+event_detector = tf.saved_model.load(DETECTOR_PATH)
+
+# 获取推理接口
+frontend_func = frontend_model.signatures["serving_default"]
+encoder_func = hear_encoder.signatures["serving_default"]
+detector_func = event_detector.signatures["serving_default"]
 
 
-def process_official_hear_flow(audio_path):
-    # A. 加载原始长音频
-    audio, sr = librosa.load(audio_path, sr=16000)
+# --- 3. 官方复刻：检测 -> 裁剪 2s -> 预测 ---
+def process_icbhi_sample(audio_path):
+    # A. 采样率重采样至 16kHz (HeAR 官方标准)
+    audio, _ = librosa.load(audio_path, sr=16000)
     waveform = tf.convert_to_tensor(audio[np.newaxis, :], dtype=tf.float32)
 
-    # B. 全局检测：找出音频中“最异常”的位置
+    # B. 寻找最显著的 2 秒 (Event Detection)
     # 链路：Frontend -> Encoder -> Detector
-    f_out = frontend_func(audio=waveform)['spectrogram']  # 根据签名调整key
-    e_out = hear_func(x=f_out)['embedding']
-    d_out = detector_func(x=e_out)['logits']  # 得到 [1, Time, Classes]
+    spec = list(frontend_func(audio=waveform).values())[0]
+    emb = list(encoder_func(x=spec).values())[0]
+    logits = list(detector_func(x=emb).values())[0]  # [1, Time, Classes]
 
-    # C. 官方裁剪逻辑：寻找事件中心
-    # 假设异常音标签在 detector 输出的某些维度上，我们取最大激活时刻
-    event_scores = tf.reduce_max(d_out, axis=-1).numpy()[0]  # 聚合各异常类的得分
-    best_step = np.argmax(event_scores)  # 概率最高的时刻
+    # 找到整段音频中异常得分最高的时刻
+    event_scores = tf.reduce_max(logits, axis=-1).numpy()[0]
+    best_step_idx = np.argmax(event_scores)
 
-    # 计算中心点对应的采样点位置 (HeAR 的 time step 通常对应 20ms-50ms)
-    # 这里根据 HeAR 官方 stride 换算，假设 best_step 对应的时间点是 t_center
-    total_steps = len(event_scores)
-    t_center_ratio = best_step / total_steps
-    center_sample = int(t_center_ratio * len(audio))
-
-    # 截取以 center_sample 为中心的 2 秒片段 (32000 个采样点)
+    # 将时间步换算回音频采样点，并截取以其为中心的 2 秒 (32000点)
+    center_sample = int((best_step_idx / len(event_scores)) * len(audio))
     start = max(0, center_sample - 16000)
     end = min(len(audio), start + 32000)
-    # 如果靠后不够截，往前挪
-    if end == len(audio): start = max(0, end - 32000)
 
-    official_crop = audio[start:end]
-    if len(official_crop) < 32000:  # 补齐
-        official_crop = np.pad(official_crop, (0, 32000 - len(official_crop)))
+    # 官方截取并补齐
+    crop = audio[start:end]
+    if len(crop) < 32000:
+        crop = np.pad(crop, (0, 32000 - len(crop)))
 
-    # D. 最终判定：对这 2 秒精华片段进行二分类
-    crop_tensor = tf.convert_to_tensor(official_crop[np.newaxis, :], dtype=tf.float32)
-    final_f = frontend_func(audio=crop_tensor)['spectrogram']
-    final_e = hear_func(x=final_f)['embedding']
-    final_d = detector_func(x=final_e)['logits']
+    # C. 对截取的 2s 片段做最终二分类
+    crop_tensor = tf.convert_to_tensor(crop[np.newaxis, :], dtype=tf.float32)
+    final_spec = list(frontend_func(audio=crop_tensor).values())[0]
+    final_emb = list(encoder_func(x=final_spec).values())[0]
+    final_logits = list(detector_func(x=final_emb).values())[0]
 
-    # 最终异常得分：该 2s 片段的平均最大概率
-    final_score = np.mean(tf.reduce_max(final_d, axis=-1).numpy())
-    prediction = 1 if final_score > 0.5 else 0
+    # 最终异常得分 (0-1)
+    # 取该 2s 片段内各类别概率的最大值作为异常强度
+    score = np.max(tf.nn.sigmoid(final_logits).numpy())
+    prediction = 1 if score > 0.5 else 0
 
-    return prediction, final_score
+    return prediction, score
 
 
-# --- 2. 批量处理 ---
+# --- 4. 批量执行 ---
 def main():
     files = [f for f in os.listdir(DATASET_DIR) if f.endswith('.wav')]
     results = []
-    print(f"🚀 按照 HeAR 官方检测+裁剪逻辑处理 ICBHI...")
 
+    print(f"🚀 开始处理 {len(files)} 个 ICBHI 样本...")
     with tf.device('/GPU:0'):
         for filename in tqdm(files):
             try:
-                pred, score = process_official_hear_flow(os.path.join(DATASET_DIR, filename))
+                path = os.path.join(DATASET_DIR, filename)
+                pred, score = process_icbhi_sample(path)
                 results.append(f"{filename},{pred},{score:.4f}")
             except Exception as e:
-                print(f"❌ {filename} 失败: {e}")
+                print(f"❌ 处理 {filename} 失败: {e}")
 
-    with open(os.path.join(OUTPUT_DIR, "official_binary_results.csv"), "w") as f:
-        f.write("filename,label,score\n")
+    # 保存 CSV 报告
+    with open(os.path.join(OUTPUT_DIR, "icbhi_binary_report.csv"), "w") as f:
+        f.write("filename,prediction,confidence\n")
         f.write("\n".join(results))
 
 
 if __name__ == "__main__":
     main()
+    print(f"✨ 复现完成！报告保存在: {OUTPUT_DIR}")
