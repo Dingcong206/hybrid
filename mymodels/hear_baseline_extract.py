@@ -28,7 +28,7 @@ def extract_features(audio_path):
 
 
 # 3. 测试运行
-test_file = "/data/dingcong/hybrid/hear/test_data/test.wav"  # 确保这个路径有音频文件
+test_file = "audio_and_txt_files"  # 确保这个路径有音频文件
 if os.path.exists(test_file):
     feat = extract_features(test_file)
     print(f"✅ 特征提取成功！形状为: {feat.shape}")
