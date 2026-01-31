@@ -1,79 +1,38 @@
 import os
-import sys
-import torch
-import tensorflow as tf
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
+import tensorflow as tf
+from huggingface_hub import from_pretrained_keras
+import librosa
 
-# --- 核心修改：链接到你下载的官方源码绝对路径 ---
-HEAR_SOURCE_DIR = "/data/dingcong/hybrid/hear/python"
-if HEAR_SOURCE_DIR not in sys.path:
-    sys.path.append(HEAR_SOURCE_DIR)
-
-# 现在可以安全地导入官方模块了
-try:
-    from data_processing.audio_utils import preprocess_audio
-
-    print("✅ 成功链接官方 data_processing 模块")
-except ImportError:
-    print(f"❌ 错误：在 {HEAR_SOURCE_DIR} 没找到源码，请核对路径！")
-    sys.exit()
-
-from transformers import AutoModel
-
-# --- 路径配置 ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DETECTOR_PATH = "/data/dingcong/models/hear_event_detector"  # 你解压权重的地方
-CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/combined_data.csv"
-SAVE_DIR = "/data/dingcong/hybrid/Coswara-Data/official_features"
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-# --- 初始化模型 ---
-print("🔗 正在加载官方模型 (Detector & ViT)...")
-detector = tf.saved_model.load(DETECTOR_PATH).signatures['serving_default']
-hear_vit = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True).to(DEVICE).eval()
+# 1. 加载模型（会自动使用你下载好的缓存）
+print("🔗 正在从缓存加载 HeAR 模型...")
+model = from_pretrained_keras("google/hear")
+# 获取推理签名
+infer = model.signatures["serving_default"]
 
 
-def get_official_embedding(wav_path):
-    import librosa
-    # 1. 官方要求的 16k 采样
-    y, _ = librosa.load(wav_path, sr=16000)
+# 2. 定义处理函数
+def extract_features(audio_path):
+    # HeAR 通常要求 16000Hz 采样率
+    audio, _ = librosa.load(audio_path, sr=16000)
+    # 增加 batch 维度并转换为 tensor
+    audio_tensor = tf.convert_to_tensor(audio[np.newaxis, :], dtype=tf.float32)
 
-    # 2. 运行健康检测器 (Event Detector)
-    input_tensor = tf.convert_to_tensor(y, dtype=tf.float32)
-    det_out = detector(input_tensor)
-    probs = det_out['probabilities'].numpy()[:, 0]  # 0位是咳嗽
+    # 进行推理
+    output = infer(audio_tensor)
 
-    # 3. 筛选有效段落 (阈值 0.2)
-    valid_secs = np.where(probs > 0.2)[0]
-    if len(valid_secs) == 0: valid_secs = [np.argmax(probs)]
-
-    all_embs = []
-    for sec in valid_secs:
-        start, end = int(sec * 16000), int((sec + 2) * 16000)
-        seg = y[start:end]
-        if len(seg) < 32000: seg = np.pad(seg, (0, 32000 - len(seg)))
-
-        # 4. 官方预处理 + 全量 ViT 提取 1024 维特征
-        spec = preprocess_audio(torch.from_numpy(seg).float().unsqueeze(0))
-        with torch.no_grad():
-            output = hear_vit(spec.to(DEVICE))
-            all_embs.append(output.pooler_output.cpu().numpy())
-
-    # 返回均值作为该音频的 Baseline 特征
-    return np.mean(np.concatenate(all_embs, axis=0), axis=0)
+    # HeAR 会输出多种特征，通常我们取 'embedding' (1024维)
+    # 具体 key 名取决于模型，刚才检查脚本输出过
+    embedding = output['embedding'].numpy()
+    return embedding
 
 
-# --- 执行提取 ---
-df = pd.read_csv(CSV_PATH)
-for idx, row in tqdm(df.iterrows(), total=len(df)):
-    save_path = os.path.join(SAVE_DIR, f"{row['user_id']}.npy")
-    if not os.path.exists(save_path):
-        try:
-            feat = get_official_embedding(row['path'])
-            np.save(save_path, feat)
-        except Exception as e:
-            print(f"❌ 样本 {row['user_id']} 提取失败: {e}")
-
-print(f"✅ 所有特征已保存至: {SAVE_DIR}")
+# 3. 测试运行
+test_file = "/data/dingcong/hybrid/hear/test_data/test.wav"  # 确保这个路径有音频文件
+if os.path.exists(test_file):
+    feat = extract_features(test_file)
+    print(f"✅ 特征提取成功！形状为: {feat.shape}")
+    # 保存特征
+    np.save("test_feature.npy", feat)
+else:
+    print("❌ 未找到测试音频，请检查路径。")
