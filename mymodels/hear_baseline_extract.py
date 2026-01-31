@@ -4,94 +4,84 @@ import tensorflow as tf
 import librosa
 from tqdm import tqdm
 
-# --- 1. 严格配置模型路径 (根据你的 image_d7d3c6.png 定制) ---
-# 这是你 snapshots 文件夹的绝对路径
-MODEL_ROOT = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
+# --- 1. 严格路径配置 (直接从你的 image_d7d3c6.png 复制) ---
+# 请确保这个快照 ID 是最新的
+SNAPSHOT_PATH = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
 
-# 根据 ls 结果，子模型文件夹名称略有不同
-FRONTEND_PATH = os.path.join(MODEL_ROOT, "spectrogram_frontend")
-ENCODER_PATH = MODEL_ROOT  # 根目录通常是 Encoder
-# 官方提供 large 和 small 两个检测器，这里默认用 large
-DETECTOR_PATH = os.path.join(MODEL_ROOT, "event_detector_large")
+# 根据 ls 结果，子文件夹名称必须完全一致
+FRONTEND_PATH = os.path.join(SNAPSHOT_PATH, "spectrogram_frontend")
+ENCODER_PATH = SNAPSHOT_PATH  # 根目录存放基础编码器
+DETECTOR_PATH = os.path.join(SNAPSHOT_PATH, "event_detector_large")
 
 # 数据路径
-DATASET_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-OUTPUT_DIR = "/data/dingcong/hybrid/features/icbhi_hear_official"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+DATA_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
+OUT_DIR = "/data/dingcong/hybrid/features/icbhi_final_binary"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- 2. 加载官方组件 ---
-print("🔗 正在从本地缓存加载 HeAR 官方组件...")
-frontend_model = tf.saved_model.load(FRONTEND_PATH)
-hear_encoder = tf.saved_model.load(ENCODER_PATH)
-event_detector = tf.saved_model.load(DETECTOR_PATH)
+# 路径自检
+for p in [FRONTEND_PATH, ENCODER_PATH, DETECTOR_PATH]:
+    if not os.path.exists(os.path.join(p, "saved_model.pb")):
+        print(f"❌ 警告：路径 {p} 下找不到 saved_model.pb，请检查文件名！")
 
-# 获取推理接口
-frontend_func = frontend_model.signatures["serving_default"]
-encoder_func = hear_encoder.signatures["serving_default"]
-detector_func = event_detector.signatures["serving_default"]
+# --- 2. 加载模型组件 ---
+print("🔗 正在加载 HeAR 官方组件...")
+frontend = tf.saved_model.load(FRONTEND_PATH).signatures["serving_default"]
+encoder = tf.saved_model.load(ENCODER_PATH).signatures["serving_default"]
+detector = tf.saved_model.load(DETECTOR_PATH).signatures["serving_default"]
 
 
-# --- 3. 官方复刻：检测 -> 裁剪 2s -> 预测 ---
-def process_icbhi_sample(audio_path):
-    # A. 采样率重采样至 16kHz (HeAR 官方标准)
+# --- 3. 官方复现：ICBHI 二分类处理逻辑 ---
+def predict_icbhi(audio_path):
+    # HeAR 官方方法：先检测整段音频，找到最显著的事件点
     audio, _ = librosa.load(audio_path, sr=16000)
     waveform = tf.convert_to_tensor(audio[np.newaxis, :], dtype=tf.float32)
 
-    # B. 寻找最显著的 2 秒 (Event Detection)
-    # 链路：Frontend -> Encoder -> Detector
-    spec = list(frontend_func(audio=waveform).values())[0]
-    emb = list(encoder_func(x=spec).values())[0]
-    logits = list(detector_func(x=emb).values())[0]  # [1, Time, Classes]
+    # 全局扫描定位
+    spec = list(frontend(audio=waveform).values())[0]
+    emb = list(encoder(x=spec).values())[0]
+    logits = list(detector(x=emb).values())[0]
 
-    # 找到整段音频中异常得分最高的时刻
-    event_scores = tf.reduce_max(logits, axis=-1).numpy()[0]
-    best_step_idx = np.argmax(event_scores)
+    # 找到得分最高的时间点
+    scores = tf.reduce_max(logits, axis=-1).numpy()[0]
+    best_idx = np.argmax(scores)
 
-    # 将时间步换算回音频采样点，并截取以其为中心的 2 秒 (32000点)
-    center_sample = int((best_step_idx / len(event_scores)) * len(audio))
-    start = max(0, center_sample - 16000)
+    # 官方裁剪：以此点为中心截取 2 秒 (32000点)
+    center = int((best_idx / len(scores)) * len(audio))
+    start = max(0, center - 16000)
     end = min(len(audio), start + 32000)
 
-    # 官方截取并补齐
     crop = audio[start:end]
     if len(crop) < 32000:
         crop = np.pad(crop, (0, 32000 - len(crop)))
 
-    # C. 对截取的 2s 片段做最终二分类
+    # 最终二分类：对 2s 精华片段进行判定
     crop_tensor = tf.convert_to_tensor(crop[np.newaxis, :], dtype=tf.float32)
-    final_spec = list(frontend_func(audio=crop_tensor).values())[0]
-    final_emb = list(encoder_func(x=final_spec).values())[0]
-    final_logits = list(detector_func(x=final_emb).values())[0]
+    f_out = list(frontend(audio=crop_tensor).values())[0]
+    e_out = list(encoder(x=f_out).values())[0]
+    d_out = list(detector(x=e_out).values())[0]
 
-    # 最终异常得分 (0-1)
-    # 取该 2s 片段内各类别概率的最大值作为异常强度
-    score = np.max(tf.nn.sigmoid(final_logits).numpy())
-    prediction = 1 if score > 0.5 else 0
+    # 获取最高概率分数 (0-1)
+    prob = np.max(tf.nn.sigmoid(d_out).numpy())
+    label = 1 if prob > 0.5 else 0
 
-    return prediction, score
+    return label, prob
 
 
-# --- 4. 批量执行 ---
-def main():
-    files = [f for f in os.listdir(DATASET_DIR) if f.endswith('.wav')]
+# --- 4. 批量预测 ---
+if __name__ == "__main__":
+    wav_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.wav')]
     results = []
 
-    print(f"🚀 开始处理 {len(files)} 个 ICBHI 样本...")
+    print(f"🚀 开始对 {len(wav_files)} 个 ICBHI 样本进行官方复现推理...")
     with tf.device('/GPU:0'):
-        for filename in tqdm(files):
+        for f in tqdm(wav_files):
             try:
-                path = os.path.join(DATASET_DIR, filename)
-                pred, score = process_icbhi_sample(path)
-                results.append(f"{filename},{pred},{score:.4f}")
+                l, p = predict_icbhi(os.path.join(DATA_DIR, f))
+                results.append(f"{f},{l},{p:.4f}")
             except Exception as e:
-                print(f"❌ 处理 {filename} 失败: {e}")
+                print(f"❌ {f} 失败: {e}")
 
-    # 保存 CSV 报告
-    with open(os.path.join(OUTPUT_DIR, "icbhi_binary_report.csv"), "w") as f:
-        f.write("filename,prediction,confidence\n")
+    with open(os.path.join(OUT_DIR, "report.csv"), "w") as f:
+        f.write("filename,prediction,score\n")
         f.write("\n".join(results))
-
-
-if __name__ == "__main__":
-    main()
-    print(f"✨ 复现完成！报告保存在: {OUTPUT_DIR}")
+    print("✨ 处理完成！")
