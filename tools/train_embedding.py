@@ -88,16 +88,15 @@ def train():
 
     OUT_DIR = PROJECT_ROOT / "outputs"
     OUT_DIR.mkdir(exist_ok=True)
-    SAVE_PATH = str(OUT_DIR / "best_multi_user_auc.pth")
+    SAVE_PATH = str(OUT_DIR / "best_multi_user_f1.pth")
 
     # 超参数
     BATCH_SIZE = 64
     EPOCHS = 80
-    MAX_LR = 5e-5
-    WEIGHT_DECAY = 1e-3
+    MAX_LR = 1e-5
+    WEIGHT_DECAY = 1e-2
     PATIENCE = 15
-    MIN_SP = 0.65  # 你的指标底线
-
+    MIN_SP = 0.65
     # 1. 加载数据并执行【用户级】划分 (严防泄露)
     df = pd.read_csv(CSV_PATH)
     unique_users = df[["user_id", "label"]].drop_duplicates()
@@ -129,7 +128,7 @@ def train():
     criterion = FocalLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-    best_user_auc = -1.0
+    best_user_f1 = -1.0
     no_improve = 0
 
     print(f"🚀 开始训练 | 训练集用户: {len(train_u)} | 验证集用户: {len(val_u)}")
@@ -189,16 +188,18 @@ def train():
         print("—" * 45 + "\n")
 
         # --- 保存逻辑 ---
-        if u_auc > best_user_auc:
-            best_user_auc = u_auc
+        cur_f1 = float(u_best["f1"])
+
+        if cur_f1 > best_user_f1:
+            best_user_f1 = cur_f1
             torch.save(model.state_dict(), SAVE_PATH)
-            print(f"🌟 New Best User AUC: {best_user_auc:.4f} (Saved to {SAVE_PATH})")
+            print(f"New Best User F1: {best_user_f1:.4f} (Saved to {SAVE_PATH})")
             no_improve = 0
         else:
             no_improve += 1
 
         if no_improve >= PATIENCE:
-            print(f"Early Stopping! Best AUC: {best_user_auc:.4f}")
+            print(f"Early Stopping! Best F1: {best_user_f1:.4f}")
             break
 
 
