@@ -3,8 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
+
 # =====================================================
-# 1) BiMambaBlock: 双向 Mamba 核心块 (保持不变)
+# 1) BiMambaBlock: 双向 Mamba 核心块
 # =====================================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2, mlp_ratio=4):
@@ -24,79 +25,86 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
+        # Mamba 残差分支
         h = self.ln1(x)
+        # 双向融合：前向 + 翻转后的后向再翻转回来
         h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h)
+        # FFN 残差分支
         x = x + self.mlp(self.ln2(x))
         return x
 
+
 # =====================================================
-# 2) SSA_Layer: 每一层 = Attention -> 3*Mamba -> Attention
+# 2) SSA_Layer: 空间-频谱-注意力层 (核心修改处)
 # =====================================================
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    def __init__(self, d_model, nhead=12, dropout=0.3):
         super().__init__()
 
-        # A. 卷积层：局部细节补偿
+        # A. 卷积层：提取局部纹理
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
             nn.Dropout(dropout)
         )
 
-        # B. 前置 Attention 层
-        self.pre_attn_ln = nn.LayerNorm(d_model)
-        self.pre_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-        self.pre_attn_drop = nn.Dropout(dropout)
-
-        # C. 中间 3 层 Mamba 堆栈
-        self.mamba_stack = nn.ModuleList([
+        # B. Pre-Attention Mamba 堆栈 (3层)
+        self.bimamba_stack = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout)
             for _ in range(3)
         ])
 
-        # D. 后置 Attention 层
-        self.post_attn_ln = nn.LayerNorm(d_model)
-        self.post_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-        self.post_attn_drop = nn.Dropout(dropout)
+        # C. Attention 层
+        self.attn_ln = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.attn_drop = nn.Dropout(dropout)
 
-        # E. 门控残差机制
+        # D. 新增：Post-Attention Mamba 堆栈
+        self.post_mamba_stack = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout)
+            for _ in range(3)
+        ])
+
+        # E. 门控机制
         self.gate = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        res_layer = x  # 这一层的大残差
+        res_layer = x  # 大残差
 
-        # 1. 卷积局部增强
+        # 1. 卷积：处理局部信息
         x_conv = x.transpose(1, 2)
         x = x + self.conv(x_conv).transpose(1, 2)
 
-        # 2. 前置 Attention：先看全局
-        res_pre = x
-        x_pre, _ = self.pre_attn(self.pre_attn_ln(x), self.pre_attn_ln(x), self.pre_attn_ln(x))
-        x = res_pre + self.pre_attn_drop(x_pre)
+        # 2. Pre-Attention Mamba：时序初步建模
+        for bimamba in self.bimamba_stack:
+            x = bimamba(x)
 
-        # 3. 3 层 Mamba：深度时序建模
-        for mamba in self.mamba_stack:
-            x = mamba(x)
+        # 3. Attention：全局特征检索
+        res_attn = x
+        x_norm = self.attn_ln(x)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        x_out = res_attn + self.attn_drop(x_attn)
 
-        # 4. 后置 Attention：全局特征归纳
-        res_post = x
-        x_post, _ = self.post_attn(self.post_attn_ln(x), self.post_attn_ln(x), self.post_attn_ln(x))
-        x = res_post + self.post_attn_drop(x_post)
+        # 4. Post-Attention Mamba：追加的 3 层 Mamba 进行精炼
+        for post_bimamba in self.post_mamba_stack:
+            x_out = post_bimamba(x_out)
 
-        # 5. 门控融合
-        g = self.gate(x.mean(dim=1, keepdim=True))
-        return res_layer + g * x
+        # 5. 应用门控
+        g = self.gate(x_out.mean(dim=1, keepdim=True))
+        return res_layer + g * x_out
+
 
 # =====================================================
-# 3) SSA_Model: 顶层封装
+# 3) SSA_Model: 顶层架构
 # =====================================================
 class SSA_Model(nn.Module):
-    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.3, n_layers=2, seq_len=96):
+    def __init__(self, input_dim=1024, num_classes=1, d_model=256, dropout=0.2, n_layers=2, seq_len=96):
         super().__init__()
 
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -108,8 +116,7 @@ class SSA_Model(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # 可学习的层权重：让模型自己决定第一层和第二层谁更重要
-        self.layer_weights = nn.Parameter(torch.ones(n_layers))
+        self.norm = nn.LayerNorm(d_model)
 
         self.pool_proj = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
@@ -117,13 +124,10 @@ class SSA_Model(nn.Module):
             nn.Linear(d_model // 4, 1)
         )
 
-        # 增加 Std Pooling 后，每一层有 4 路特征 (Attn, Max, Avg, Std)
-        # 4路 * d_model = 1024 维
         self.head = nn.Sequential(
-            nn.Linear(d_model * 4, d_model),
-            nn.BatchNorm1d(d_model),  # 增加 BN 防止过拟合
+            nn.Linear(d_model * 3, d_model),
             nn.GELU(),
-            nn.Dropout(0.5),  # 提高 Dropout 到 0.5
+            nn.Dropout(dropout),
             nn.Linear(d_model, num_classes)
         )
 
@@ -133,33 +137,33 @@ class SSA_Model(nn.Module):
         x = self.input_proj(x) + self.pos_embed
         x = self.pos_drop(x)
 
-        # 用于存储加权后的融合特征
-        weighted_fusion = 0
-        layer_soft_weights = torch.softmax(self.layer_weights, dim=0)
-
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             x = layer(x)
 
-            # 池化操作
-            attn_logits = self.pool_proj(x)
-            # 使用 Top-K (K=16) 增强局部鲁棒性
-            _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=16, dim=1)
-            mask = torch.zeros_like(attn_logits).fill_(-1e9)
-            mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
-            topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)
+        x = self.norm(x)
 
-            attn_f = torch.sum(x * topk_weights, dim=1)
-            max_f, _ = torch.max(x, dim=1)
-            avg_f = torch.mean(x, dim=1)
-            std_f = torch.std(x, dim=1)  # 捕捉声音的波动特征
+        # Top-K 选通注意力池化
+        attn_logits = self.pool_proj(x)
+        _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=16, dim=1)
+        mask = torch.zeros_like(attn_logits).fill_(-1e9)
+        mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
+        topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)
 
-            # 拼接当前层的 4 路特征
-            layer_combined = torch.cat([attn_f, max_f, avg_f, std_f], dim=-1)
+        # 三路融合
+        attn_feat = torch.sum(x * topk_weights, dim=1)
+        max_feat, _ = torch.max(x, dim=1)
+        avg_feat = torch.mean(x, dim=1)
 
-            # 按可学习权重累加
-            weighted_fusion += layer_soft_weights[i] * layer_combined
+        feat = torch.cat([attn_feat, max_feat, avg_feat], dim=-1)
 
-        return self.head(weighted_fusion).squeeze(-1)
+        return self.head(feat).squeeze(-1)
+
 
 def build_model(input_dim=1024, d_model=256, dropout=0.15, num_classes=1, seq_len=96):
-    return SSA_Model(input_dim, num_classes, d_model, dropout, n_layers=2, seq_len=seq_len)
+    return SSA_Model(
+        input_dim=input_dim,
+        d_model=d_model,
+        dropout=dropout,
+        num_classes=num_classes,
+        seq_len=seq_len,
+    )
