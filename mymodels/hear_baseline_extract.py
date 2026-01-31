@@ -3,70 +3,62 @@ import sys
 import tensorflow as tf
 import numpy as np
 import librosa
+import torch  # 注意：官方预处理函数使用的是 torch 格式
 from tqdm import tqdm
 
-# 1. 挂载官方代码路径
+# 1. 挂载路径
 sys.path.append("/data/dingcong/hybrid/hear/python")
 from data_processing import audio_utils
 
-# 2. 定义模型物理路径
-# 这里的路径必须指向包含 saved_model.pb 的文件夹
+# 2. 模型路径配置
 MODEL_ROOT = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
 FRONTEND_PATH = os.path.join(MODEL_ROOT, "event_detector/spectrogram_frontend")
-ENCODER_PATH = MODEL_ROOT  # Encoder 通常在根目录
+ENCODER_PATH = MODEL_ROOT
 
-# 3. 加载模型组件
-print("📦 正在加载 HeAR 模型组件...")
+# 加载模型
+print("📦 正在加载 HeAR ViT Encoder (RTX 4090 已就绪)...")
 frontend = tf.saved_model.load(FRONTEND_PATH).signatures["serving_default"]
 encoder = tf.saved_model.load(ENCODER_PATH).signatures["serving_default"]
 
-# 4. 配置输入输出
-WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-SAVE_DIR = "/data/dingcong/hybrid/hear_features"
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR)
 
+# 3. 官方标准提取函数
+def extract_with_official_utils(wav_path):
+    # A. 使用 librosa 加载原始音频
+    y, sr = librosa.load(wav_path, sr=16000)
 
-# --- 核心处理函数 ---
-def extract_official_features(wav_path):
-    """
-    使用官方预处理逻辑，彻底解决 32240 长度报错
-    """
-    # 使用官方工具加载音频并重采样至 16kHz
-    audio = audio_utils.load_audio(wav_path, sample_rate=16000)
+    # B. 调用官方重采样与单声道转换
+    # 注意：官方函数可能期待 torch.Tensor
+    y_torch = torch.from_numpy(y).float()
+    processed_audio = audio_utils.resample_audio_and_convert_to_mono(y_torch, sr, 16000)
 
-    # 【关键逻辑】官方分帧处理：将长音频切成 32240 长度的片段
-    # 这步解决了 Input to reshape is a tensor with 320240 values 的错误
+    # C. 解决 32240 报错的核心：分帧
+    # 这里我们手动对齐官方要求的帧长
     FRAME_LEN = 32240
-    frames = tf.signal.frame(audio, frame_length=FRAME_LEN, frame_step=FRAME_LEN, pad_end=True)
+    frames = tf.signal.frame(processed_audio.numpy(), frame_length=FRAME_LEN, frame_step=FRAME_LEN, pad_end=True)
 
-    # 执行模型链路
-    # Step A: Frontend (Waveform -> Spectrogram)
-    # 此时 frames 的 shape 是 [N, 32240]
+    # D. 进入 ViT 链路
+    # Step 1: Frontend
     spec_output = frontend(audio=frames)['output_0']
 
-    # Step B: Encoder (Spectrogram -> Embedding)
+    # Step 2: Encoder (ViT 核心)
+    # 这一步将频谱图转换为高维 Embedding
     embeddings = encoder(x=spec_output)['output_0']
 
     return embeddings.numpy()
 
 
-# --- 批量运行循环 ---
-print(f"🎬 开始处理 {WAV_DIR} 中的音频文件...")
-wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith('.wav')]
+# 4. 批量处理循环
+WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
+SAVE_DIR = "/data/dingcong/hybrid/hear_features_official"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-for filename in tqdm(wav_files):
-    file_path = os.path.join(WAV_DIR, filename)
-    save_path = os.path.join(SAVE_DIR, filename.replace('.wav', '.npy'))
+print(f"🎬 开始处理 {len(os.listdir(WAV_DIR))} 个音频文件...")
+for filename in tqdm(os.listdir(WAV_DIR)):
+    if filename.endswith('.wav'):
+        try:
+            feat = extract_with_official_utils(os.path.join(WAV_DIR, filename))
+            np.save(os.path.join(SAVE_DIR, filename.replace('.wav', '.npy')), feat)
+        except Exception as e:
+            print(f"❌ {filename} 失败: {e}")
 
-    try:
-        # 提取特征
-        features = extract_official_features(file_path)
-
-        # 保存为 numpy 文件方便后续训练
-        np.save(save_path, features)
-
-    except Exception as e:
-        print(f"❌ 文件 {filename} 处理失败: {str(e)}")
-
-print(f"✅ 处理完成！所有特征已保存在: {SAVE_DIR}")
+print(f"✅ 特征提取完成，已进入 ViT 空间。")
