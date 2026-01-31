@@ -1,6 +1,6 @@
 import os
 
-feat_dir = "/data/dingcong/hybrid/hear_features_official_final"
+feat_dir = "/data/dingcong/hybrid/hear_features_official"
 label_dir = "/data/dingcong/hybrid/audio_and_txt_files" # 假设标签和音频在同个目录
 
 feat_files = set([f.replace('.npy', '') for f in os.listdir(feat_dir) if f.endswith('.npy')])
