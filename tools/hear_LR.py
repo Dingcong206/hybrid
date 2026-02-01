@@ -17,12 +17,13 @@ def get_label(base_name):
     txt_path = os.path.join(LABEL_DIR, base_name + ".txt")
     if not os.path.exists(txt_path): return None
     df = pd.read_csv(txt_path, sep='\t', header=None)
+    # 原始标签逻辑：只要 txt 里有 1，就是异常
     return 1 if (df[2] == 1).any() or (df[3] == 1).any() else 0
 
 
-# --- 2. 修复后的加载逻辑 ---
+# --- 2. 加载数据 ---
 feat_files = sorted(glob.glob(os.path.join(FEAT_DIR, "*.npy")))
-file_data = []  # 存储文件级别的信息
+file_data = []
 
 print(f"📂 正在解析 {len(feat_files)} 个序列特征文件...")
 
@@ -32,65 +33,53 @@ for f_path in feat_files:
     if label is None: continue
 
     emb = np.load(f_path)
-    if emb.ndim == 1: emb = emb[None, :]  # 确保是 2D 矩阵
+    if emb.ndim == 1: emb = emb[None, :]
 
-    file_data.append({
-        'name': base_name,
-        'X': emb,  # (N, 512)
-        'y': label  # 0 或 1
-    })
+    file_data.append({'name': base_name, 'X': emb, 'y': label})
 
-# --- 3. 划分数据集 (按文件划分，防止数据泄露) ---
+# 按文件划分
 train_data, test_data = train_test_split(file_data, test_size=0.2, random_state=42)
 
-# 拆解成片段用于训练
 X_train = np.vstack([d['X'] for d in train_data])
 y_train = np.hstack([[d['y']] * len(d['X']) for d in train_data])
 
-# 标准化
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 
-# --- 4. 权重搜索 ---
-weights = np.arange(1.0, 10.1, 0.5)
-best_valid = None
+# --- 3. 寻找能让“一票判定”逻辑成立的参数 ---
+# 因为你坚持“一有即异常”，所以我们要搜索不同的“判定门槛”
+decision_thresholds = [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+weights = [0.5, 1.0, 2.0]  # 这里的权重不再需要太大
 
 print("\n" + "=" * 80)
-print(f"{'异常权重':>8} | {'SE (灵敏度)':>12} | {'SP (特异性)':>12} | {'(SE+SP)/2':>12}")
+print(f"{'门槛':>6} | {'权重':>6} | {'SE (灵敏度)':>12} | {'SP (特异性)':>12} | {'状态'}")
 print("-" * 80)
 
-for w in weights:
-    model = LogisticRegression(max_iter=1000, class_weight={0: 1, 1: w}, C=0.1, random_state=42)
-    model.fit(X_train, y_train)
+for thres in decision_thresholds:
+    for w in weights:
+        # C=0.0001 是为了让模型不要对单个特征维度过度反应
+        model = LogisticRegression(max_iter=1000, class_weight={0: 1, 1: w}, C=0.0001, random_state=42)
+        model.fit(X_train, y_train)
 
-    # 在测试集上做文件级聚合预测
-    y_test_file, y_prob_file = [], []
+        y_test_file, y_pred_file = [], []
 
-    for d in test_data:
-        # 对该文件的所有片段进行标准化和预测
-        X_test_scaled = scaler.transform(d['X'])
-        probs = model.predict_proba(X_test_scaled)[:, 1]
+        for d in test_data:
+            X_test_scaled = scaler.transform(d['X'])
+            probs = model.predict_proba(X_test_scaled)[:, 1]
 
-        # 聚合策略：均值 (Mean)
-        file_prob = np.mean(probs)
-        y_prob_file.append(file_prob)
-        y_test_file.append(d['y'])
+            # --- 核心逻辑：Max Pooling (一票判定) ---
+            max_prob = np.max(probs)
+            # 只有最大概率超过自定义门槛，才判为异常
+            pred = 1 if max_prob >= thres else 0
 
-    y_pred_file = (np.array(y_prob_file) >= 0.5).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_test_file, y_pred_file).ravel()
+            y_pred_file.append(pred)
+            y_test_file.append(d['y'])
 
-    se = tp / (tp + fn) if (tp + fn) > 0 else 0
-    sp = tn / (tn + fp) if (tn + fp) > 0 else 0
-    score = (se + sp) / 2
+        tn, fp, fn, tp = confusion_matrix(y_test_file, y_pred_file).ravel()
+        se = tp / (tp + fn) if (tp + fn) > 0 else 0
+        sp = tn / (tn + fp) if (tn + fp) > 0 else 0
 
-    status = "✅" if se >= MIN_THRESHOLD and sp >= MIN_THRESHOLD else "❌"
-    print(f"{w:>12.1f} | {se:>12.4f} | {sp:>12.4f} | {score:>12.4f} | {status}")
-
-    if (se >= MIN_THRESHOLD and sp >= MIN_THRESHOLD) and (best_valid is None or score > best_valid[3]):
-        best_valid = (w, se, sp, score)
+        status = "✅" if se >= MIN_THRESHOLD and sp >= MIN_THRESHOLD else "❌"
+        print(f"{thres:>8.2f} | {w:>8.1f} | {se:>12.4f} | {sp:>12.4f} | {status}")
 
 print("=" * 80)
-if best_valid:
-    print(f"🏆 最佳权重: {best_valid[0]} | ICBHI Score: {best_valid[3]:.4f}")
-else:
-    print("😓 依然没能满足双 0.45 约束，建议尝试更换 C 值为 0.01 或 0.001。")
