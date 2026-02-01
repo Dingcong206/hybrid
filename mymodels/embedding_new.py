@@ -64,20 +64,32 @@ for filename in tqdm(wav_files):
         # 将长音频切成片段 [N, 32240]
         audio_clips = tf.signal.frame(audio_16k, TARGET_LEN, TARGET_LEN)
 
-        # C. 逐个片段提取 Patch (解决 Reshape 报错的关键)
+        # C. 逐个片段提取 Patch
         all_patches = []
-        for i in range(audio_clips.shape[0]):
-            single_clip = audio_clips[i]  # 形状 [32240]
-            # 增加 Batch 维度变为 [1, 32240]
-            input_tensor = tf.expand_dims(single_clip, axis=0)
+        for i in range(num_frames):
+            start = i * TARGET_LEN
+            end = start + TARGET_LEN
+            single_clip = audio_padded[start:end]
 
-            # 调用前端
-            output = patch_infer(audio_wav=input_tensor)
-            all_patches.append(output['output_0'].numpy())
+            # 增加 Batch 维度变为 [1, 32000]
+            input_tensor = tf.constant(single_clip.reshape(1, -1), dtype=tf.float32)
+
+            # --- 核心修改位置 ---
+            # 1. 先拿到模型输出的字典
+            output_dict = patch_infer(audio_wav=input_tensor)
+
+            # 2. 动态提取字典里的第一个值（不管它的 Key 叫什么）
+            # 原来你是：patch_data = output['output_0'].numpy()
+            # 现在改成下面这两行：
+            val_list = list(output_dict.values())
+            patch_data = val_list[0].numpy()
+
+            all_patches.append(patch_data)
+            # --------------------
 
         # D. 合并结果
-        # 最终形状: [N, 190, 256]
         final_patches = np.concatenate(all_patches, axis=0)
+        np.save(save_path, final_patches)
 
         # E. 保存
         np.save(save_path, final_patches)
