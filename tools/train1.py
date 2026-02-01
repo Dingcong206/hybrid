@@ -20,47 +20,77 @@ from tqdm import tqdm
 from mymodels.model import build_model
 from utils.metrics import user_metrics
 
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from data.patch_utils import patch_10_200_48_to_tokens
 
 # =====================================================
 # 1) 增强型 Dataset：包含双向 Mask
 # =====================================================
-class CoswaraDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, is_train=True):
-        self.df = df.reset_index(drop=True)
-        self.is_train = is_train
+class HearPatchDataset(Dataset):
+    def __init__(self, patch_dir, items, seq_len=96):
+        """
+        items: [(filename.npy, label), ...]
+        """
+        self.patch_dir = patch_dir
+        self.items = items
+        self.seq_len = seq_len
 
     def __len__(self):
-        return len(self.df)
+        return len(self.items)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        try:
-            feat = np.load(row["feature_path"]).astype(np.float32)
-            # 兼容 HeAR 原始输出
-            if feat.shape[0] == 97:
-                feat = feat[1:, :]
-            if feat.shape != (96, 1024):
-                feat = np.resize(feat, (96, 1024)).astype(np.float32)
-        except Exception:
-            feat = np.zeros((96, 1024), dtype=np.float32)
+        fname, label = self.items[idx]
 
-        # 数据增强 (仅在训练集)
-        if self.is_train:
-            # A. 时间轴 Mask (Time Masking)
-            if np.random.rand() < 0.4:
-                t_mask = np.random.randint(5, 15)
-                t0 = np.random.randint(0, 96 - t_mask)
-                feat[t0: t0 + t_mask, :] = 0
+        patch = np.load(f"{self.patch_dir}/{fname}")   # (10,200,48)
+        patch = torch.tensor(patch, dtype=torch.float32)
 
-            # B. 特征轴 Mask (Feature Masking)
-            if np.random.rand() < 0.3:
-                f_mask = np.random.randint(50, 150)
-                f0 = np.random.randint(0, 1024 - f_mask)
-                feat[:, f0: f0 + f_mask] = 0
+        x = patch_10_200_48_to_tokens(patch, self.seq_len)
+        y = torch.tensor(label, dtype=torch.float32)
 
-        label = torch.tensor(float(row["label"]), dtype=torch.float32)
-        return torch.from_numpy(feat), label
+        return x, y
 
+
+
+# =====================================================
+# 2) 核心训练流程：解决 KeyError 与维度初始化
+# =====================================================
+def train():
+    CSV_PATH = "/data/dingcong/hybrid/labels.csv"
+    PATCH_DIR = "/data/dingcong/hybrid/hear_patch_final"
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 加载数据并修复 KeyError: 'user_id'
+    df = pd.read_csv(CSV_PATH)
+
+    # 如果你的 labels.csv 没有 user_id，我们用 file_name 代替进行分割
+    # 这样可以确保每个文件被独立对待
+    if "user_id" not in df.columns:
+        df["user_id"] = df["file_name"]
+
+    users = df["user_id"].unique()
+    # 这里的 label 获取逻辑需要确保 CSV 里有 label 列
+    user_labels = df.groupby("user_id")["label"].max().reindex(users).values.astype(int)
+
+    # 划分训练/验证集
+    train_users, val_users = train_test_split(
+        users, test_size=0.2, random_state=42, stratify=user_labels
+    )
+
+    # 初始化 DataLoader
+    train_loader = DataLoader(
+        HeARPatchDataset(df[df["user_id"].isin(train_users)], PATCH_DIR, is_train=True),
+        batch_size=32, shuffle=True, num_workers=4
+    )
+    val_loader = DataLoader(
+        HeARPatchDataset(df[df["user_id"].isin(val_users)], PATCH_DIR, is_train=False),
+        batch_size=32, shuffle=False, num_workers=4
+    )
+
+    # 【重要】模型初始化：input_dim 必须设为 48
+    # d_model 可以设为 256 或 512，这是你的 Encoder 内部维度
+    model = build_model(input_dim=48, d_model=256, dropout=0.3).to(DEVICE)
 
 # =====================================================
 # 2) 损失函数：Focal Loss (解决类别不平衡)
