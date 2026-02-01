@@ -60,6 +60,8 @@ def train():
     CSV_PATH = "/data/dingcong/hybrid/labels.csv"
     PATCH_DIR = "/data/dingcong/hybrid/hear_patch_final"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("DF columns:", df.columns.tolist())
+    print(df.head())
 
     # 加载数据并修复 KeyError: 'user_id'
     df = pd.read_csv(CSV_PATH)
