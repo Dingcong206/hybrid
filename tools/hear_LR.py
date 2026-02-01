@@ -7,7 +7,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, confusion_matrix
-
+from sklearn.calibration import CalibratedClassifierCV
 
 # =========================
 # 1) 路径配置
@@ -175,35 +175,27 @@ def patient_wise_split_files(file_label, file_patient, test_size=TEST_SIZE, seed
 # =========================
 # 7) Segment -> File 聚合：max(prob)
 # =========================
-def aggregate_file_maxprob(files, seg_files, seg_probs):
-    """
-    files: 需要聚合的 file 集合
-    seg_files: 每个 segment 属于哪个 file（长度 = N_seg）
-    seg_probs: 每个 segment 的异常概率（长度 = N_seg）
-    返回:
-      file_list, file_prob
-    """
-    from collections import defaultdict
 
+
+def aggregate_file_noisy_or(files, seg_files, seg_probs):
+    from collections import defaultdict
     bucket = defaultdict(list)
     for f, p in zip(seg_files, seg_probs):
         if f in files:
             bucket[f].append(float(p))
 
-    file_list = []
-    file_prob = []
+    file_list, file_prob = [], []
     for f in sorted(files):
         ps = bucket.get(f, [])
         if len(ps) == 0:
-            # 理论上不会发生（因为文件都有 segment），但兜底
-            file_list.append(f)
-            file_prob.append(0.0)
-        else:
-            file_list.append(f)
-            file_prob.append(max(ps))  # ✅ max 聚合
+            file_list.append(f); file_prob.append(0.0)
+            continue
+        ps = np.clip(np.asarray(ps, dtype=np.float64), 1e-6, 1-1e-6)
+        p_file = 1.0 - np.prod(1.0 - ps)   # ✅ Noisy-OR
+        file_list.append(f)
+        file_prob.append(float(p_file))
 
     return file_list, np.asarray(file_prob, dtype=np.float32)
-
 
 # =========================
 # 8) 主流程：训练 LR（segment-level）+ file-level 评估（max）
@@ -227,13 +219,14 @@ def run():
 
     # 训练 LR：balanced
     print("🚀 Training Logistic Regression (segment-level, class_weight=balanced)...")
-    clf = LogisticRegression(
+    base_lr = LogisticRegression(
         max_iter=5000,
         C=1.0,
         solver="lbfgs",
         class_weight="balanced",
         random_state=RANDOM_SEED
     )
+    clf = CalibratedClassifierCV(base_lr, method="sigmoid", cv=3)
     clf.fit(X_train_s, y_train)
 
     # segment 概率
