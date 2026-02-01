@@ -29,40 +29,37 @@ patch_infer = patch_model.signatures["serving_default"]
 
 # --- 4. 批量处理函数 ---
 def process_single_file(file_path):
-    # A. 加载音频并转为单声道 16kHz
+    # 1. 加载与基础补齐
     audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
-
-    # B. 按照官方逻辑进行分帧 (解决 num_frames 未定义问题)
-    # 如果音频不足 2 秒，进行补齐
     if len(audio) < FRAME_LENGTH:
         audio = np.pad(audio, (0, FRAME_LENGTH - len(audio)), mode='constant')
 
-    # 使用 tf.signal.frame 将长音频切成 2 秒一段的 Batch [N, 32000]
-    # 这里 frame_step = FRAME_LENGTH 表示无重叠切割
-    # 设定 10ms 步长 (160 采样点) 以达到 2K 序列长度
+    # 2. 高密度分帧以获取长序列 (10ms 步长)
     NEW_STEP = 160
     audio_clips = tf.signal.frame(audio, FRAME_LENGTH, NEW_STEP).numpy()
 
     num_frames = audio_clips.shape[0]
     all_patches = []
 
-    # 必须严格一帧一帧喂，防止 Reshape 报错
+    # 3. 逐帧推理并降维
     for i in range(num_frames):
-        # 保持形状为 [1, 32000]
         single_clip = audio_clips[i: i + 1]
-
-        # 推理
         output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
-        patch_data = list(output_dict.values())[0].numpy()  # [1, 190, 256]
 
-        # 【重要建议】为了节省硬盘，对 190 维度取平均
-        # 这样 920 个文件的 2K 序列才不会把你的硬盘塞满
-        patch_reduced = np.mean(patch_data, axis=1)  # 变成 [1, 256]
+        # 原始 [1, 190, 256] -> 降维后 [1, 256]
+        patch_data = list(output_dict.values())[0].numpy()
+        patch_reduced = np.mean(patch_data, axis=1).astype(np.float32)
         all_patches.append(patch_reduced)
 
-    # 最终合并成 [T, 256]
-    return np.concatenate(all_patches, axis=0)
+    # 4. 合并并强制对齐 T=2048
+    res = np.concatenate(all_patches, axis=0)
+    target_len = 2048
+    if res.shape[0] >= target_len:
+        res = res[:target_len, :]
+    else:
+        res = np.pad(res, ((0, target_len - res.shape[0]), (0, 0)), mode='constant')
 
+    return res
 
 # --- 5. 执行主循环 ---
 wav_files = sorted([f for f in os.listdir(WAV_DIR) if f.endswith('.wav')])
