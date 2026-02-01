@@ -1,5 +1,8 @@
 import sys
 from pathlib import Path
+
+from torchvision.transforms.v2.functional import pad_mask
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 import os
@@ -120,8 +123,8 @@ def train_one_epoch(model, loader, optimizer):
         x_pad = x_pad.to(DEVICE)
         mask = mask.to(DEVICE)
         y_file = y_file.to(DEVICE)
-
-        logits = model(x_pad, key_padding_mask=mask)  # 期望输出 (B,T)，mask可选（你模型不收也行）
+        pad_mask = ~mask
+        logits = model(x_pad, patch_mask=pad_mask)  # 期望输出 (B,T)，mask可选（你模型不收也行）
         if logits.dim() != 2:
             raise RuntimeError(f"Model must return (B,T) logits, got {tuple(logits.shape)}")
 
@@ -161,7 +164,7 @@ def evaluate(model, loader):
         x_pad = x_pad.to(DEVICE)
         mask = mask.to(DEVICE)
 
-        logits = model(x_pad, key_padding_mask=mask)      # (B,T)
+        logits = model(x_pad, patch_mask=pad_mask)      # (B,T)
         probs = torch.sigmoid(logits)         # (B,T)
 
         # file-level 聚合：对每个文件只取有效长度的 probs，再 top-k mean
