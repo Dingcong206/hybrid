@@ -2,30 +2,33 @@ import os
 import glob
 import numpy as np
 import pandas as pd
+import joblib  # 用于保存模型
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
 
-# --- 1. 配置 ---
+# --- 1. 最终配置 (基于实验得出的最优值) ---
 FEAT_DIR = "/data/dingcong/hybrid/hear_features_official"
 LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
+MODEL_SAVE_PATH = "hear_lr_baseline_model.pkl"
+SCALER_SAVE_PATH = "hear_scaler_baseline.pkl"
+
 TOP_K = 5
-MIN_THRESHOLD = 0.45
+BEST_THRESHOLD = 0.80
+BEST_WEIGHT = 3.0
 
 
 def get_label(base_name):
     txt_path = os.path.join(LABEL_DIR, base_name + ".txt")
     if not os.path.exists(txt_path): return None
     df = pd.read_csv(txt_path, sep='\t', header=None)
-    # 只要包含 Crackle 或 Wheeze 标记即为 1
     return 1 if (df[2] == 1).any() or (df[3] == 1).any() else 0
 
 
 # --- 2. 加载数据 ---
 feat_files = sorted(glob.glob(os.path.join(FEAT_DIR, "*.npy")))
 file_data = []
-print(f"📂 正在加载 {len(feat_files)} 个序列特征文件...")
 
 for f_path in feat_files:
     base_name = os.path.basename(f_path).replace(".npy", "")
@@ -33,54 +36,82 @@ for f_path in feat_files:
     if label is None: continue
     emb = np.load(f_path)
     if emb.ndim == 1: emb = emb[None, :]
-    file_data.append({'X': emb, 'y': label})
+    file_data.append({'name': base_name, 'X': emb, 'y': label})
 
-# 划分训练/测试
 train_data, test_data = train_test_split(file_data, test_size=0.2, random_state=42)
 
 X_train = np.vstack([d['X'] for d in train_data])
 y_train = np.hstack([[d['y']] * len(d['X']) for d in train_data])
 
+# --- 3. 训练与保存 ---
+print("⚙️ 正在训练最终模型...")
 scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
+X_train_scaled = scaler.fit_transform(X_train)
 
-# --- 3. 固定 Top-K=5，搜索判定门槛和权重 ---
-# 我们重点搜索不同的判定门槛 (Threshold)，因为这决定了 SP 能否回升
-thresholds = [0.4, 0.5, 0.6, 0.7, 0.8]
-weights = [1.0, 1.5, 2.0, 3.0]
+# 使用最优参数
+model = LogisticRegression(
+    max_iter=1000,
+    class_weight={0: 1.0, 1: BEST_WEIGHT},
+    C=0.001,
+    solver='liblinear',
+    random_state=42
+)
+model.fit(X_train_scaled, y_train)
 
-print("\n" + "=" * 85)
-print(f"{'判定门槛':>8} | {'异常权重':>8} | {'SE (灵敏度)':>12} | {'SP (特异性)':>12} | {'(SE+SP)/2'}")
-print("-" * 85)
+# 保存模型组件
+joblib.dump(model, MODEL_SAVE_PATH)
+joblib.dump(scaler, SCALER_SAVE_PATH)
+print(f"💾 模型已保存至: {MODEL_SAVE_PATH}")
 
-for thres in thresholds:
-    for w in weights:
-        # C=0.001 强制平滑，liblinear 适合小样本高维数据
-        model = LogisticRegression(max_iter=1000, class_weight={0: 1, 1: w}, C=0.001, solver='liblinear',
-                                   random_state=42)
-        model.fit(X_train, y_train)
+# --- 4. 详细评估 ---
+print("\n📊 正在生成详细报告...")
+results = []
+y_true_file = []
+y_pred_file = []
+y_prob_file = []
 
-        y_test_file, y_pred_file = [], []
-        for d in test_data:
-            X_test_scaled = scaler.transform(d['X'])
-            probs = model.predict_proba(X_test_scaled)[:, 1]
+for d in test_data:
+    X_test_scaled = scaler.transform(d['X'])
+    probs = model.predict_proba(X_test_scaled)[:, 1]
 
-            # --- Top-K=5 聚合逻辑 ---
-            actual_k = min(TOP_K, len(probs))
-            # 取概率最高的前 K 个片段
-            top_probs = np.sort(probs)[-actual_k:]
-            mean_top_prob = np.mean(top_probs)
+    # Top-K 聚合逻辑
+    actual_k = min(TOP_K, len(probs))
+    top_probs = np.sort(probs)[-actual_k:]
+    mean_top_prob = np.mean(top_probs)
 
-            # 使用当前搜索的门槛判定
-            y_pred_file.append(1 if mean_top_prob >= thres else 0)
-            y_test_file.append(d['y'])
+    pred = 1 if mean_top_prob >= BEST_THRESHOLD else 0
 
-        tn, fp, fn, tp = confusion_matrix(y_test_file, y_pred_file).ravel()
-        se = tp / (tp + fn) if (tp + fn) > 0 else 0
-        sp = tn / (tn + fp) if (tn + fp) > 0 else 0
-        avg_score = (se + sp) / 2
+    y_true_file.append(d['y'])
+    y_pred_file.append(pred)
+    y_prob_file.append(mean_top_prob)
 
-        tag = "✅" if se >= MIN_THRESHOLD and sp >= MIN_THRESHOLD else "❌"
-        print(f"{thres:>12.2f} | {w:>12.1f} | {se:>12.4f} | {sp:>12.4f} | {avg_score:>10.4f} {tag}")
+    results.append({
+        'filename': d['name'],
+        'true_label': d['y'],
+        'pred_label': pred,
+        'prob': round(mean_top_prob, 4)
+    })
 
-print("=" * 85)
+# 指标计算
+tn, fp, fn, tp = confusion_matrix(y_true_file, y_pred_file).ravel()
+se = tp / (tp + fn)
+sp = tn / (tn + fp)
+auc = roc_auc_score(y_true_file, y_prob_file)
+
+print("-" * 50)
+print(f"🔥 Final Performance (Threshold={BEST_THRESHOLD}, Weight={BEST_WEIGHT}):")
+print(f"Sensitivity (SE): {se:.4f}")
+print(f"Specificity (SP): {sp:.4f}")
+print(f"ICBHI Score: {(se + sp) / 2:.4f}")
+print(f"ROC-AUC: {auc:.4f}")
+print("-" * 50)
+print("\nConfusion Matrix:")
+print(f"TN: {tn} | FP: {fp}")
+print(f"FN: {fn} | TP: {tp}")
+print("\nDetailed Classification Report:")
+print(classification_report(y_true_file, y_pred_file, target_names=['Normal', 'Abnormal']))
+
+# --- 5. 保存预测结果 CSV ---
+df_results = pd.DataFrame(results)
+df_results.to_csv("baseline_test_results.csv", index=False)
+print(f"📝 详细预测列表已保存至: baseline_test_results.csv")
