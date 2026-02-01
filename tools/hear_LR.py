@@ -50,7 +50,13 @@ X_test = scaler.transform(X_test)
 
 # 初始化 LR
 # class_weight='balanced' 能有效平衡你的正常/异常比例，降低 FN
-model = LogisticRegression(max_iter=1000, class_weight='balanced', C=1.0)
+#model = LogisticRegression(max_iter=1000, class_weight='balanced', C=1.0)
+model = LogisticRegression(
+    max_iter=1000,
+    class_weight={0: 1.0, 1: 2.5},  # 正常给1，异常给2.5
+    C=1.0,
+    random_state=42
+)
 model.fit(X_train, y_train)
 
 # --- 5. 结果输出 ---
