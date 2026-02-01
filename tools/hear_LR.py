@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix
 
 # --- 1. 配置与加载 ---
-FEAT_DIR = "/data/dingcong/hybrid/hear_features_official_baseline"
+FEAT_DIR = "/data/dingcong/hybrid/hear_features_official"
 LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
 MIN_THRESHOLD = 0.45  # 你的底线要求
 
