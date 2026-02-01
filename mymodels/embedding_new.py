@@ -57,21 +57,29 @@ def process_single_file(file_path):
     all_frame_features = []
 
     # C. 逐帧推理 + 空间压缩 (190 -> 16)
+
+    # ... 前面的推理逻辑 ...
     for i in range(selected_clips.shape[0]):
         single_clip = selected_clips[i: i + 1]
         output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
 
-        # 原始 patch_data: [1, 190, 256]
-        patch_data = list(output_dict.values())[0].numpy()
+        # 1. 获取数据并转为 NumPy (确保脱离 TF)
+        patch_data = list(output_dict.values())[0].numpy()  # [1, 190, 256]
 
-        # 使用线性插值将 190 压缩到 16
-        # 注意：interpolate 需要 [Batch, Channel, Length] 格式
-        feat_tensor = torch.from_numpy(patch_data).permute(0, 2, 1)  # [1, 256, 190]
+        # 2. 转换为 Torch Tensor 并确保是 float32
+        feat_tensor = torch.from_numpy(patch_data).float()  # [1, 190, 256]
+
+        # 3. 维度置换: [B, T, C] -> [B, C, T] 以符合 Torch 1D 插值要求
+        feat_tensor = feat_tensor.permute(0, 2, 1)  # [1, 256, 190]
+
+        # 4. 执行插值 (190 -> 16)
+        # size=16 代表我们要在时间轴上保留 16 个点
         feat_resized = F.interpolate(feat_tensor, size=INTERNAL_PATCHES, mode='linear', align_corners=False)
-        patch_res16 = feat_resized.permute(0, 2, 1).numpy()  # [1, 16, 256]
+
+        # 5. 换回原始维度并转回 NumPy: [1, 256, 16] -> [1, 16, 256]
+        patch_res16 = feat_resized.permute(0, 2, 1).cpu().numpy()
 
         all_frame_features.append(patch_res16)
-
     # D. 最终拼接
     # 结果形状应该是 [TARGET_LEN, 16, 256] -> 展平为 [TARGET_LEN * 16, 256]
     res = np.concatenate(all_frame_features, axis=0)  # [T_actual, 16, 256]
