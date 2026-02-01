@@ -57,7 +57,7 @@ for filename in tqdm(wav_files):
         # B. 补齐与分帧
         # 注意：HeAR 前端通常期望略多于 32000 点（为了 STFT 边缘对齐）
         # 我们按照报错提示的 32240 来补齐
-        TARGET_LEN = 32240
+        TARGET_LEN = 32000
         if len(audio_16k) < TARGET_LEN:
             audio_16k = np.pad(audio_16k, (0, TARGET_LEN - len(audio_16k)), mode='constant')
 
