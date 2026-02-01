@@ -215,7 +215,7 @@ def main():
         num_workers=2, pin_memory=True, collate_fn=collate_pad
     )
 
-    model = build_model(input_dim=48).to(DEVICE)
+    model = build_model(in_dim=48).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
     best_icbhi = -1.0
