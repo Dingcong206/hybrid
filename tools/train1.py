@@ -161,7 +161,7 @@ def evaluate(model, loader):
     for x_pad, mask, y_file, bases, lengths in loader:
         x_pad = x_pad.to(DEVICE)
         mask = mask.to(DEVICE)
-
+        attn_mask = ~mask
         logits = model(x_pad, patch_mask=attn_mask)      # (B,T)
         probs = torch.sigmoid(logits)         # (B,T)
 

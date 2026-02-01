@@ -212,9 +212,10 @@ class SSA_PatchLogitModel(nn.Module):
         else:
             pos = sinusoidal_positional_encoding(T, x.size(-1), device).unsqueeze(0)
         x = self.pos_drop(x + pos)
-        print("DEBUG patch_mask type:", type(patch_mask))
-        if patch_mask is not None:
-            print("DEBUG patch_mask is_tensor:", torch.is_tensor(patch_mask))
+
+        # print("DEBUG patch_mask type:", type(patch_mask))
+        # if patch_mask is not None:
+        #     print("DEBUG patch_mask is_tensor:", torch.is_tensor(patch_mask))
 
         # 3) SSA layers
         for layer in self.layers:
