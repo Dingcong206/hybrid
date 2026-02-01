@@ -86,7 +86,7 @@ class FocalLoss(nn.Module):
 # 3) 核心训练流程
 # =====================================================
 def train():
-    CSV_PATH = "/data/dingcong/hybrid/Coswara-Data/coswara_hear_patches.csv"
+    CSV_PATH = "/data/dingcong/hybrid/hear_patch_final"
     DEVICE = torch.device("cuda" if torch.cuda.is_avaigolable() else "cpu")
 
     # 配置超参数
