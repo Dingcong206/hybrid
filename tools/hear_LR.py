@@ -20,7 +20,8 @@ RANDOM_SEED = 42
 TEST_SIZE = 0.2
 
 # 阈值扫描：让混淆矩阵别极端（可调）
-MIN_SP = 0.50                    # 约束特异度最低 >= 0.60（你也可以试 0.50 / 0.65）
+MIN_SP = 0.50
+MIN_SE = 0.50  # 约束特异度最低 >= 0.60（你也可以试 0.50 / 0.65）
 THR_GRID = np.linspace(0.05, 0.95, 181)
 
 
@@ -241,7 +242,7 @@ def run():
 
     print("\n" + "=" * 70)
     print(f"🎯 Val FILE-level AUC-ROC: {auc:.4f}")
-    print(f"⭐ Best ICBHI: {best_icbhi:.4f} | SE: {se:.4f} | SP: {sp:.4f} | thr: {best_thr:.2f} | min_sp={MIN_SP}")
+    print(f"⭐ Best ICBHI: {best_icbhi:.4f} | SE: {se:.4f} | SP: {sp:.4f} | thr: {best_thr:.2f} | min_sp={MIN_SP}|min_se={MIN_SE}")
     print("🧱 Confusion Matrix [ [TN FP], [FN TP] ]:")
     print(cm)
     print("=" * 70)
