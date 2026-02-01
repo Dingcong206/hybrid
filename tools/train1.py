@@ -227,7 +227,7 @@ def main():
     # sanity check
     x0, m0, y0, _, _ = next(iter(train_loader))
     x0 = x0.to(DEVICE); m0 = m0.to(DEVICE)
-    out0 = model(x0, key_padding_mask=m0)
+    out0 = model(x0, patch_mask=m0)
     print(f"Sanity: x {tuple(x0.shape)} mask {tuple(m0.shape)} logits {tuple(out0.shape)}")
 
     for epoch in range(1, EPOCHS + 1):
