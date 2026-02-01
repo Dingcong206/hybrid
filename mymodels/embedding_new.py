@@ -39,11 +39,6 @@ def process_single_file(file_path):
 
     # 使用 tf.signal.frame 将长音频切成 2 秒一段的 Batch [N, 32000]
     # 这里 frame_step = FRAME_LENGTH 表示无重叠切割
-
-
-def process_single_file(file_path):
-    # ... 前面的加载和补齐逻辑保持不变 ...
-
     # 设定 10ms 步长 (160 采样点) 以达到 2K 序列长度
     NEW_STEP = 160
     audio_clips = tf.signal.frame(audio, FRAME_LENGTH, NEW_STEP).numpy()
