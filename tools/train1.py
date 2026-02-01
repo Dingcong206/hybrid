@@ -87,7 +87,7 @@ class FocalLoss(nn.Module):
 # =====================================================
 def train():
     CSV_PATH = "/data/dingcong/hybrid/hear_patch_final"
-    DEVICE = torch.device("cuda" if torch.cuda.is_avaigolable() else "cpu")
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 配置超参数
     BATCH_SIZE = 48  # 略微减小 batch 让梯度更有随机性
