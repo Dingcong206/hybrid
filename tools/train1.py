@@ -1,4 +1,3 @@
-import os
 import glob
 import torch
 import numpy as np
@@ -9,6 +8,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report
+import sys
+import os
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 # 导入你的模型
 from mymodels.model import SSA_Model, build_model
