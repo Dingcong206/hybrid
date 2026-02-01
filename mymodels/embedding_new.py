@@ -63,23 +63,38 @@ def process_single_file(file_path):
         single_clip = selected_clips[i: i + 1]
         output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
 
-        # 1. 获取数据并转为 NumPy (确保脱离 TF)
-        patch_data = list(output_dict.values())[0].numpy()  # [1, 190, 256]
+        # ✅ 选出 [1, 190, 256] 的输出
+        patch_tensor = None
+        for k, v in output_dict.items():
+            shp = v.shape
+            if len(shp) == 3 and shp[-1] == 256:
+                patch_tensor = v
+                break
+        if patch_tensor is None:
+            raise ValueError(
+                f"找不到 (1,190,256) 的输出。实际输出为: "
+                f"{[(k, tuple(v.shape)) for k, v in output_dict.items()]}"
+            )
 
-        # 2. 转换为 Torch Tensor 并确保是 float32
+        patch_data = patch_tensor.numpy()  # [1, 190, 256]
         feat_tensor = torch.from_numpy(patch_data).float()  # [1, 190, 256]
-
-        # 3. 维度置换: [B, T, C] -> [B, C, T] 以符合 Torch 1D 插值要求
         feat_tensor = feat_tensor.permute(0, 2, 1)  # [1, 256, 190]
 
-        # 4. 执行插值 (190 -> 16)
-        # size=16 代表我们要在时间轴上保留 16 个点
-        feat_resized = F.interpolate(feat_tensor, size=INTERNAL_PATCHES, mode='linear', align_corners=False)
+        feat_resized = F.interpolate(
+            feat_tensor,
+            size=INTERNAL_PATCHES,
+            mode='linear',
+            align_corners=False
+        )
 
-        # 5. 换回原始维度并转回 NumPy: [1, 256, 16] -> [1, 16, 256]
-        patch_res16 = feat_resized.permute(0, 2, 1).cpu().numpy()
+        patch_res16 = feat_resized.permute(0, 2, 1).cpu().numpy()  # [1, 16, 256]
+
+        # ✅ 保险：确保维度永远是 256
+        if patch_res16.shape[-1] != 256:
+            raise ValueError(f"patch_res16 维度异常: {patch_res16.shape}")
 
         all_frame_features.append(patch_res16)
+
     # D. 最终拼接
     # 结果形状应该是 [TARGET_LEN, 16, 256] -> 展平为 [TARGET_LEN * 16, 256]
     res = np.concatenate(all_frame_features, axis=0)  # [T_actual, 16, 256]
