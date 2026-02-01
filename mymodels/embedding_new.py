@@ -17,7 +17,7 @@ BASE_PATH = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/
 FRONTEND_PATH = os.path.join(BASE_PATH, "event_detector", "spectrogram_frontend")
 
 WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final2"
+SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --- 3. 加载官方模型 ---
