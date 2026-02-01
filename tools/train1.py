@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report
 
 # 导入你的模型
-from .model import SSA_Model, build_model
+from mymodels.model import SSA_Model, build_model
 
 # --- 1. 配置 ---
 PATCH_DIR = "/data/dingcong/hybrid/hear_patch_final"
