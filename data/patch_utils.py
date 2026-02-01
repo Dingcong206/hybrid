@@ -4,30 +4,32 @@ import torch.nn.functional as F
 
 def patch_10_200_48_to_tokens(patch, seq_len=96):
     """
-    将 HeAR spectrogram patch (10, 200, 48)
-    转换为 SSA 可用的 token 序列 (seq_len, 48)
-
-    Args:
-        patch: torch.Tensor, shape (10, 200, 48)
-        seq_len: int, 默认 96
-
-    Returns:
-        torch.Tensor, shape (seq_len, 48)
+    patch: Tensor of shape (T, 200, 48), T 可变
+    return: (seq_len, 48)
     """
-    assert patch.shape == (10, 200, 48), f"Expected (10,200,48), got {patch.shape}"
 
-    # 1️⃣ 频率维压缩：200 -> 10
-    x = patch.permute(0, 2, 1)           # (10, 48, 200)
-    x = F.adaptive_avg_pool1d(x, 10)     # (10, 48, 10)
-    x = x.permute(0, 2, 1)               # (10, 10, 48)
+    assert patch.ndim == 3, f"Expected 3D tensor, got {patch.shape}"
+    T, F, C = patch.shape
+    assert F == 200 and C == 48, f"Expected (*,200,48), got {patch.shape}"
 
-    # 2️⃣ 展平成 token：10×10 = 100
-    x = x.reshape(100, 48)               # (100, 48)
+    # -------- Step 1: 频率维压缩 200 -> 10 --------
+    # (T,200,48) -> (T,48,200)
+    x = patch.permute(0, 2, 1)
 
-    # 3️⃣ 压缩到 seq_len（默认 96）
-    if x.shape[0] != seq_len:
-        x = x.T.unsqueeze(0)             # (1, 48, 100)
-        x = F.adaptive_avg_pool1d(x, seq_len)
-        x = x.squeeze(0).T               # (96, 48)
+    # (T,48,200) -> (T,48,10)
+    x = F.adaptive_avg_pool1d(x, 10)
+
+    # (T,48,10) -> (T,10,48)
+    x = x.permute(0, 2, 1)
+
+    # -------- Step 2: 展平成 token --------
+    # (T,10,48) -> (T*10,48)
+    x = x.reshape(T * 10, 48)
+
+    # -------- Step 3: 时间维统一到 seq_len --------
+    # (T*10,48) -> (seq_len,48)
+    x = x.transpose(0, 1).unsqueeze(0)     # (1,48,T*10)
+    x = F.adaptive_avg_pool1d(x, seq_len)  # (1,48,seq_len)
+    x = x.squeeze(0).transpose(0, 1)       # (seq_len,48)
 
     return x
