@@ -121,7 +121,7 @@ def train_one_epoch(model, loader, optimizer):
         mask = mask.to(DEVICE)
         y_file = y_file.to(DEVICE)
 
-        logits = model(x_pad, mask=mask)  # 期望输出 (B,T)，mask可选（你模型不收也行）
+        logits = model(x_pad, key_padding_mask=mask)  # 期望输出 (B,T)，mask可选（你模型不收也行）
         if logits.dim() != 2:
             raise RuntimeError(f"Model must return (B,T) logits, got {tuple(logits.shape)}")
 
@@ -161,7 +161,7 @@ def evaluate(model, loader):
         x_pad = x_pad.to(DEVICE)
         mask = mask.to(DEVICE)
 
-        logits = model(x_pad, mask=mask)      # (B,T)
+        logits = model(x_pad, key_padding_mask=mask)      # (B,T)
         probs = torch.sigmoid(logits)         # (B,T)
 
         # file-level 聚合：对每个文件只取有效长度的 probs，再 top-k mean
