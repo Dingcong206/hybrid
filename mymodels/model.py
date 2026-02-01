@@ -118,7 +118,7 @@ class SSA_Layer(nn.Module):
 
 # =====================================================
 # 3) PatchEncoder: (200,48) -> (D)
-#    你说的“升维”：这里把 48 升到 d_model
+#    48 升到 d_model
 # =====================================================
 class PatchEncoder(nn.Module):
     def __init__(self, in_dim=48, d_model=256, dropout=0.2):
@@ -198,6 +198,7 @@ class SSA_PatchLogitModel(nn.Module):
             logits_patch: (B, T)
             (optional) emb: (B, T, D)
         """
+
         device = x_patch.device
         B, T, _, _ = x_patch.shape
 
@@ -211,6 +212,9 @@ class SSA_PatchLogitModel(nn.Module):
         else:
             pos = sinusoidal_positional_encoding(T, x.size(-1), device).unsqueeze(0)
         x = self.pos_drop(x + pos)
+        print("DEBUG patch_mask type:", type(patch_mask))
+        if patch_mask is not None:
+            print("DEBUG patch_mask is_tensor:", torch.is_tensor(patch_mask))
 
         # 3) SSA layers
         for layer in self.layers:
@@ -228,6 +232,7 @@ class SSA_PatchLogitModel(nn.Module):
         if return_emb:
             return logits, x
         return logits
+
 
 
 def build_model(in_dim=48, d_model=512, dropout=0.2, n_layers=4, nhead=8, max_len=512):
