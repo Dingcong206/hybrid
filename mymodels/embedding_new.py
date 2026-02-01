@@ -52,25 +52,35 @@ for filename in tqdm(wav_files):
         audio, sr = librosa.load(file_path, sr=None)
         audio_16k = resample_audio_and_convert_to_mono(audio, sr)
 
+        # ... (前面的加载和 16k 转换保持不变) ...
+
         # B. 补齐与分帧
-        if len(audio_16k) < CLIP_LENGTH:
-            audio_16k = np.pad(audio_16k, (0, CLIP_LENGTH - len(audio_16k)), mode='constant')
+        # 注意：HeAR 前端通常期望略多于 32000 点（为了 STFT 边缘对齐）
+        # 我们按照报错提示的 32240 来补齐
+        TARGET_LEN = 32240
+        if len(audio_16k) < TARGET_LEN:
+            audio_16k = np.pad(audio_16k, (0, TARGET_LEN - len(audio_16k)), mode='constant')
 
-        # 将音频切成 2s 的 Batch [N, 32000]
-        audio_clip_batch = tf.signal.frame(audio_16k, CLIP_LENGTH, CLIP_LENGTH)
+        # 将长音频切成片段 [N, 32240]
+        audio_clips = tf.signal.frame(audio_16k, TARGET_LEN, TARGET_LEN)
 
-        # C. 官方前端推理 (关键点)
-        # 注意：这里的输入 Key 必须是 'audio_wav'
-        output = patch_infer(audio_wav=tf.constant(audio_clip_batch, dtype=tf.float32))
+        # C. 逐个片段提取 Patch (解决 Reshape 报错的关键)
+        all_patches = []
+        for i in range(audio_clips.shape[0]):
+            single_clip = audio_clips[i]  # 形状 [32240]
+            # 增加 Batch 维度变为 [1, 32240]
+            input_tensor = tf.expand_dims(single_clip, axis=0)
 
-        # D. 提取 Patch
-        # 此时得到的 patches 维度应该是 (N, 190, 256)
-        # N 是 2s 片段的数量，190 是序列长度，256 是 Patch 维度
-        patches = output['output_0'].numpy()
+            # 调用前端
+            output = patch_infer(audio_wav=input_tensor)
+            all_patches.append(output['output_0'].numpy())
+
+        # D. 合并结果
+        # 最终形状: [N, 190, 256]
+        final_patches = np.concatenate(all_patches, axis=0)
 
         # E. 保存
-        np.save(save_path, patches)
-
+        np.save(save_path, final_patches)
     except Exception as e:
         print(f"❌ 文件 {filename} 处理失败: {str(e)}")
 
