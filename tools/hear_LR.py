@@ -8,16 +8,25 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, confusion_matrix
 
-# --- 1. 路径配置 ---
-FEAT_DIR = "/data/dingcong/hybrid/hear_features_official"   # .npy 特征目录 (每个文件 shape: [n_seg,512] 或 [512])
+
+# =========================
+# 1) 路径配置
+# =========================
+FEAT_DIR = "/data/dingcong/hybrid/hear_features_official"   # 每个文件: (n_seg,512) 或 (512,)
 LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"     # ICBHI .txt 标签目录
-SAVE_MODEL_NAME = "hear_lr_patientwise.joblib"
+SAVE_MODEL_NAME = "hear_lr_patientwise_segmax.joblib"
 
 RANDOM_SEED = 42
 TEST_SIZE = 0.2
 
+# 阈值扫描：让混淆矩阵别极端（可调）
+MIN_SP = 0.60                     # 约束特异度最低 >= 0.60（你也可以试 0.50 / 0.65）
+THR_GRID = np.linspace(0.05, 0.95, 181)
 
-# --- 2. 标签解析函数 (针对 ICBHI 标准 TXT 格式) ---
+
+# =========================
+# 2) 解析 ICBHI 标签
+# =========================
 def get_label_from_icbhi_txt(txt_path):
     """
     ICBHI TXT: [start_time, end_time, crackle, wheeze]
@@ -33,52 +42,67 @@ def get_label_from_icbhi_txt(txt_path):
         return None
 
 
-# --- 3. 解析 patient_id：ICBHI 文件名通常形如 101_1b1_Al_sc_Meditron ---
+# =========================
+# 3) 解析 patient_id
+# =========================
 def parse_patient_id(base_name: str):
-    """
-    从 base_name 提取 patient_id。默认取第一个 '_' 之前的字段。
-    如果不是纯数字，也照样当作字符串 patient_id 用。
-    """
+    # 通常 ICBHI: 101_1b1_Al_sc_Meditron -> patient=101
     if "_" in base_name:
         return base_name.split("_", 1)[0]
-    return base_name  # 兜底
+    return base_name
 
 
-# --- 4. 阈值扫描：按 ICBHI score 选最佳阈值 ---
-def scan_threshold_icbhi(y_true, y_prob, thresholds=None):
-    """
-    y_true: {0,1}
-    y_prob: [0,1]
-    返回 best: (best_icbhi, best_thr, se, sp, cm)
-    """
+# =========================
+# 4) 阈值扫描：ICBHI = (SE+SP)/2
+#    + 约束 SP >= MIN_SP（避免“全异常/全正常”极端）
+# =========================
+def scan_threshold_icbhi(y_true, y_prob, thresholds=THR_GRID, min_sp=MIN_SP):
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
 
-    if thresholds is None:
-        thresholds = np.linspace(0.05, 0.95, 91)
-
-    best_icbhi, best_thr, best_se, best_sp, best_cm = -1.0, 0.5, 0.0, 0.0, None
+    best = None
+    best_any = (-1.0, 0.5, 0.0, 0.0, None)
 
     for thr in thresholds:
         y_pred = (y_prob >= thr).astype(int)
         cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
         tn, fp, fn, tp = cm.ravel()
 
-        se = tp / (tp + fn + 1e-9)  # sensitivity/recall for class 1
-        sp = tn / (tn + fp + 1e-9)  # specificity for class 0
+        se = tp / (tp + fn + 1e-9)
+        sp = tn / (tn + fp + 1e-9)
         icbhi = 0.5 * (se + sp)
 
-        if icbhi > best_icbhi:
-            best_icbhi, best_thr, best_se, best_sp, best_cm = icbhi, float(thr), float(se), float(sp), cm
+        # 无约束兜底最优
+        if icbhi > best_any[0]:
+            best_any = (icbhi, float(thr), float(se), float(sp), cm)
 
-    return best_icbhi, best_thr, best_se, best_sp, best_cm
+        # 有约束最优
+        if sp >= min_sp:
+            if (best is None) or (icbhi > best[0]):
+                best = (icbhi, float(thr), float(se), float(sp), cm)
+
+    return best if best is not None else best_any
 
 
-# --- 5. 数据集构建：文件级 pooled embedding + 标签 + patient_id ---
-def prepare_dataset():
-    rows = []
+# =========================
+# 5) 构建 segment-level 数据
+#    返回：
+#      seg_X: (N_seg_total, 512)
+#      seg_y: (N_seg_total,)
+#      seg_file: 每个 segment 属于哪个文件
+#      seg_patient: 每个 segment 属于哪个 patient
+#      file_label: dict[file] -> 0/1
+#      file_patient: dict[file] -> patient_id
+# =========================
+def prepare_segment_dataset():
     feat_files = sorted(glob.glob(os.path.join(FEAT_DIR, "*.npy")))
-    print(f"🔍 正在处理 {len(feat_files)} 个特征文件...")
+    print(f"🔍 正在扫描 {len(feat_files)} 个特征文件...")
+
+    seg_X, seg_y, seg_file, seg_patient = [], [], [], []
+    file_label = {}
+    file_patient = {}
+
+    used_files = 0
 
     for f_path in feat_files:
         base_name = os.path.basename(f_path).replace(".npy", "")
@@ -91,40 +115,45 @@ def prepare_dataset():
             continue
 
         emb = np.load(f_path)
-        if emb.ndim > 1:
-            feat = emb.mean(axis=0)  # (512,)
-        else:
-            feat = emb
+        if emb.ndim == 1:
+            emb = emb[None, :]  # (1,512)
 
-        patient_id = parse_patient_id(base_name)
-        rows.append((base_name, patient_id, label, feat))
+        pid = parse_patient_id(base_name)
 
-    if not rows:
-        raise RuntimeError("没有匹配到任何 (npy, txt) 对，请检查 FEAT_DIR / LABEL_DIR 路径。")
+        file_label[base_name] = int(label)
+        file_patient[base_name] = pid
+        used_files += 1
 
-    # 打包
-    file_names = [r[0] for r in rows]
-    patient_ids = [r[1] for r in rows]
-    labels = np.array([r[2] for r in rows], dtype=int)
-    X = np.stack([r[3] for r in rows], axis=0).astype(np.float32)
+        # segment-level 样本
+        for i in range(emb.shape[0]):
+            seg_X.append(emb[i].astype(np.float32))
+            seg_y.append(int(label))
+            seg_file.append(base_name)
+            seg_patient.append(pid)
 
-    print(f"✅ 数据准备就绪：样本数={len(X)}, 特征维度={X.shape[1]}")
-    print(f"📊 文件级类别分布：正常={int((labels==0).sum())}, 异常={int((labels==1).sum())}")
+    seg_X = np.asarray(seg_X, dtype=np.float32)
+    seg_y = np.asarray(seg_y, dtype=np.int64)
 
-    return file_names, patient_ids, X, labels
+    print(f"✅ 文件数: {used_files}")
+    print(f"✅ Segment 总数: {len(seg_X)} | 特征维度: {seg_X.shape[1]}")
+    print(f"📊 文件级类别分布：正常={(np.array(list(file_label.values()))==0).sum()}，异常={(np.array(list(file_label.values()))==1).sum()}")
+
+    return seg_X, seg_y, np.array(seg_file), np.array(seg_patient), file_label, file_patient
 
 
-# --- 6. patient-wise split：按 patient 分 train/val ---
-def patient_wise_split(file_names, patient_ids, labels, test_size=0.2, seed=42):
+# =========================
+# 6) patient-wise split（按文件所属 patient 划分）
+# =========================
+def patient_wise_split_files(file_label, file_patient, test_size=TEST_SIZE, seed=RANDOM_SEED):
     df = pd.DataFrame({
-        "file_name": file_names,
-        "patient_id": patient_ids,
-        "label": labels
+        "file": list(file_label.keys()),
+        "patient": [file_patient[f] for f in file_label.keys()],
+        "label": [file_label[f] for f in file_label.keys()]
     })
 
-    # patient 标签：只要该 patient 任何文件异常 -> patient 异常（更接近临床）
-    p = df.groupby("patient_id")["label"].max().reset_index()
-    patients = p["patient_id"].values
+    # patient 标签：该 patient 任一文件异常 -> patient 异常
+    p = df.groupby("patient")["label"].max().reset_index()
+    patients = p["patient"].values
     p_labels = p["label"].values.astype(int)
 
     train_p, val_p = train_test_split(
@@ -134,33 +163,70 @@ def patient_wise_split(file_names, patient_ids, labels, test_size=0.2, seed=42):
         stratify=p_labels
     )
 
-    train_mask = df["patient_id"].isin(train_p).values
-    val_mask = df["patient_id"].isin(val_p).values
-
-    return df, train_mask, val_mask, train_p, val_p
-
-
-# --- 7. 主流程 ---
-def run_training():
-    file_names, patient_ids, X, y = prepare_dataset()
-
-    df_meta, train_mask, val_mask, train_p, val_p = patient_wise_split(
-        file_names, patient_ids, y, test_size=TEST_SIZE, seed=RANDOM_SEED
-    )
+    train_files = df[df["patient"].isin(train_p)]["file"].tolist()
+    val_files = df[df["patient"].isin(val_p)]["file"].tolist()
 
     print(f"Train patients: {len(train_p)} | Val patients: {len(val_p)}")
-    print(f"Train files   : {int(train_mask.sum())} | Val files   : {int(val_mask.sum())}")
+    print(f"Train files   : {len(train_files)} | Val files   : {len(val_files)}")
 
-    X_train, y_train = X[train_mask], y[train_mask]
-    X_val, y_val = X[val_mask], y[val_mask]
+    return set(train_files), set(val_files), set(train_p), set(val_p)
 
-    # 标准化
+
+# =========================
+# 7) Segment -> File 聚合：max(prob)
+# =========================
+def aggregate_file_maxprob(files, seg_files, seg_probs):
+    """
+    files: 需要聚合的 file 集合
+    seg_files: 每个 segment 属于哪个 file（长度 = N_seg）
+    seg_probs: 每个 segment 的异常概率（长度 = N_seg）
+    返回:
+      file_list, file_prob
+    """
+    from collections import defaultdict
+
+    bucket = defaultdict(list)
+    for f, p in zip(seg_files, seg_probs):
+        if f in files:
+            bucket[f].append(float(p))
+
+    file_list = []
+    file_prob = []
+    for f in sorted(files):
+        ps = bucket.get(f, [])
+        if len(ps) == 0:
+            # 理论上不会发生（因为文件都有 segment），但兜底
+            file_list.append(f)
+            file_prob.append(0.0)
+        else:
+            file_list.append(f)
+            file_prob.append(max(ps))  # ✅ max 聚合
+
+    return file_list, np.asarray(file_prob, dtype=np.float32)
+
+
+# =========================
+# 8) 主流程：训练 LR（segment-level）+ file-level 评估（max）
+# =========================
+def run():
+    seg_X, seg_y, seg_files, seg_patients, file_label, file_patient = prepare_segment_dataset()
+    train_files, val_files, train_p, val_p = patient_wise_split_files(file_label, file_patient)
+
+    # 训练用 segment：属于 train_files 的 segments
+    train_mask = np.isin(seg_files, list(train_files))
+    val_mask = np.isin(seg_files, list(val_files))
+
+    X_train, y_train = seg_X[train_mask], seg_y[train_mask]
+    X_val_seg, y_val_seg = seg_X[val_mask], seg_y[val_mask]
+    val_seg_files = seg_files[val_mask]
+
+    # 标准化（只在训练 segment 上 fit）
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
-    X_val_s = scaler.transform(X_val)
+    X_val_seg_s = scaler.transform(X_val_seg)
 
-    # LR：balanced
-    print("🚀 开始训练 Logistic Regression (class_weight=balanced, patient-wise split)...")
+    # 训练 LR：balanced
+    print("🚀 Training Logistic Regression (segment-level, class_weight=balanced)...")
     clf = LogisticRegression(
         max_iter=5000,
         C=1.0,
@@ -170,25 +236,31 @@ def run_training():
     )
     clf.fit(X_train_s, y_train)
 
-    # 预测概率
-    val_prob = clf.predict_proba(X_val_s)[:, 1]
-    auc = roc_auc_score(y_val, val_prob)
+    # segment 概率
+    val_seg_prob = clf.predict_proba(X_val_seg_s)[:, 1]
 
-    # 阈值扫描（ICBHI）
-    best_icbhi, best_thr, se, sp, cm = scan_threshold_icbhi(y_val, val_prob)
+    # file-level 聚合：max(prob)
+    val_file_list, val_file_prob = aggregate_file_maxprob(val_files, val_seg_files, val_seg_prob)
+    y_val_file = np.array([file_label[f] for f in val_file_list], dtype=int)
 
-    print("\n" + "=" * 60)
-    print(f"🎯 Val AUC-ROC: {auc:.4f}")
-    print(f"⭐ Best ICBHI: {best_icbhi:.4f} | SE: {se:.4f} | SP: {sp:.4f} | thr: {best_thr:.2f}")
+    # AUC（file-level）
+    auc = roc_auc_score(y_val_file, val_file_prob)
+
+    # 阈值扫描（file-level）
+    best_icbhi, best_thr, se, sp, cm = scan_threshold_icbhi(y_val_file, val_file_prob)
+
+    print("\n" + "=" * 70)
+    print(f"🎯 Val FILE-level AUC-ROC: {auc:.4f}")
+    print(f"⭐ Best ICBHI: {best_icbhi:.4f} | SE: {se:.4f} | SP: {sp:.4f} | thr: {best_thr:.2f} | min_sp={MIN_SP}")
     print("🧱 Confusion Matrix [ [TN FP], [FN TP] ]:")
     print(cm)
-    print("=" * 60)
+    print("=" * 70)
 
-    # 保存模型（含 scaler）
+    # 保存模型
     import joblib
     joblib.dump({"model": clf, "scaler": scaler}, SAVE_MODEL_NAME)
-    print(f"💾 模型已保存至: {SAVE_MODEL_NAME}")
+    print(f"💾 Saved: {SAVE_MODEL_NAME}")
 
 
 if __name__ == "__main__":
-    run_training()
+    run()
