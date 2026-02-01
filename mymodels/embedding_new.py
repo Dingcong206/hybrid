@@ -46,22 +46,21 @@ def process_single_file(file_path):
     num_frames = audio_clips.shape[0]
     all_patches = []
 
-    # --- 核心修改：批量推理 (Batch Inference) ---
-    BATCH_SIZE = 64  # 根据 4090 显存，可以尝试 64 甚至 128
-    for i in range(0, num_frames, BATCH_SIZE):
-        # 1. 切片获取当前批次 [Batch, 32000]
-        batch_clips = audio_clips[i: i + BATCH_SIZE]
+    # 必须严格一帧一帧喂，防止 Reshape 报错
+    for i in range(num_frames):
+        # 保持形状为 [1, 32000]
+        single_clip = audio_clips[i: i + 1]
 
-        # 2. 转换为 TF 张量并一次性推理
-        output_dict = patch_infer(audio_wav=tf.constant(batch_clips, dtype=tf.float32))
+        # 推理
+        output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
+        patch_data = list(output_dict.values())[0].numpy()  # [1, 190, 256]
 
-        # 3. 提取结果。注意：这里的 patch_data 形状会变成 [Batch, 190, 256]
-        # 动态获取输出值，这能解决之前遇到的 'output_0' 报错问题
-        patch_data = list(output_dict.values())[0].numpy()
-        all_patches.append(patch_data)
+        # 【重要建议】为了节省硬盘，对 190 维度取平均
+        # 这样 920 个文件的 2K 序列才不会把你的硬盘塞满
+        patch_reduced = np.mean(patch_data, axis=1)  # 变成 [1, 256]
+        all_patches.append(patch_reduced)
 
-    # 4. 合并所有 Batch。最终结果 Shape: [T, 190, 256]
-    # np.concatenate 会把多个 [Batch, 190, 256] 拼成一个 [T, 190, 256]
+    # 最终合并成 [T, 256]
     return np.concatenate(all_patches, axis=0)
 
 
