@@ -13,12 +13,14 @@ LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
 TOP_K = 5
 MIN_THRESHOLD = 0.45
 
+
 def get_label(base_name):
     txt_path = os.path.join(LABEL_DIR, base_name + ".txt")
     if not os.path.exists(txt_path): return None
     df = pd.read_csv(txt_path, sep='\t', header=None)
     # 只要包含 Crackle 或 Wheeze 标记即为 1
     return 1 if (df[2] == 1).any() or (df[3] == 1).any() else 0
+
 
 # --- 2. 加载数据 ---
 feat_files = sorted(glob.glob(os.path.join(FEAT_DIR, "*.npy")))
@@ -47,5 +49,38 @@ X_train = scaler.fit_transform(X_train)
 thresholds = [0.4, 0.5, 0.6, 0.7, 0.8]
 weights = [1.0, 1.5, 2.0, 3.0]
 
-print("\n" + "="*85)
-print(f"{'判定门槛':>8
+print("\n" + "=" * 85)
+print(f"{'判定门槛':>8} | {'异常权重':>8} | {'SE (灵敏度)':>12} | {'SP (特异性)':>12} | {'(SE+SP)/2'}")
+print("-" * 85)
+
+for thres in thresholds:
+    for w in weights:
+        # C=0.001 强制平滑，liblinear 适合小样本高维数据
+        model = LogisticRegression(max_iter=1000, class_weight={0: 1, 1: w}, C=0.001, solver='liblinear',
+                                   random_state=42)
+        model.fit(X_train, y_train)
+
+        y_test_file, y_pred_file = [], []
+        for d in test_data:
+            X_test_scaled = scaler.transform(d['X'])
+            probs = model.predict_proba(X_test_scaled)[:, 1]
+
+            # --- Top-K=5 聚合逻辑 ---
+            actual_k = min(TOP_K, len(probs))
+            # 取概率最高的前 K 个片段
+            top_probs = np.sort(probs)[-actual_k:]
+            mean_top_prob = np.mean(top_probs)
+
+            # 使用当前搜索的门槛判定
+            y_pred_file.append(1 if mean_top_prob >= thres else 0)
+            y_test_file.append(d['y'])
+
+        tn, fp, fn, tp = confusion_matrix(y_test_file, y_pred_file).ravel()
+        se = tp / (tp + fn) if (tp + fn) > 0 else 0
+        sp = tn / (tn + fp) if (tn + fp) > 0 else 0
+        avg_score = (se + sp) / 2
+
+        tag = "✅" if se >= MIN_THRESHOLD and sp >= MIN_THRESHOLD else "❌"
+        print(f"{thres:>12.2f} | {w:>12.1f} | {se:>12.4f} | {sp:>12.4f} | {avg_score:>10.4f} {tag}")
+
+print("=" * 85)
