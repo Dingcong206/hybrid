@@ -17,7 +17,7 @@ BASE_PATH = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/
 FRONTEND_PATH = os.path.join(BASE_PATH, "event_detector", "spectrogram_frontend")
 
 WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final"
+SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final2"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --- 3. 加载官方模型 ---
@@ -29,20 +29,26 @@ patch_infer = patch_model.signatures["serving_default"]
 
 # --- 4. 批量处理函数 ---
 def process_single_file(file_path):
-    # A. 加载音频并转为单声道 16kHz
     audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
 
-    # B. 按照官方逻辑进行分帧 (解决 num_frames 未定义问题)
-    # 如果音频不足 2 秒，进行补齐
-    if len(audio) < FRAME_LENGTH:
-        audio = np.pad(audio, (0, FRAME_LENGTH - len(audio)), mode='constant')
+    # 强制补齐/裁剪以对齐 2048 长度 (可选)
+    # 或者直接使用滑动窗口，20秒音频配合 160 步长约等于 2000 个 Patch
 
-    # 使用 tf.signal.frame 将长音频切成 2 秒一段的 Batch [N, 32000]
-    # 这里 frame_step = FRAME_LENGTH 表示无重叠切割
-    audio_clips = tf.signal.frame(audio, FRAME_LENGTH, FRAME_LENGTH).numpy()
+    # --- 核心修改：将 frame_step 设为 160 (10ms) ---
+    NEW_STEP = 160
+    audio_clips = tf.signal.frame(audio, FRAME_LENGTH, NEW_STEP).numpy()
 
     num_frames = audio_clips.shape[0]
     all_patches = []
+
+    for i in range(num_frames):
+        single_clip = audio_clips[i:i + 1]
+        output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
+        patch_data = list(output_dict.values())[0].numpy()
+        all_patches.append(patch_data)
+
+    # 结果 shape: [T, 190, 256] -> 其中 T 约为 2000
+    return np.concatenate(all_patches, axis=0)
 
     # C. 逐帧推理 (绕过模型内部 Reshape 限制)
     for i in range(num_frames):
