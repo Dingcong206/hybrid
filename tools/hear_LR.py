@@ -41,7 +41,7 @@ TOPK = 3                  # topk_mean 时使用
 USE_CALIBRATION = False   # ⚠️ 默认关掉：校准常导致异常概率更保守 -> FN更高
 CALIB_CV = 3              # 只有 USE_CALIBRATION=True 才用
 
-CLASS_WEIGHT = {0: 1.0, 1: 2.0}  # 正类更重 -> 降 FN
+CLASS_WEIGHT = {0: 1.0, 1: 2.5}  # 正类更重 -> 降 FN
 LR_C = 1.0
 MAX_ITER = 5000
 
