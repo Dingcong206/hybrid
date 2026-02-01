@@ -1,123 +1,239 @@
-import glob
-import torch
+import os
+import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
-import joblib
 from tqdm import tqdm
-from sklearn.linear_model import LogisticRegression
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import confusion_matrix, classification_report
-import sys
-import os
+from sklearn.metrics import confusion_matrix, roc_auc_score
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+# ====== 项目根目录，保证能 import mymodels ======
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# 导入你的模型
-from mymodels.model import SSA_Model, build_model
-
-# --- 1. 配置 ---
-PATCH_DIR = "/data/dingcong/hybrid/hear_patch_final"
-LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-CHECKPOINT_PATH = "your_model_checkpoint.pth"  # 你的模型权重路径
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# LR 优化的超参数
-TOP_K = 5
-BEST_THRESHOLD = 0.80
-BEST_WEIGHT = 3.0
+from mymodels.model import build_model  # noqa
 
 
-def get_label(base_name):
-    txt_path = os.path.join(LABEL_DIR, base_name + ".txt")
-    if not os.path.exists(txt_path): return None
-    df = pd.read_csv(txt_path, sep='\t', header=None)
-    return 1 if (df[2] == 1).any() or (df[3] == 1).any() else 0
+# =========================
+# 1) Dataset: 读取 (200,48) patch
+# =========================
+class HearPatchDataset(Dataset):
+    def __init__(self, df, patch_dir):
+        self.items = []
+        self.patch_dir = patch_dir
+
+        for _, row in df.iterrows():
+            path = os.path.join(patch_dir, row["file_name"])
+            label = int(row["label"])
+
+            x = np.load(path)  # (N,200,48)
+            if x.ndim == 2:
+                x = x[None, ...]
+
+            for i in range(x.shape[0]):
+                self.items.append((x[i], label))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        x, y = self.items[idx]
+        if idx == 0:
+            print("🧪 Dataset sample shape:", x.shape)
+        return (
+            torch.tensor(x, dtype=torch.float32),  # (200,48)
+            torch.tensor(y, dtype=torch.float32)
+        )
 
 
-# --- 2. 初始化你的模型 ---
-print("🚀 正在加载 SSA-Model...")
-model = build_model()  # 或者 SSA_Model(...) 根据你的定义
-# 如果有权重则加载
-if os.path.exists(CHECKPOINT_PATH):
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
-model.to(DEVICE)
-model.eval()
+# =========================
+# 2) Focal Loss（可选）
+# =========================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.35, gamma=2.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
 
-# --- 3. 提取模型深层特征 ---
-# 这一步是将 Patch 转化为模型认知的“高级语义向量”
-print("🧠 正在通过模型提取深层特征...")
-feat_files = sorted(glob.glob(os.path.join(PATCH_DIR, "*.npy")))
-file_data = []
+    def forward(self, logits, targets):
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt = torch.exp(-bce)
+        loss = self.alpha * (1 - pt) ** self.gamma * bce
+        return loss.mean()
 
-with torch.no_grad():
-    for f_path in tqdm(feat_files):
-        base_name = os.path.basename(f_path).replace(".npy", "")
-        label = get_label(base_name)
-        if label is None: continue
 
-        # 加载 Patch 数据: 形状通常是 (N, seq_len, dim) 或类似
-        patches = np.load(f_path)
-        patches_torch = torch.from_numpy(patches).float().to(DEVICE)
+# =========================
+# 3) 阈值扫描：ICBHI = (SE+SP)/2
+# =========================
+def scan_threshold_icbhi(y_true, y_prob, thr_grid=None):
+    if thr_grid is None:
+        thr_grid = np.linspace(0.05, 0.95, 181)
 
-        # 喂入模型获取特征 (例如取 cls_token 或 global_pool 的输出)
-        # 假设你的模型 forward 返回的是 (N, hidden_dim)
-        deep_features = model(patches_torch)
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
 
-        if isinstance(deep_features, tuple):  # 兼容返回多个值的情况
-            deep_features = deep_features[0]
+    best = (-1.0, 0.5, 0.0, 0.0, None)  # icbhi, thr, se, sp, cm
 
-        file_data.append({
-            'name': base_name,
-            'X': deep_features.cpu().numpy(),  # 模型输出的高级特征矩阵 (N, dim)
-            'y': label
-        })
+    for thr in thr_grid:
+        y_pred = (y_prob >= thr).astype(int)
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
 
-# --- 4. 划分数据集 ---
-train_data, test_data = train_test_split(file_data, test_size=0.2, random_state=42)
+        se = tp / (tp + fn + 1e-9)
+        sp = tn / (tn + fp + 1e-9)
+        icbhi = 0.5 * (se + sp)
 
-X_train = np.vstack([d['X'] for d in train_data])
-y_train = np.hstack([[d['y']] * len(d['X']) for d in train_data])
+        if icbhi > best[0]:
+            best = (float(icbhi), float(thr), float(se), float(sp), cm)
 
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
+    return best
 
-# --- 5. LR 线性探测 (Linear Probing) ---
-print("⚖️ 正在进行 LR 线性探测评估...")
-lr_model = LogisticRegression(
-    max_iter=1000,
-    class_weight={0: 1.0, 1: BEST_WEIGHT},
-    C=0.001,
-    solver='liblinear',
-    random_state=42
-)
-lr_model.fit(X_train_scaled, y_train)
 
-# --- 6. 验证与 Top-K 聚合 ---
-y_true_file = []
-y_pred_file = []
+# =========================
+# 4) 训练主函数
+# =========================
+def train():
+    CSV_PATH = "/data/dingcong/hybrid/labels.csv"
+    PATCH_DIR = "/data/dingcong/hybrid/hear_patch_final"
+    OUT_DIR = PROJECT_ROOT / "outputs"
+    OUT_DIR.mkdir(exist_ok=True)
+    SAVE_PATH = str(OUT_DIR / "best_icbhi_score.pth")
 
-for d in test_data:
-    X_test_scaled = scaler.transform(d['X'])
-    probs = lr_model.predict_proba(X_test_scaled)[:, 1]
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", DEVICE)
 
-    # 保持你之前的 Top-K=5 逻辑
-    actual_k = min(TOP_K, len(probs))
-    top_probs = np.sort(probs)[-actual_k:]
-    score = np.mean(top_probs)
+    # 超参
+    SEQ_LEN = 200
+    INPUT_DIM = 48
+    D_MODEL = 256
+    N_LAYERS = 2
+    DROPOUT = 0.25
 
-    pred = 1 if score >= BEST_THRESHOLD else 0
-    y_true_file.append(d['y'])
-    y_pred_file.append(pred)
+    BATCH_SIZE = 48
+    EPOCHS = 80
+    LR = 6e-5
+    WD = 1e-3
+    PATIENCE = 20
+    CLIP = 1.0
 
-# --- 7. 输出结果 ---
-tn, fp, fn, tp = confusion_matrix(y_true_file, y_pred_file).ravel()
-se = tp / (tp + fn) if (tp + fn) > 0 else 0
-sp = tn / (tn + fp) if (tn + fp) > 0 else 0
+    # 读 CSV
+    df = pd.read_csv(CSV_PATH)
+    print("DF columns:", df.columns.tolist())
+    print(df.head(2))
 
-print("\n" + "=" * 50)
-print(f"🌟 SSA-Model + LR Baseline 结果:")
-print(f"SE: {se:.4f} | SP: {sp:.4f} | Score: {(se + sp) / 2:.4f}")
-print("-" * 50)
-print(classification_report(y_true_file, y_pred_file, target_names=['Normal', 'Abnormal']))
+    # patient-wise split（如果没有 patient_id，就从 file_name 解析）
+    if "patient_id" not in df.columns:
+        df["patient_id"] = df["file_name"].astype(str).str.split("_", n=1).str[0]
+
+    patients = df["patient_id"].unique()
+    p_labels = df.groupby("patient_id")["label"].max().reindex(patients).values.astype(int)
+
+    train_p, val_p = train_test_split(
+        patients, test_size=0.2, random_state=42, stratify=p_labels
+    )
+    train_df = df[df["patient_id"].isin(train_p)].copy()
+    val_df = df[df["patient_id"].isin(val_p)].copy()
+
+    print(f"Train patients: {len(train_p)} | Val patients: {len(val_p)}")
+    print(f"Train segs    : {len(train_df)} | Val segs    : {len(val_df)}")
+
+    train_loader = DataLoader(
+        HearPatchDataset(train_df, PATCH_DIR, seq_len=SEQ_LEN),
+        batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        HearPatchDataset(val_df, PATCH_DIR, seq_len=SEQ_LEN),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
+    )
+
+    # 模型
+    model = build_model(
+        input_dim=INPUT_DIM, seq_len=SEQ_LEN, d_model=D_MODEL,
+        n_layers=N_LAYERS, dropout=DROPOUT, num_classes=1
+    ).to(DEVICE)
+
+    # sanity forward
+    x0, y0 = next(iter(train_loader))
+    with torch.no_grad():
+        logits0 = model(x0.to(DEVICE))
+    print(f"Sanity check: x {tuple(x0.shape)} logits {tuple(logits0.shape)}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+
+    criterion = FocalLoss(alpha=0.35, gamma=2.0)
+
+    best_icbhi = -1.0
+    no_improve = 0
+
+    print("开始训练（保存指标：ICBHI score = (SE+SP)/2，阈值验证集扫描）...")
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        total_loss = 0.0
+
+        for x, y in pbar:
+            x = x.to(DEVICE, non_blocking=True)  # (B,200,48)
+            y = y.to(DEVICE, non_blocking=True)  # (B,)
+            if epoch == 0:
+                print("🔥 Batch x shape:", x.shape)
+                print("🔥 Batch y shape:", y.shape)
+                break
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x).view(-1)
+            loss = criterion(logits, y)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+            optimizer.step()
+
+            total_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+
+        scheduler.step(epoch)
+
+        # ===== val =====
+        model.eval()
+        y_true, y_prob = [], []
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(DEVICE, non_blocking=True)
+                logits = model(x).view(-1)
+                prob = torch.sigmoid(logits).cpu().numpy()
+                y_prob.extend(prob.tolist())
+                y_true.extend(y.numpy().tolist())
+
+        # AUC
+        try:
+            auc = roc_auc_score(np.asarray(y_true).astype(int), np.asarray(y_prob))
+        except Exception:
+            auc = float("nan")
+
+        icbhi, thr, se, sp, cm = scan_threshold_icbhi(y_true, y_prob)
+
+        print(f"\n[Epoch {epoch}] AUC={auc:.4f} | ICBHI={icbhi:.4f} | SE={se:.4f} | SP={sp:.4f} | thr={thr:.2f}")
+        print("Confusion Matrix:\n", cm)
+
+        if icbhi > best_icbhi:
+            best_icbhi = icbhi
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"⭐ New Best ICBHI: {best_icbhi:.4f} (epoch {epoch}) -> saved: {SAVE_PATH}")
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= PATIENCE:
+                print(f"Early Stopping! Best ICBHI: {best_icbhi:.4f}")
+                break
+
+
+if __name__ == "__main__":
+    train()
