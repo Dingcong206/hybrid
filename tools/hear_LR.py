@@ -15,7 +15,7 @@ from sklearn.calibration import CalibratedClassifierCV
 # =========================
 # 1) 路径配置
 # =========================
-FEAT_DIR = "/data/dingcong/hybrid/hear_features_official"   # 每个文件: (n_seg,512) 或 (512,)
+FEAT_DIR = "/data/dingcong/hybrid/hear_features_official_baseline"   # 每个文件: (n_seg,512) 或 (512,)
 LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"     # ICBHI .txt 标签目录
 SAVE_MODEL_NAME = "hear_lr_patientwise_seg_topkmean.joblib"
 
