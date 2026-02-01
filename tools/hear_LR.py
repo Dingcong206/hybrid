@@ -173,7 +173,7 @@ def patient_wise_split_files(file_label, file_patient, test_size=TEST_SIZE, seed
 
 
 # =========================
-# 7) Segment -> File 聚合：max(prob)
+# 7) Segment -> 聚合
 # =========================
 
 
@@ -233,7 +233,7 @@ def run():
     val_seg_prob = clf.predict_proba(X_val_seg_s)[:, 1]
 
     # file-level 聚合：max(prob)
-    val_file_list, val_file_prob = aggregate_file_maxprob(val_files, val_seg_files, val_seg_prob)
+    val_file_list, val_file_prob = aggregate_file_noisy_or(val_files, val_seg_files, val_seg_prob)
     y_val_file = np.array([file_label[f] for f in val_file_list], dtype=int)
 
     # AUC（file-level）
