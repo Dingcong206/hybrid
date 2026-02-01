@@ -4,6 +4,21 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba
 
 
+# =========================
+# 0) 小工具：sin/cos 位置编码（可变长度更稳）
+# =========================
+def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
+    """
+    (seq_len, dim)
+    """
+    pe = torch.zeros(seq_len, dim, device=device)
+    position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-torch.log(torch.tensor(10000.0, device=device)) / dim))
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
 # =====================================================
 # 1) BiMambaBlock: 双向 Mamba 核心块
 # =====================================================
@@ -25,7 +40,9 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
+        # x: (B, T, D)
         h = self.ln1(x)
+        # 双向：前向 + 翻转的后向
         h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h)
         x = x + self.mlp(self.ln2(x))
@@ -33,13 +50,13 @@ class BiMambaBlock(nn.Module):
 
 
 # =====================================================
-# 2) SSA_Layer: 卷积 + (Pre Mamba) + Attention + (Post Mamba) + Gate
+# 2) SSA_Layer: 卷积 + (Mamba堆叠) + Attention + (Mamba堆叠) + gate
 # =====================================================
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    def __init__(self, d_model, nhead=8, dropout=0.3, n_mamba_pre=3, n_mamba_post=3):
         super().__init__()
 
-        # A. 卷积层：提取局部纹理
+        # Conv1d expects (B, D, T)
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
             nn.BatchNorm1d(d_model),
@@ -48,176 +65,184 @@ class SSA_Layer(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # B. Pre-Attention Mamba 堆栈
-        self.bimamba_stack = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout)
-            for _ in range(3)
-        ])
+        self.pre_mamba = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(n_mamba_pre)])
 
-        # C. Attention 层
         self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.attn_drop = nn.Dropout(dropout)
 
-        # D. Post-Attention Mamba 堆栈
-        self.post_mamba_stack = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout)
-            for _ in range(3)
-        ])
+        self.post_mamba = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(n_mamba_post)])
 
-        # E. 门控机制
         self.gate = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask=None):
+        """
+        x: (B, T, D)
+        key_padding_mask: (B, T) bool, True means PAD（不参与attention）
+        """
         res_layer = x
 
-        # 1) Conv
-        x_conv = x.transpose(1, 2)
+        # 1) Conv (local)
+        x_conv = x.transpose(1, 2)  # (B, D, T)
         x = x + self.conv(x_conv).transpose(1, 2)
 
         # 2) Pre Mamba
-        for bimamba in self.bimamba_stack:
-            x = bimamba(x)
+        for blk in self.pre_mamba:
+            x = blk(x)
 
-        # 3) Attention
+        # 3) Attention (global) - 支持 mask
         res_attn = x
         x_norm = self.attn_ln(x)
-        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=key_padding_mask, need_weights=False)
         x_out = res_attn + self.attn_drop(x_attn)
 
         # 4) Post Mamba
-        for post_bimamba in self.post_mamba_stack:
-            x_out = post_bimamba(x_out)
+        for blk in self.post_mamba:
+            x_out = blk(x_out)
 
-        # 5) Gate
-        g = self.gate(x_out.mean(dim=1, keepdim=True))
+        # 5) Gate（用均值做门控；若有mask则做masked mean）
+        if key_padding_mask is None:
+            mean_feat = x_out.mean(dim=1, keepdim=True)  # (B,1,D)
+        else:
+            # mask: True=PAD -> weight=0
+            valid = (~key_padding_mask).float().unsqueeze(-1)  # (B,T,1)
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean_feat = (x_out * valid).sum(dim=1, keepdim=True) / denom
+
+        g = self.gate(mean_feat)  # (B,1,D)
         return res_layer + g * x_out
 
 
 # =====================================================
-# 3) SSA_Model: 顶层架构（加入显式升维 + 可变长位置编码）
+# 3) PatchEncoder: (200,48) -> (D)
+#    你说的“升维”：这里把 48 升到 d_model
 # =====================================================
-class SSA_Model(nn.Module):
+class PatchEncoder(nn.Module):
+    def __init__(self, in_dim=48, d_model=256, dropout=0.2):
+        super().__init__()
+        # 输入 patch: (B,T,200,48)
+        # 我们把每个 patch 的 200 帧当序列，用 1D conv 提取，再池化成一个向量
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x_patch):
+        """
+        x_patch: (B, T, 200, 48)
+        return:  x_token (B, T, D)
+        """
+        B, T, L, C = x_patch.shape  # L=200, C=48
+        # 先对最后一维做升维：48 -> D
+        x = self.proj(x_patch)  # (B,T,200,D)
+
+        # 对每个 patch 的 200 帧做 temporal conv + pool 成一个向量
+        x = x.reshape(B * T, L, -1).transpose(1, 2)  # (B*T, D, 200)
+        x = self.temporal_conv(x)                   # (B*T, D, 200)
+
+        # 池化到 1：得到 patch-level token
+        x = F.adaptive_avg_pool1d(x, 1).squeeze(-1)  # (B*T, D)
+        x = x.reshape(B, T, -1)                      # (B, T, D)
+        return x
+
+
+# =====================================================
+# 4) SSA_Model: 输出 patch logits (B,T)
+# =====================================================
+class SSA_PatchLogitModel(nn.Module):
     def __init__(
         self,
-        input_dim=48,
-        num_classes=1,
+        in_dim=48,
         d_model=256,
         dropout=0.2,
         n_layers=2,
         nhead=8,
-        max_seq_len=200,   # 用于初始化位置编码长度（你现在 L=200）
-        topk=16
+        max_len=256,   # 位置编码最大支持的 T（够用就行）
     ):
         super().__init__()
+        self.patch_encoder = PatchEncoder(in_dim=in_dim, d_model=d_model, dropout=dropout)
 
-        assert d_model % nhead == 0, f"d_model={d_model} 必须能被 nhead={nhead} 整除"
-
-        # ✅ 0) 显式 Linear 升维（48 -> d_model）
-        self.linear_up = nn.Linear(input_dim, d_model)
-
-        # ✅ 1) 可学习位置编码（长度先按 max_seq_len 初始化）
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        self.max_len = max_len
         self.pos_drop = nn.Dropout(dropout)
 
-        # 2) 编码层堆叠
         self.layers = nn.ModuleList([
-            SSA_Layer(d_model, nhead=nhead, dropout=dropout)
+            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout)
             for _ in range(n_layers)
         ])
 
         self.norm = nn.LayerNorm(d_model)
 
-        # 3) Top-K pooling
-        self.topk = topk
-        self.pool_proj = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.GELU(),
-            nn.Linear(d_model // 4, 1)
-        )
-
-        # 4) 分类头（attn/max/avg 三路融合）
-        self.head = nn.Sequential(
-            nn.Linear(d_model * 3, d_model),
+        # 输出每个 patch 的 logits
+        self.patch_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, num_classes)
+            nn.Linear(d_model, 1)  # -> logit
         )
 
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-    def _add_pos_embed(self, x):
+    def forward(self, x_patch, patch_mask=None, return_emb=False):
         """
-        x: (B, L, d_model)
-        pos_embed: (1, max_seq_len, d_model)
-        如果 L != max_seq_len，就插值到 L
+        x_patch: (B, T, 200, 48)
+        patch_mask: (B, T) bool, True=PAD (可选，T可变时用)
+        return:
+            logits_patch: (B, T)
+            (optional) emb: (B, T, D)
         """
-        B, L, D = x.shape
-        pos = self.pos_embed
+        device = x_patch.device
+        B, T, _, _ = x_patch.shape
 
-        if pos.shape[1] != L:
-            # 插值需要 (B, D, L)
-            pos = pos.transpose(1, 2)  # (1, D, maxL)
-            pos = F.interpolate(pos, size=L, mode="linear", align_corners=False)
-            pos = pos.transpose(1, 2)  # (1, L, D)
+        # 1) patch -> token
+        x = self.patch_encoder(x_patch)  # (B, T, D)
 
-        return x + pos
+        # 2) 位置编码（sin/cos） + dropout
+        if T > self.max_len:
+            # 允许更长：动态生成
+            pos = sinusoidal_positional_encoding(T, x.size(-1), device).unsqueeze(0)  # (1,T,D)
+        else:
+            pos = sinusoidal_positional_encoding(T, x.size(-1), device).unsqueeze(0)
+        x = self.pos_drop(x + pos)
 
-    def forward(self, x):
-        """
-        输入 x: (B, L, 48) 例如 (B, 200, 48)
-        """
-        # ✅ 先升维到 d_model
-        x = self.linear_up(x)  # (B, L, d_model)
-
-        # ✅ 加位置编码（支持可变 L）
-        x = self._add_pos_embed(x)
-        x = self.pos_drop(x)
-
-        # 编码层
+        # 3) SSA layers
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, key_padding_mask=patch_mask)
 
         x = self.norm(x)
 
-        # Top-K 选通注意力池化
-        attn_logits = self.pool_proj(x)  # (B, L, 1)
-        k = min(self.topk, x.shape[1])
-        _, topk_idx = torch.topk(attn_logits.squeeze(-1), k=k, dim=1)
+        # 4) patch logits
+        logits = self.patch_head(x).squeeze(-1)  # (B,T)
 
-        mask = torch.zeros_like(attn_logits).fill_(-1e9)
-        mask.scatter_(1, topk_idx.unsqueeze(-1), 0)
-        topk_weights = torch.softmax((attn_logits + mask) / 0.5, dim=1)  # (B, L, 1)
+        # 5) 若有mask，把PAD位置 logits 置为极小（防止你后面 max/topk 选到PAD）
+        if patch_mask is not None:
+            logits = logits.masked_fill(patch_mask, -1e9)
 
-        # 三路融合
-        attn_feat = torch.sum(x * topk_weights, dim=1)
-        max_feat, _ = torch.max(x, dim=1)
-        avg_feat = torch.mean(x, dim=1)
-
-        feat = torch.cat([attn_feat, max_feat, avg_feat], dim=-1)
-        return self.head(feat).squeeze(-1)
+        if return_emb:
+            return logits, x
+        return logits
 
 
-def build_model(
-    input_dim=48,
-    d_model=256,
-    dropout=0.2,
-    num_classes=1,
-    n_layers=2,
-    nhead=8,
-    max_seq_len=200,
-    topk=16
-):
-    return SSA_Model(
-        input_dim=input_dim,
+def build_model(in_dim=48, d_model=512, dropout=0.2, n_layers=4, nhead=8, max_len=512):
+    """
+    你的 train.py 可以:
+        model = build_model(in_dim=48, d_model=256, ...)
+        logits_patch = model(x_patch, patch_mask=mask)  # (B,T)
+        prob_patch = torch.sigmoid(logits_patch)
+        file_prob = prob_patch.max(dim=1)[0]            # MIL聚合在train里做
+    """
+    return SSA_PatchLogitModel(
+        in_dim=in_dim,
         d_model=d_model,
         dropout=dropout,
-        num_classes=num_classes,
         n_layers=n_layers,
         nhead=nhead,
-        max_seq_len=max_seq_len,
-        topk=topk
+        max_len=max_len
     )
