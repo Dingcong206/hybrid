@@ -84,4 +84,4 @@ for filename in tqdm(wav_files):
     except Exception as e:
         print(f"❌ 文件 {filename} 处理失败: {str(e)}")
 
-print(f"✅ 处理完成！真正的 Patch 数据已存入: {SAVE_DIR}")所以，我如果想要将补偿变成2k的话应该在特征提取的这个环节怎么做呢
+print(f"✅ 处理完成！真正的 Patch 数据已存入: {SAVE_DIR}")
