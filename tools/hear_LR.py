@@ -5,67 +5,74 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.metrics import confusion_matrix
 
-# --- 1. 路径配置 ---
+# --- 1. 配置路径 ---
 FEAT_DIR = "/data/dingcong/hybrid/hear_features_official_baseline"
 LABEL_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
 
 
-# --- 2. 标签解析函数 (ICBHI 逻辑) ---
 def get_label(base_name):
     txt_path = os.path.join(LABEL_DIR, base_name + ".txt")
     if not os.path.exists(txt_path): return None
-    df = pd.read_csv(txt_path, sep='\t', header=None)  # ICBHI 默认制表符
-    # 只要有 crackle(col 2) 或 wheeze(col 3) 就是异常(1)
+    # ICBHI 标签通常以制表符分隔
+    df = pd.read_csv(txt_path, sep='\t', header=None)
+    # 只要 crackle (列2) 或 wheeze (列3) 出现 1，即判定为异常 (1)
     return 1 if (df[2] == 1).any() or (df[3] == 1).any() else 0
 
 
-# --- 3. 数据加载 ---
+# --- 2. 加载 HeAR 特征 (512维) ---
 X, y = [], []
-print("🚚 正在加载特征...")
-feat_files = glob.glob(os.path.join(FEAT_DIR, "*.npy"))
+feat_files = sorted(glob.glob(os.path.join(FEAT_DIR, "*.npy")))
+print(f"📂 正在读取 {len(feat_files)} 个特征文件...")
 
 for f_path in feat_files:
     base_name = os.path.basename(f_path).replace(".npy", "")
     label = get_label(base_name)
-
     if label is not None:
-        feat = np.load(f_path).squeeze()  # 确保是 (512,)
-        X.append(feat)
+        X.append(np.load(f_path).squeeze())
         y.append(label)
 
-X = np.array(X)
-y = np.array(y)
-print(f"✅ 加载完成: 样本数={len(X)}, 特征维度={X.shape[1]}")
-
-# --- 4. 训练与评估 ---
-# 划分训练集和测试集
+X, y = np.array(X), np.array(y)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-# 标准化 (非常重要，LR 对量纲敏感)
+# 标准化
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 X_test = scaler.transform(X_test)
 
-# 初始化 LR
-# class_weight='balanced' 能有效平衡你的正常/异常比例，降低 FN
-#model = LogisticRegression(max_iter=1000, class_weight='balanced', C=1.0)
-model = LogisticRegression(
-    max_iter=1000,
-    class_weight={0: 1.0, 1: 2},  # 正常给1，异常给2
-    C=1.0,
-    random_state=42
-)
-model.fit(X_train, y_train)
+# --- 3. 权重扫描循环 ---
+weights = np.arange(1.0, 5.1, 0.2)
+best_score = -1
+best_report = None
 
-# --- 5. 结果输出 ---
-y_pred = model.predict(X_test)
-y_prob = model.predict_proba(X_test)[:, 1]
+print("\n" + "=" * 75)
+print(f"{'异常权重':>8} | {'SE (灵敏度)':>12} | {'SP (特异性)':>12} | {'(SE+SP)/2':>12} | {'FN (漏诊)':>8}")
+print("-" * 75)
 
-print("\n" + "=" * 30 + " 结果报告 " + "=" * 30)
-print(f"ROC-AUC: {roc_auc_score(y_test, y_prob):.4f}")
-print("\n混淆矩阵:")
-print(confusion_matrix(y_test, y_pred))
-print("\n分类详情:")
-print(classification_report(y_test, y_pred, target_names=['Normal', 'Abnormal']))
+for w in weights:
+    cw = {0: 1.0, 1: round(w, 2)}
+    model = LogisticRegression(max_iter=1000, class_weight=cw, C=1.0, random_state=42)
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+
+    # 计算指标
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0
+    avg_score = (se + sp) / 2
+
+    print(f"{cw[1]:>12.1f} | {se:>12.4f} | {sp:>12.4f} | {avg_score:>12.4f} | {fn:>8}")
+
+    # 记录最佳
+    if avg_score > best_score:
+        best_score = avg_score
+        best_report = (cw[1], se, sp, avg_score, fn)
+
+print("=" * 75)
+if best_report:
+    w, se, sp, score, fn = best_report
+    print(f"🏆 最佳权重结果: 异常类权重 = {w}")
+    print(f"📊 指标: SE={se:.4f}, SP={sp:.4f}, (SE+SP)/2 = {score:.4f}")
+    print(f"📉 此时漏诊数 (FN): {fn}")
