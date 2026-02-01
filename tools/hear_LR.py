@@ -53,7 +53,7 @@ X_test = scaler.transform(X_test)
 #model = LogisticRegression(max_iter=1000, class_weight='balanced', C=1.0)
 model = LogisticRegression(
     max_iter=1000,
-    class_weight={0: 1.0, 1: 2.5},  # 正常给1，异常给2.5
+    class_weight={0: 1.0, 1: 2},  # 正常给1，异常给2
     C=1.0,
     random_state=42
 )
