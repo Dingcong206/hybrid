@@ -20,7 +20,7 @@ RANDOM_SEED = 42
 TEST_SIZE = 0.2
 
 # 阈值扫描：让混淆矩阵别极端（可调）
-MIN_SP = 0.60                     # 约束特异度最低 >= 0.60（你也可以试 0.50 / 0.65）
+MIN_SP = 0.50                    # 约束特异度最低 >= 0.60（你也可以试 0.50 / 0.65）
 THR_GRID = np.linspace(0.05, 0.95, 181)
 
 
@@ -175,7 +175,7 @@ def patient_wise_split_files(file_label, file_patient, test_size=TEST_SIZE, seed
 # =========================
 # 7) Segment -> 聚合
 # =========================
-def aggregate_file_topk_mean(files, seg_files, seg_probs, k=3):
+def aggregate_file_topk_mean(files, seg_files, seg_probs, k=5):
     from collections import defaultdict
     bucket = defaultdict(list)
     for f, p in zip(seg_files, seg_probs):
@@ -215,12 +215,12 @@ def run():
     X_val_seg_s = scaler.transform(X_val_seg)
 
     # 训练 LR：balanced
-    print("🚀 Training Logistic Regression (segment-level, class_weight=balanced)...")
+    print("🚀 Training Logistic Regression (segment-level, class_weight={0: 1.0, 1: 2.0}")
     base_lr = LogisticRegression(
         max_iter=5000,
         C=1.0,
         solver="lbfgs",
-        class_weight="balanced",
+        class_weight= {0: 1.0, 1: 2.0},
         random_state=RANDOM_SEED
     )
     clf = CalibratedClassifierCV(base_lr, method="sigmoid", cv=3)
