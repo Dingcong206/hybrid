@@ -76,7 +76,8 @@ def process_wav(wav_path):
     spec_torch = torch.from_numpy(spec).float()
     tokens = patch_embed(spec_torch)
 
-    return tokens.squeeze(0).numpy()  # (16, 256)
+    return tokens.squeeze(0).detach().cpu().numpy()
+    # (16, 256)
 
 
 # ============================
