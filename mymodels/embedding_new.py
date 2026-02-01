@@ -1,122 +1,101 @@
 import os
 import numpy as np
-import tensorflow as tf
 import librosa
-from tqdm import tqdm
-from scipy.signal import butter, lfilter
+import tensorflow as tf
 import torch
-import torch.nn.functional as F  # 使用 torch 的 interpolate 更加丝滑
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
 
-# --- 1. 配置对齐 ---
+# ============================
+# 配置
+# ============================
 SAMPLE_RATE = 16000
-FRAME_LENGTH = 32000
-TARGET_LEN = 2048  # 宏观 Token 数 (2s 片段数)
-INTERNAL_PATCHES = 16  # 每 2s 片段保留的微观 Patch 数
+FRAME_LEN = 32000
+NUM_PATCHES = 16
+IN_DIM = 48
+OUT_DIM = 256
 
-# --- 2. 路径配置 ---
-BASE_PATH = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
-FRONTEND_PATH = os.path.join(BASE_PATH, "event_detector", "spectrogram_frontend")
 WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-SAVE_DIR = "/data/dingcong/hybrid/hear_patch_res16_final"  # 建议新目录
+SAVE_DIR = "/data/dingcong/hybrid/hear_16x256"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- 3. 加载模型 ---
-patch_model = tf.saved_model.load(FRONTEND_PATH)
-patch_infer = patch_model.signatures["serving_default"]
+HEAR_BASE = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
+FRONTEND_PATH = os.path.join(
+    HEAR_BASE,
+    "event_detector",
+    "spectrogram_frontend"
+)
+
+# ============================
+# Patch Embedding
+# ============================
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_dim=48, out_dim=256, num_patches=16):
+        super().__init__()
+        self.num_patches = num_patches
+        self.proj = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # [B, 48, 200]
+        x = F.interpolate(x, size=self.num_patches, mode="linear", align_corners=False)
+        x = x.permute(0, 2, 1)  # [B, 16, 48]
+        x = self.proj(x)        # [B, 16, 256]
+        return x
 
 
-def butter_bandpass_filter(data, lowcut=100, highcut=2000, fs=16000, order=5):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return lfilter(b, a, data)
+# ============================
+# 初始化
+# ============================
+print("Loading HeAR frontend...")
+frontend = tf.saved_model.load(FRONTEND_PATH)
+frontend_fn = frontend.signatures["serving_default"]
+
+patch_embed = PatchEmbedding(
+    in_dim=IN_DIM,
+    out_dim=OUT_DIM,
+    num_patches=NUM_PATCHES
+)
+
+# ============================
+# 单文件处理
+# ============================
+def process_wav(wav_path):
+    audio, _ = librosa.load(wav_path, sr=SAMPLE_RATE)
+
+    if len(audio) < FRAME_LEN:
+        audio = np.pad(audio, (0, FRAME_LEN - len(audio)))
+    audio = audio[:FRAME_LEN]
+
+    # HeAR frontend
+    audio_tf = tf.constant(audio[None, :], dtype=tf.float32)
+    out = frontend_fn(audio_wav=audio_tf)
+    spec = list(out.values())[0].numpy()  # (1, 200, 48)
+
+    # Patch embedding
+    spec_torch = torch.from_numpy(spec).float()
+    tokens = patch_embed(spec_torch)
+
+    return tokens.squeeze(0).numpy()  # (16, 256)
 
 
-# --- 4. 核心处理逻辑 ---
-def process_single_file(file_path):
-    # A. 预处理
-    audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
-    audio = butter_bandpass_filter(audio).astype(np.float32)
+# ============================
+# 批量处理
+# ============================
+if __name__ == "__main__":
+    wav_files = [f for f in os.listdir(WAV_DIR) if f.endswith(".wav")]
 
-    if len(audio) < FRAME_LENGTH:
-        audio = np.pad(audio, (0, FRAME_LENGTH - len(audio)), mode='constant')
+    for wav in tqdm(wav_files):
+        wav_path = os.path.join(WAV_DIR, wav)
+        save_path = os.path.join(SAVE_DIR, wav.replace(".wav", ".npy"))
 
-    # B. 分帧与能量筛选
-    NEW_STEP = 160
-    audio_clips = tf.signal.frame(audio, FRAME_LENGTH, NEW_STEP).numpy()
-    energies = np.sqrt(np.mean(audio_clips ** 2, axis=1))
+        if os.path.exists(save_path):
+            continue
 
-    if audio_clips.shape[0] > TARGET_LEN:
-        top_indices = np.argsort(energies)[-TARGET_LEN:]
-        top_indices = sorted(top_indices)
-        selected_clips = audio_clips[top_indices]
-    else:
-        selected_clips = audio_clips
+        try:
+            feat = process_wav(wav_path)
+            np.save(save_path, feat)
+        except Exception as e:
+            print(f"❌ {wav} failed:", e)
 
-    all_frame_features = []
-
-    # C. 逐帧推理 + 空间压缩 (190 -> 16)
-
-    # ... 前面的推理逻辑 ...
-    for i in range(selected_clips.shape[0]):
-        single_clip = selected_clips[i: i + 1]
-        output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
-
-        # ✅ 选出 [1, 190, 256] 的输出
-        patch_tensor = None
-        for k, v in output_dict.items():
-            shp = v.shape
-            if len(shp) == 3 and shp[-1] == 256:
-                patch_tensor = v
-                break
-        if patch_tensor is None:
-            raise ValueError(
-                f"找不到 (1,190,256) 的输出。实际输出为: "
-                f"{[(k, tuple(v.shape)) for k, v in output_dict.items()]}"
-            )
-
-        patch_data = patch_tensor.numpy()  # [1, 190, 256]
-        feat_tensor = torch.from_numpy(patch_data).float()  # [1, 190, 256]
-        feat_tensor = feat_tensor.permute(0, 2, 1)  # [1, 256, 190]
-
-        feat_resized = F.interpolate(
-            feat_tensor,
-            size=INTERNAL_PATCHES,
-            mode='linear',
-            align_corners=False
-        )
-
-        patch_res16 = feat_resized.permute(0, 2, 1).cpu().numpy()  # [1, 16, 256]
-
-        # ✅ 保险：确保维度永远是 256
-        if patch_res16.shape[-1] != 256:
-            raise ValueError(f"patch_res16 维度异常: {patch_res16.shape}")
-
-        all_frame_features.append(patch_res16)
-
-    # D. 最终拼接
-    # 结果形状应该是 [TARGET_LEN, 16, 256] -> 展平为 [TARGET_LEN * 16, 256]
-    res = np.concatenate(all_frame_features, axis=0)  # [T_actual, 16, 256]
-
-    # 补齐到固定长度
-    current_t = res.shape[0]
-    if current_t < TARGET_LEN:
-        padding = np.zeros((TARGET_LEN - current_t, INTERNAL_PATCHES, 256), dtype=np.float32)
-        res = np.concatenate([res, padding], axis=0)
-
-    # 展平以便 Mamba 直接处理：[32768, 256]
-    res_flattened = res.reshape(-1, 256)
-    return res_flattened
-
-
-# --- 5. 执行 ---
-wav_files = sorted([f for f in os.listdir(WAV_DIR) if f.endswith('.wav')])
-for filename in tqdm(wav_files):
-    save_path = os.path.join(SAVE_DIR, filename.replace('.wav', '.npy'))
-    if os.path.exists(save_path): continue
-    try:
-        final_data = process_single_file(os.path.join(WAV_DIR, filename))
-        np.save(save_path, final_data)
-    except Exception as e:
-        print(f"❌ {filename} 失败: {e}")
+    print("✅ All features extracted.")
