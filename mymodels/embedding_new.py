@@ -4,96 +4,75 @@ import tensorflow as tf
 import librosa
 from tqdm import tqdm
 
-# --- 1. 官方配置常量 ---
+# --- 1. 官方配置对齐 ---
+# 根据官方 audio_utils.py 确定的标准
 SAMPLE_RATE = 16000
 CLIP_DURATION = 2
-CLIP_LENGTH = SAMPLE_RATE * CLIP_DURATION  # 32000
+FRAME_LENGTH = 32000  # 严格使用 32000，模型内部会处理 STFT 所需的补齐
 
-# --- 2. 路径设置 (关键修正) ---
-# 基础 snapshot 路径
-base_snapshot_path = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
-# 【核心修正】：根据 Notebook 线索，直接加载 frontend 子目录
-frontend_model_path = os.path.join(base_snapshot_path, "event_detector", "spectrogram_frontend")
+# --- 2. 路径配置 ---
+# 你的 snapshot 真实路径
+BASE_PATH = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f"
+# 锁定官方定义的 frontend 子目录
+FRONTEND_PATH = os.path.join(BASE_PATH, "event_detector", "spectrogram_frontend")
 
 WAV_DIR = "/data/dingcong/hybrid/audio_and_txt_files"
-SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final"  # 建议换个目录，存真正的 Patch
+SAVE_DIR = "/data/dingcong/hybrid/hear_patch_final"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- 3. 加载官方前端模型 ---
-print(f"📦 正在加载 HeAR 前端提取器: {frontend_model_path}")
-# 使用 tf.saved_model.load 直接加载子模块，这样最稳
-patch_model = tf.saved_model.load(frontend_model_path)
+# --- 3. 加载官方模型 ---
+print(f"📦 正在加载 HeAR 前端提取器: {FRONTEND_PATH}")
+# 使用 SavedModel 加载签名，这是最通用的官方方式
+patch_model = tf.saved_model.load(FRONTEND_PATH)
 patch_infer = patch_model.signatures["serving_default"]
 
 
-# --- 4. 官方音频预处理函数 ---
-def resample_audio_and_convert_to_mono(audio_array, sampling_rate):
-    if audio_array.ndim > 1:
-        audio_mono = np.mean(audio_array, axis=1)
-    else:
-        audio_mono = audio_array
-    if sampling_rate != SAMPLE_RATE:
-        audio_mono = librosa.resample(audio_mono, orig_sr=sampling_rate, target_sr=SAMPLE_RATE)
-    return audio_mono
+# --- 4. 批量处理函数 ---
+def process_single_file(file_path):
+    # A. 加载音频并转为单声道 16kHz
+    audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
+
+    # B. 按照官方逻辑进行分帧 (解决 num_frames 未定义问题)
+    # 如果音频不足 2 秒，进行补齐
+    if len(audio) < FRAME_LENGTH:
+        audio = np.pad(audio, (0, FRAME_LENGTH - len(audio)), mode='constant')
+
+    # 使用 tf.signal.frame 将长音频切成 2 秒一段的 Batch [N, 32000]
+    # 这里 frame_step = FRAME_LENGTH 表示无重叠切割
+    audio_clips = tf.signal.frame(audio, FRAME_LENGTH, FRAME_LENGTH).numpy()
+
+    num_frames = audio_clips.shape[0]
+    all_patches = []
+
+    # C. 逐帧推理 (绕过模型内部 Reshape 限制)
+    for i in range(num_frames):
+        # 取出单帧 [1, 32000]
+        single_clip = audio_clips[i:i + 1]
+
+        # 调用推理接口，Key 必须是 'audio_wav'
+        output_dict = patch_infer(audio_wav=tf.constant(single_clip, dtype=tf.float32))
+
+        # 动态获取第一个输出 (解决 'output_0' KeyError)
+        # 官方子模型输出通常叫 'output_0' 或 'spectrogram'，这样写最保险
+        patch_data = list(output_dict.values())[0].numpy()
+        all_patches.append(patch_data)
+
+    # 合并成 [N, 190, 256]
+    return np.concatenate(all_patches, axis=0)
 
 
-# --- 5. 批量提取循环 ---
+# --- 5. 执行主循环 ---
 wav_files = sorted([f for f in os.listdir(WAV_DIR) if f.endswith('.wav')])
-print(f"🎬 开始处理 {len(wav_files)} 个音频，截取进入 Encoder 之前的 Patch...")
+print(f"🎬 开始处理 {len(wav_files)} 个文件，目标维度: (N, 190, 256)")
 
 for filename in tqdm(wav_files):
-    file_path = os.path.join(WAV_DIR, filename)
     save_path = os.path.join(SAVE_DIR, filename.replace('.wav', '.npy'))
-
     if os.path.exists(save_path): continue
 
     try:
-        # A. 加载与预处理
-        audio, sr = librosa.load(file_path, sr=None)
-        audio_16k = resample_audio_and_convert_to_mono(audio, sr)
-
-        # ... (前面的加载和 16k 转换保持不变) ...
-
-        # B. 补齐与分帧
-        # 注意：HeAR 前端通常期望略多于 32000 点（为了 STFT 边缘对齐）
-        # 我们按照报错提示的 32240 来补齐
-        TARGET_LEN = 32000
-        if len(audio_16k) < TARGET_LEN:
-            audio_16k = np.pad(audio_16k, (0, TARGET_LEN - len(audio_16k)), mode='constant')
-
-        # 将长音频切成片段 [N, 32240]
-        audio_clips = tf.signal.frame(audio_16k, TARGET_LEN, TARGET_LEN)
-
-        # C. 逐个片段提取 Patch
-        all_patches = []
-        for i in range(num_frames):
-            start = i * TARGET_LEN
-            end = start + TARGET_LEN
-            single_clip = audio_padded[start:end]
-
-            # 增加 Batch 维度变为 [1, 32000]
-            input_tensor = tf.constant(single_clip.reshape(1, -1), dtype=tf.float32)
-
-            # --- 核心修改位置 ---
-            # 1. 先拿到模型输出的字典
-            output_dict = patch_infer(audio_wav=input_tensor)
-
-            # 2. 动态提取字典里的第一个值（不管它的 Key 叫什么）
-            # 原来你是：patch_data = output['output_0'].numpy()
-            # 现在改成下面这两行：
-            val_list = list(output_dict.values())
-            patch_data = val_list[0].numpy()
-
-            all_patches.append(patch_data)
-            # --------------------
-
-        # D. 合并结果
-        final_patches = np.concatenate(all_patches, axis=0)
-        np.save(save_path, final_patches)
-
-        # E. 保存
+        final_patches = process_single_file(os.path.join(WAV_DIR, filename))
         np.save(save_path, final_patches)
     except Exception as e:
         print(f"❌ 文件 {filename} 处理失败: {str(e)}")
 
-print(f"✅ 处理完成！真正的 Patch 数据保存在: {SAVE_DIR}")
+print(f"✅ 处理完成！真正的 Patch 数据已存入: {SAVE_DIR}")
