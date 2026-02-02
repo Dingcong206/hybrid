@@ -106,47 +106,50 @@ def train_one_epoch(epoch):
 
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 
-def compute_metrics(y_true, y_prob, thr=0.5):
-    y_true = np.asarray(y_true).astype(int)
-    y_prob = np.asarray(y_prob).astype(float)
-    y_pred = (y_prob >= thr).astype(int)
+from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
+def validate(thr=0.5):
+    model.eval()
+    all_probs = []
+    all_labels = []
 
-    # SE = Recall(positive)
-    se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    recall = se
+    with torch.no_grad():
+        for feats, labels in tqdm(val_loader, desc="[Valid]"):
+            feats = feats.to(device)
+            labels = labels.to(device).long()
 
-    # SP = Specificity
-    sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            file_logit, _ = model(feats)
+            prob = torch.sigmoid(file_logit).detach()
 
-    # ICBHI score
-    icbhi = 0.5 * (se + sp)
+            all_probs.extend(prob.cpu().numpy().tolist())
+            all_labels.extend(labels.cpu().numpy().tolist())
 
-    # F1
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    # AUC（可能 NaN）
-    if len(np.unique(y_true)) == 2:
-        auc = roc_auc_score(y_true, y_prob)
-    else:
+    # ---- 指标计算 ----
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except Exception:
         auc = float("nan")
+
+    preds = [1 if p >= thr else 0 for p in all_probs]
+
+    f1 = f1_score(all_labels, preds, zero_division=0)
+
+    tn, fp, fn, tp = confusion_matrix(all_labels, preds, labels=[0, 1]).ravel()
+
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # Sensitivity / Recall
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # Specificity
+
+    icbhi = (se + sp) / 2.0   # ✅ 你的 ICBHI score
 
     return {
         "AUC": auc,
         "F1": f1,
-        "Recall": recall,
+        "Recall": se,   # ✅ 这里必须叫 Recall，否则你 print 会炸
         "SE": se,
         "SP": sp,
         "ICBHI": icbhi,
-        "TP": int(tp),
-        "TN": int(tn),
-        "FP": int(fp),
-        "FN": int(fn),
+        "TP": tp, "TN": tn, "FP": fp, "FN": fn
     }
-
-
 
 # ==========================================
 # 5. 主训练循环
@@ -175,7 +178,7 @@ try:
             print(f"🌟 新最优 ICBHI={best_icbhi:.4f}，已保存至: {checkpoint_path}")
 
 finally:
-    # 训练结束后清理临时文件（可选）
+    # 训练结束后清理临时文件
     if os.path.exists(train_csv_tmp): os.remove(train_csv_tmp)
     if os.path.exists(val_csv_tmp): os.remove(val_csv_tmp)
 
