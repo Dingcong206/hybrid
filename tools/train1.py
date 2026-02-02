@@ -1,3 +1,21 @@
+import sys
+import os
+
+
+# 1. 获取当前脚本 (train1.py) 的绝对路径
+current_script_path = os.path.abspath(__file__)
+
+# 2. 找到项目的根目录 (也就是 PythonProject 这一级)
+# 第一次 dirname 得到 tools/，第二次 dirname 得到 PythonProject/
+project_root = os.path.dirname(os.path.dirname(current_script_path))
+
+# 3. 将根目录加入 Python 搜索路径
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 4. 现在可以正确导入了（注意加上 mymodels 前缀）
+from mymodels.model import build_model
+from mymodels.dataset import RespiratoryDataset
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,8 +27,6 @@ from tqdm import tqdm
 
 # 导入你之前的定义
 # 向上退一级再进入文件夹导入
-from mymodels.model import build_model
-from mymodels.dataset import RespiratoryDataset
 # ==========================================
 # 1. 基础配置
 # ==========================================
