@@ -174,8 +174,17 @@ class SSA_Model_2k(nn.Module):
         x = self.norm(x)
 
         # ---- MIL head
-        logits = self.patch_head(x).squeeze(-1)  # (B, 2048)
-        file_logit, _ = torch.max(logits, dim=1) # (B,)
+        logits = self.patch_head(x).squeeze(-1)
+
+        # ---- 【改进点】Top-K 聚合策略 ----
+        # 计算需要取多少个点 (例如 2048 * 0.1 = 204个点)
+        k = int(T * self.topk_ratio)
+
+        # 对每个样本的 logits 进行排序，取最大的前 k 个
+        topk_logits, _ = torch.topk(logits, k, dim=1)
+
+        # 取均值作为文件级别的最终 Logit
+        file_logit = torch.mean(topk_logits, dim=1)  # (B,)
 
         return file_logit, logits
 
