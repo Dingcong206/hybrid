@@ -38,7 +38,7 @@ FBANK_STD = 4.57
 # =========================
 def lungsound_label(crackles: int, wheezes: int) -> int:
     crackles = int(crackles)
-    wheezes = int(wheeze := wheezes)
+    wheezes = int(wheezes)
     if crackles == 0 and wheezes == 0:
         return 0
     if crackles == 1 and wheezes == 0:
@@ -66,8 +66,8 @@ def find_official_split_file(data_dir: str) -> str:
         if c.exists():
             return str(c)
 
-    # fallback: recursive search (limited)
-    for c in list(p.rglob("official_split.txt"))[:10]:
+    # fallback: recursive search
+    for c in list(p.rglob("official_split.txt"))[:20]:
         return str(c)
 
     raise FileNotFoundError(
@@ -82,8 +82,9 @@ def find_official_split_file(data_dir: str) -> str:
 
 def load_official_split(split_path: str) -> Dict[str, str]:
     """
-    official_split.txt format:
-    <filename>   train/test   (tab or whitespace separated)
+    Make matching robust:
+    - Accept keys in split file as: 'xxx.wav' OR 'xxx' OR 'path/to/xxx.wav'
+    - Store BOTH: basename-with-ext AND stem-without-ext
     """
     mapping: Dict[str, str] = {}
     with open(split_path, "r", encoding="utf-8") as f:
@@ -91,13 +92,28 @@ def load_official_split(split_path: str) -> Dict[str, str]:
             line = line.strip()
             if not line:
                 continue
+
             parts = line.split("\t") if "\t" in line else line.split()
             if len(parts) < 2:
                 continue
-            fname = parts[0].strip()
+
+            raw = parts[0].strip()
             tag = parts[1].strip().lower()
-            if tag in ("train", "test"):
-                mapping[fname] = tag
+            if tag not in ("train", "test"):
+                continue
+
+            # normalize: drop directories
+            name = Path(raw).name               # xxx.wav OR xxx
+            stem = Path(name).stem              # xxx
+
+            # store multiple keys
+            mapping[name] = tag                 # xxx.wav OR xxx
+            mapping[stem] = tag                 # xxx
+
+            # if split file provides no extension, also register xxx.wav (common case)
+            if "." not in name:
+                mapping[f"{name}.wav"] = tag
+
     if not mapping:
         raise ValueError(f"official_split.txt 解析为空：{split_path}")
     return mapping
@@ -153,7 +169,7 @@ def fix_to_8s_trunc_or_repeat_fade(x: torch.Tensor, sr: int = SR) -> torch.Tenso
         ratio = math.ceil(TARGET_SAMPLES / max(1, x.shape[-1]))
         y = x.repeat(1, ratio)[..., :TARGET_SAMPLES]
 
-    fade_samples = int(sr / 16)  # ~62.5ms at 16k
+    fade_samples = int(sr / 16)  # ~62.5ms at 16kHz
     y = apply_fade_in_out(y, fade_samples)
     return y
 
@@ -191,7 +207,7 @@ def wav_to_fbank_798x128(wav_8s: torch.Tensor) -> np.ndarray:
         frame_shift=FRAME_SHIFT_MS     # 10ms
     )  # (T, 128)
 
-    # (x - mean) / std  (exactly as the paper sentence)
+    # paper sentence: standard normalization with mean/std
     fbank = (fbank - FBANK_MEAN) / FBANK_STD
 
     # force frames to 798
@@ -211,11 +227,10 @@ def wav_to_fbank_798x128(wav_8s: torch.Tensor) -> np.ndarray:
 # =========================
 def get_ast_projection_conv(ast_model: ASTModel):
     """
-    Robustly find the Conv2d projection module that maps spectrogram -> patch embeddings.
-    Different versions may name it slightly differently.
+    Find the Conv2d projection module mapping spectrogram -> patch embeddings.
+    HF AST commonly uses:
+      ast_model.embeddings.patch_embeddings.projection
     """
-    # Most common for HF AST:
-    # ast_model.embeddings.patch_embeddings.projection : Conv2d
     if hasattr(ast_model, "embeddings") and hasattr(ast_model.embeddings, "patch_embeddings"):
         pe = ast_model.embeddings.patch_embeddings
         if hasattr(pe, "projection"):
@@ -229,7 +244,7 @@ def get_ast_projection_conv(ast_model: ASTModel):
 def fbank_to_patch_tokens(ast_model: ASTModel, fbank_798x128: np.ndarray, device: torch.device) -> np.ndarray:
     """
     Input: fbank shape (798, 128) [time, mel]
-    AST patch projection expects image-like: (B, 1, freq, time) = (1,1,128,798)
+    AST patch projection expects: (B, 1, freq, time) = (1,1,128,798)
     Output: patch tokens (num_patches, hidden_dim) BEFORE encoder
     """
     # (time, mel) -> (mel, time)
@@ -237,7 +252,7 @@ def fbank_to_patch_tokens(ast_model: ASTModel, fbank_798x128: np.ndarray, device
     x = x.unsqueeze(0).unsqueeze(0).to(device)          # (1,1,128,798)
 
     conv = get_ast_projection_conv(ast_model)
-    y = conv(x)  # (B, hidden, f', t') usually
+    y = conv(x)  # (B, hidden, f', t')
 
     # flatten patches -> tokens
     y = y.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
@@ -249,9 +264,6 @@ def fbank_to_patch_tokens(ast_model: ASTModel, fbank_798x128: np.ndarray, device
 # Pair finding
 # =========================
 def find_wav_txt_pairs(data_dir: str) -> List[Tuple[str, str]]:
-    """
-    data_dir contains .wav and .txt with same stem
-    """
     root = Path(data_dir)
     wavs = {p.stem: str(p) for p in root.glob("*.wav")}
     txts = {p.stem: str(p) for p in root.glob("*.txt")}
@@ -275,8 +287,7 @@ def process_recording_to_tokens(
     wav+txt -> cycle slicing -> 8s fix -> fbank -> AST patch projection tokens -> save npy
     """
     wav = load_wav_resample_mono(wav_path, SR)
-    # optional: fade entire recording edges slightly
-    wav = apply_fade_in_out(wav, int(SR / 16))
+    wav = apply_fade_in_out(wav, int(SR / 16))  # slight fade on whole recording
 
     ann = read_cycle_txt(txt_path)
     base = Path(wav_path).stem
@@ -331,10 +342,11 @@ def main():
                         help="可选：手动指定 official_split.txt 路径；不填则自动搜索")
     parser.add_argument("--ast_model", type=str, default="MIT/ast-finetuned-audioset-10-10-0.4593",
                         help="HuggingFace AST 模型名或本地路径（已下载模型目录）")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="cuda 或 cpu")
+    parser.add_argument("--device", type=str, default="cuda", help="cuda 或 cpu")
     parser.add_argument("--save_fbank", action="store_true",
                         help="同时保存 fbank（可选，默认只保存 tokens）")
+    parser.add_argument("--local_files_only", action="store_true",
+                        help="只从本地缓存加载 HF 模型（服务器不能联网时用）")
     args = parser.parse_args()
 
     # device
@@ -354,7 +366,7 @@ def main():
     # official split
     split_path = args.split_file.strip() if args.split_file.strip() else find_official_split_file(args.data_dir)
     split_map = load_official_split(split_path)
-    print(f"[INFO] official split file: {split_path} (entries={len(split_map)})")
+    print(f"[INFO] official split file: {split_path} (keys={len(split_map)})")
 
     # pairs
     pairs = find_wav_txt_pairs(args.data_dir)
@@ -362,9 +374,14 @@ def main():
         raise FileNotFoundError(f"在 {args.data_dir} 没找到 wav/txt 配对文件。")
     print(f"[INFO] found wav/txt pairs: {len(pairs)}")
 
+    # debug: check intersection quickly
+    wav_names = [Path(w).name for w, _ in pairs]
+    hit = sum([(n in split_map) or (Path(n).stem in split_map) for n in wav_names])
+    print(f"[DEBUG] split match hits: {hit}/{len(wav_names)} (should be close to total)")
+
     # load AST
     print(f"[INFO] loading AST model: {args.ast_model}")
-    ast = ASTModel.from_pretrained(args.ast_model)
+    ast = ASTModel.from_pretrained(args.ast_model, local_files_only=args.local_files_only)
     ast.eval().to(device)
 
     train_rows: List[dict] = []
@@ -372,19 +389,17 @@ def main():
     skipped_no_split = 0
 
     for wav_path, txt_path in pairs:
-        wav_name = Path(wav_path).name  # includes .wav
+        wav_name = Path(wav_path).name
+        wav_stem = Path(wav_path).stem
 
-        # official_split usually includes ".wav"
-        if wav_name not in split_map:
-            # try stem.wav fallback
-            alt = Path(wav_path).stem + ".wav"
-            if alt in split_map:
-                wav_name = alt
-            else:
-                skipped_no_split += 1
-                continue
+        tag = split_map.get(wav_name, None)
+        if tag is None:
+            tag = split_map.get(wav_stem, None)
 
-        tag = split_map[wav_name]  # train/test
+        if tag is None:
+            skipped_no_split += 1
+            continue
+
         out_dir = train_out if tag == "train" else test_out
 
         rows = process_recording_to_tokens(
@@ -416,7 +431,7 @@ def main():
     print(f"[DONE] test_index.csv : {test_csv}")
 
     if skipped_no_split > 0:
-        print(f"[WARN] skipped {skipped_no_split} recordings (not listed in official_split.txt)")
+        print(f"[WARN] skipped {skipped_no_split} recordings (not listed in official_split.txt after normalization)")
 
     if len(train_df) > 0:
         print("\n[STATS] Train label counts:")
