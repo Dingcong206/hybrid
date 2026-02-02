@@ -122,9 +122,8 @@ class SSA_Layer(nn.Module):
 # 5) 最终模型：两次×4 下采样 -> 2048
 # =====================================================
 class SSA_Model_2k(nn.Module):
-    def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8,topk_ratio=0.1):
+    def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8):
         super().__init__()
-        self.topk_ratio = topk_ratio
         # 两次 factor=4：32768 -> 8192 -> 2048
         self.down1 = Downsampler(d_model=in_dim, factor=4)
         self.down2 = Downsampler(d_model=in_dim, factor=4)
@@ -140,52 +139,57 @@ class SSA_Model_2k(nn.Module):
         ])
 
         self.norm = nn.LayerNorm(d_model)
+
+        # --- Attention Pooling 层 ---
+        # 用于计算每个 patch 的重要程度分数
+        self.attention_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+        # 最终分类头
+        self.classifier = nn.Linear(d_model, 1)
+        # 保留 patch_head 用于辅助输出 logits (可选)
         self.patch_head = nn.Linear(d_model, 1)
 
     def forward(self, x, mask=None):
-        """
-        x: (B, 32768, 256)
-        mask: (B, 32768) bool (可选)
-        return:
-          file_logit: (B,)
-          logits: (B, 2048)
-        """
-
-        # ---- 下采样 1：-> 8192
+        # 1. 下采样过程 (保持不变)
         x = self.down1(x)
-        if mask is not None:
-            mask = mask[:, ::4]
-
-        # ---- 下采样 2：-> 2048
+        if mask is not None: mask = mask[:, ::4]
         x = self.down2(x)
-        if mask is not None:
-            mask = mask[:, ::4]   # 再 /4，总共 /16
+        if mask is not None: mask = mask[:, ::4]
 
-        # ---- proj + pos
-        x = self.input_proj(x)    # (B, 2048, d_model)
+        # 2. 特征提取 (保持不变)
+        x = self.input_proj(x)
         B, T, D = x.shape
         pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)
         x = x + pos
 
-        # ---- backbone
         for layer in self.layers:
             x = layer(x, mask=mask)
+        x = self.norm(x)  # (B, 2048, 256)
 
-        x = self.norm(x)
+        # 3. --- 修改点：Attention Pooling ---
+        # 计算注意力权重
+        attn_weights = self.attention_net(x)  # (B, 2048, 1)
 
+        # 如果有 mask，将 padding 部分权重设为极小值
+        if mask is not None:
+            attn_weights = attn_weights.masked_fill(mask.unsqueeze(-1), -1e9)
 
-        # ---- 【改进点】Top-K 聚合策略 ----
-        # 计算需要取多少个点 (例如 2048 * 0.1 = 204个点)
-        k = int(T * self.topk_ratio)
+        attn_weights = torch.softmax(attn_weights, dim=1)  # 归一化权重
 
-        # 对每个样本的 logits 进行排序，取最大的前 k 个
-        topk_logits, _ = torch.topk(logits, k, dim=1)
+        # 加权求和得到文件级特征
+        file_feature = torch.sum(attn_weights * x, dim=1)  # (B, 256)
 
-        # 取均值作为文件级别的最终 Logit
-        file_logit = torch.mean(topk_logits, dim=1)  # (B,)
+        # 得到文件级别的预测
+        file_logit = self.classifier(file_feature).squeeze(-1)  # (B,)
+
+        # 得到局部 patch 的预测 (用于监控或弱监督)
+        logits = self.patch_head(x).squeeze(-1)  # (B, 2048)
 
         return file_logit, logits
-
 
 # =====================================================
 # 6) build_model
