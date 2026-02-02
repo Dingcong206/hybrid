@@ -5,44 +5,55 @@ from mamba_ssm import Mamba
 
 
 # =====================================================
-# 1. 辅助模块：位置编码
+# 1) 位置编码
 # =====================================================
 def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
     pe = torch.zeros(seq_len, dim, device=device)
     position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (
-                -torch.log(torch.tensor(10000.0, device=device)) / dim))
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+        * (-torch.log(torch.tensor(10000.0, device=device)) / dim)
+    )
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
 
 
 # =====================================================
-# 2. 核心模块：4倍下采样器 (32768 -> 8192)
+# 2) 可配置下采样器：factor=4 / 8 / 16 ...
+#    这里我们用 factor=4，叠两次得到 16x
 # =====================================================
 class Downsampler(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model: int, factor: int = 4):
         super().__init__()
-        # 路径1：卷积学习下采样
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=4, stride=4)
-        # 路径2：最大池化保留异常突发音（如爆裂音）
-        self.maxpool = nn.MaxPool1d(kernel_size=4, stride=4)
+        self.factor = factor
 
+        # 路径1：卷积下采样
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=factor, stride=factor)
+
+        # 路径2：最大池化下采样（保留突发峰值）
+        self.maxpool = nn.MaxPool1d(kernel_size=factor, stride=factor)
+
+        # 融合
         self.fuse = nn.Linear(d_model * 2, d_model)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x):
-        # x: (B, T, D) -> (B, D, T)
-        x_raw = x.transpose(1, 2)
-        x1 = self.conv(x_raw)
-        x2 = self.maxpool(x_raw)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, D)
+        return: (B, T/factor, D)
+        """
+        x_raw = x.transpose(1, 2)  # (B, D, T)
+        x1 = self.conv(x_raw)      # (B, D, T/f)
+        x2 = self.maxpool(x_raw)   # (B, D, T/f)
 
-        x_fused = torch.cat([x1, x2], dim=1).transpose(1, 2)
-        return self.norm(self.fuse(x_fused))
+        x_fused = torch.cat([x1, x2], dim=1).transpose(1, 2)  # (B, T/f, 2D)
+        x_fused = self.fuse(x_fused)                          # (B, T/f, D)
+        return self.norm(x_fused)
 
 
 # =====================================================
-# 3. 核心模块：双向 Mamba 块
+# 3) 双向 Mamba
 # =====================================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2):
@@ -58,19 +69,18 @@ class BiMambaBlock(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
         h = self.ln1(x)
-        # 并行计算双向 Mamba 增加上下文理解
         h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h)
         return x + self.mlp(self.ln2(x))
 
 
 # =====================================================
-# 4. 核心模块：SSA 层 (Conv + Mamba + Attention)
+# 4) SSA 层
 # =====================================================
 class SSA_Layer(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
@@ -78,7 +88,7 @@ class SSA_Layer(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
             nn.BatchNorm1d(d_model),
-            nn.GELU()
+            nn.GELU(),
         )
         self.mamba = BiMambaBlock(d_model, dropout=dropout)
         self.attn_ln = nn.LayerNorm(d_model)
@@ -86,73 +96,95 @@ class SSA_Layer(nn.Module):
         self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
 
     def forward(self, x, mask=None):
+        """
+        x: (B, T, D)
+        mask: (B, T) bool, True=PAD (key_padding_mask 的语义)
+        """
         res = x
-        # 1. 局部特征提取
+
+        # local
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
-        # 2. 序列建模
+
+        # sequence modeling
         x = self.mamba(x)
-        # 3. 全局注意力
+
+        # global attention
         x_n = self.attn_ln(x)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
+        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask, need_weights=False)
         x = x + x_a
-        # 4. 门控残差
+
+        # gated residual
         g = self.gate(x.mean(dim=1, keepdim=True))
         return res + g * x
 
 
 # =====================================================
-# 5. 最终模型定义
+# 5) 最终模型：两次×4 下采样 -> 2048
 # =====================================================
-class SSA_Model_8k(nn.Module):
+class SSA_Model_2k(nn.Module):
     def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8):
         super().__init__()
-        self.downsampler = Downsampler(d_model=in_dim)
+
+        # 两次 factor=4：32768 -> 8192 -> 2048
+        self.down1 = Downsampler(d_model=in_dim, factor=4)
+        self.down2 = Downsampler(d_model=in_dim, factor=4)
+
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, d_model),
             nn.GELU(),
-            nn.LayerNorm(d_model)
+            nn.LayerNorm(d_model),
         )
+
         self.layers = nn.ModuleList([
             SSA_Layer(d_model=d_model, nhead=nhead) for _ in range(n_layers)
         ])
+
         self.norm = nn.LayerNorm(d_model)
         self.patch_head = nn.Linear(d_model, 1)
 
     def forward(self, x, mask=None):
         """
-        Input x: (B, 32768, 256)
+        x: (B, 32768, 256)
+        mask: (B, 32768) bool (可选)
+        return:
+          file_logit: (B,)
+          logits: (B, 2048)
         """
-        # 1. 4倍下采样 -> (B, 8192, 256)
-        x = self.downsampler(x)
 
-        # 2. 映射与位置编码
-        x = self.input_proj(x)
+        # ---- 下采样 1：-> 8192
+        x = self.down1(x)
+        if mask is not None:
+            mask = mask[:, ::4]
+
+        # ---- 下采样 2：-> 2048
+        x = self.down2(x)
+        if mask is not None:
+            mask = mask[:, ::4]   # 再 /4，总共 /16
+
+        # ---- proj + pos
+        x = self.input_proj(x)    # (B, 2048, d_model)
         B, T, D = x.shape
         pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)
         x = x + pos
 
-        # 3. 同步下采样 Mask
-        if mask is not None:
-            mask = mask[:, ::4]
-
-        # 4. SSA 主干
+        # ---- backbone
         for layer in self.layers:
             x = layer(x, mask=mask)
 
         x = self.norm(x)
 
-        # 5. 输出：用于多实例学习 (MIL)
-        logits = self.patch_head(x).squeeze(-1)  # (B, 8192)
-        file_logit, _ = torch.max(logits, dim=1)
+        # ---- MIL head
+        logits = self.patch_head(x).squeeze(-1)  # (B, 2048)
+        file_logit, _ = torch.max(logits, dim=1) # (B,)
 
         return file_logit, logits
 
 
 # =====================================================
-# 6. 模型构建函数
+# 6) build_model
 # =====================================================
 def build_model(in_dim=256, d_model=256, n_layers=4, nhead=8):
-    model = SSA_Model_8k(in_dim, d_model, n_layers, nhead)
+    model = SSA_Model_2k(in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead)
     params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA Model Initialized. Parameters: {params:,}")
+    print(f"✅ SSA Model (2k) Initialized. Parameters: {params:,}")
     return model
