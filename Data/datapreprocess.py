@@ -329,7 +329,7 @@ def main():
                         help="输出目录：train/ test/ + index csv")
     parser.add_argument("--split_file", type=str, default="",
                         help="可选：手动指定 official_split.txt 路径；不填则自动搜索")
-    parser.add_argument("--ast_model", type=str, default="MIT/ast-finetuned-audioset-10-10-0",
+    parser.add_argument("--ast_model", type=str, default="MIT/ast-finetuned-audioset-10-10-0.4593",
                         help="HuggingFace AST 模型名或本地路径（已下载模型目录）")
     parser.add_argument("--device", type=str, default="cuda",
                         help="cuda 或 cpu")
