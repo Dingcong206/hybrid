@@ -323,7 +323,7 @@ def process_recording_to_tokens(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_file",
+    parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_files",
                         help="包含 ICBHI .wav + .txt 的目录（同名配对）")
     parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="输出目录：train/ test/ + index csv")
