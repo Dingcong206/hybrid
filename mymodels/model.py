@@ -122,9 +122,8 @@ class SSA_Layer(nn.Module):
 # 5) 最终模型：两次×4 下采样 -> 2048
 # =====================================================
 class SSA_Model_2k(nn.Module):
-    def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8,topk_ratio=0.1):
+    def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8):
         super().__init__()
-        self.topk_ratio = topk_ratio
         # 两次 factor=4：32768 -> 8192 -> 2048
         self.down1 = Downsampler(d_model=in_dim, factor=4)
         self.down2 = Downsampler(d_model=in_dim, factor=4)
@@ -173,8 +172,6 @@ class SSA_Model_2k(nn.Module):
 
         x = self.norm(x)
 
-        # ---- MIL head
-        logits = self.patch_head(x).squeeze(-1)
 
         # ---- 【改进点】Top-K 聚合策略 ----
         # 计算需要取多少个点 (例如 2048 * 0.1 = 204个点)
