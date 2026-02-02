@@ -1,49 +1,65 @@
 import sys
 import os
-
-
-# 1. 获取当前脚本 (train1.py) 的绝对路径
-current_script_path = os.path.abspath(__file__)
-
-# 2. 找到项目的根目录 (也就是 PythonProject 这一级)
-# 第一次 dirname 得到 tools/，第二次 dirname 得到 PythonProject/
-project_root = os.path.dirname(os.path.dirname(current_script_path))
-
-# 3. 将根目录加入 Python 搜索路径
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-# 4. 现在可以正确导入了（注意加上 mymodels 前缀）
-from mymodels.model import build_model
-from mymodels.dataset import RespiratoryDataset
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score, f1_score
+import pandas as pd
 import numpy as np
-import os
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score,confusion_matrix
 from tqdm import tqdm
 
-# 导入你之前的定义
-# 向上退一级再进入文件夹导入
+
+# ==========================================
+# 0. 路径修正逻辑
+# ==========================================
+current_script_path = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(current_script_path))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 现在可以正确导入了
+from mymodels.model import build_model
+from mymodels.dataset import RespiratoryDataset
+
 # ==========================================
 # 1. 基础配置
 # ==========================================
+# --- 请根据你的实际情况修改以下路径 ---
+TOTAL_CSV_PATH = "/data/dingcong/hybrid/labels.csv" # 你的总CSV路径
+FEAT_DIR = "/data/dingcong/hybrid/hear_16x256_fixed"           # 你的特征文件夹
+SAVE_DIR = "./checkpoints"
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EPOCHS = 50
-BATCH_SIZE = 2  # 32k序列较长，建议先设为2
+BATCH_SIZE = 2
 LR = 1e-4
-SAVE_DIR = "./checkpoints"
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ==========================================
-# 2. 数据准备
+# 2. 数据切分与准备
 # ==========================================
-# 假设你已经把 CSV 拆分成了 train.csv 和 val.csv
-train_ds = RespiratoryDataset(csv_path="train.csv", feat_dir="/data/dingcong/hybrid/hear_16x256_fixed")
-val_ds = RespiratoryDataset(csv_path="val.csv", feat_dir="/data/dingcong/hybrid/labels")
+# 读取总表
+full_df = pd.read_csv(TOTAL_CSV_PATH)
 
+# 自动划分：80% 训练, 20% 验证 (random_state 保证实验可重复)
+train_df, val_df = train_test_split(full_df, test_size=0.2, random_state=42)
+
+# 为了配合你之前写的 Dataset 类（它接收 CSV 路径），我们生成两个临时 CSV
+train_csv_tmp = "train_split_tmp.csv"
+val_csv_tmp = "val_split_tmp.csv"
+train_df.to_csv(train_csv_tmp, index=False)
+val_df.to_csv(val_csv_tmp, index=False)
+
+print(f"📊 数据划分完成: 训练集 {len(train_df)} 样本, 验证集 {len(val_df)} 样本")
+
+# 实例化 Dataset
+train_ds = RespiratoryDataset(csv_path=train_csv_tmp, feat_dir=FEAT_DIR)
+val_ds = RespiratoryDataset(csv_path=val_csv_tmp, feat_dir=FEAT_DIR)
+
+# 实例化 DataLoader
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
@@ -52,18 +68,17 @@ val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_worker
 # ==========================================
 model = build_model(in_dim=256, d_model=256, n_layers=4).to(device)
 
-# 二分类交叉熵损失 (带 Logits 稳定性更好)
+# 二分类交叉熵损失
 criterion = nn.BCEWithLogitsLoss()
 
-# AdamW 是训练 Mamba/Transformer 类模型的首选
+# 优化器
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
 # 混合精度加速器 (节省显存)
 scaler = torch.cuda.amp.GradScaler()
 
-
 # ==========================================
-# 4. 训练与验证逻辑
+# 4. 训练与验证函数
 # ==========================================
 
 def train_one_epoch(epoch):
@@ -74,59 +89,94 @@ def train_one_epoch(epoch):
     for feats, labels in pbar:
         feats, labels = feats.to(device), labels.to(device).float()
 
-        # 使用自动混合精度
         with torch.cuda.amp.autocast():
-            # file_logit 是全文件的预测，patch_logits 是每个点的预测
             file_logit, _ = model(feats)
-            loss = criterion(file_logit, labels)
+            # 确保 file_logit 形状与 labels 一致 (B,)
+            loss = criterion(file_logit.view(-1), labels)
 
         optimizer.zero_grad()
-        scaler.scale(loss).backward()  # 缩放梯度
-        scaler.step(optimizer)  # 更新参数
-        scaler.update()  # 更新缩放因子
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         pbar.set_postfix(loss=loss.item())
 
     return total_loss / len(train_loader)
 
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 
-def validate():
-    model.eval()
-    all_preds = []
-    all_labels = []
+def compute_metrics(y_true, y_prob, thr=0.5):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    y_pred = (y_prob >= thr).astype(int)
 
-    with torch.no_grad():
-        for feats, labels in tqdm(val_loader, desc="[Valid]"):
-            feats = feats.to(device)
-            file_logit, _ = model(feats)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
 
-            # 记录预测概率 (Sigmoid 之后) 和 真实标签
-            prob = torch.sigmoid(file_logit)
-            all_preds.extend(prob.cpu().numpy())
-            all_labels.extend(labels.numpy())
+    # SE = Recall(positive)
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    recall = se
 
-    # 计算医学任务的核心指标：AUC
-    auc = roc_auc_score(all_labels, all_preds)
-    # 计算 F1 Score (需要把概率转成 0 或 1)
-    preds_binary = [1 if p > 0.5 else 0 for p in all_preds]
-    f1 = f1_score(all_labels, preds_binary)
+    # SP = Specificity
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
 
-    return auc, f1
+    # ICBHI score
+    icbhi = 0.5 * (se + sp)
+
+    # F1
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    # AUC（可能 NaN）
+    if len(np.unique(y_true)) == 2:
+        auc = roc_auc_score(y_true, y_prob)
+    else:
+        auc = float("nan")
+
+    return {
+        "AUC": auc,
+        "F1": f1,
+        "Recall": recall,
+        "SE": se,
+        "SP": sp,
+        "ICBHI": icbhi,
+        "TP": int(tp),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+    }
+
 
 
 # ==========================================
-# 5. 主循环
+# 5. 主训练循环
 # ==========================================
-best_auc = 0
-for epoch in range(1, EPOCHS + 1):
-    avg_loss = train_one_epoch(epoch)
-    val_auc, val_f1 = validate()
+best_icbhi = -1
+print("🚀 开始训练...")
 
-    print(f"--- Epoch {epoch} Results: Loss: {avg_loss:.4f} | AUC: {val_auc:.4f} | F1: {val_f1:.4f} ---")
+try:
+    for epoch in range(1, EPOCHS + 1):
+        avg_loss = train_one_epoch(epoch)
+        metrics = validate(thr=0.5)
 
-    # 只要 AUC 有提升就保存模型
-    if val_auc > best_auc:
-        best_auc = val_auc
-        torch.save(model.state_state_dict(), os.path.join(SAVE_DIR, "best_model.pth"))
-        print(f"🌟 New Best AUC! Model saved.")
+        print(
+            f"✅ Epoch {epoch} 总结: Loss: {avg_loss:.4f} | "
+            f"ICBHI: {metrics['ICBHI']:.4f} | "
+            f"SE: {metrics['SE']:.4f} | SP: {metrics['SP']:.4f} | "
+            f"AUC: {metrics['AUC']:.4f} | F1: {metrics['F1']:.4f} | Recall: {metrics['Recall']:.4f} | "
+            f"TP:{metrics['TP']} TN:{metrics['TN']} FP:{metrics['FP']} FN:{metrics['FN']}"
+        )
+
+        # ✅ 用 ICBHI 作为最优指标保存
+        if metrics["ICBHI"] > best_icbhi:
+            best_icbhi = metrics["ICBHI"]
+            checkpoint_path = os.path.join(SAVE_DIR, "best_model.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"🌟 新最优 ICBHI={best_icbhi:.4f}，已保存至: {checkpoint_path}")
+
+finally:
+    # 训练结束后清理临时文件（可选）
+    if os.path.exists(train_csv_tmp): os.remove(train_csv_tmp)
+    if os.path.exists(val_csv_tmp): os.remove(val_csv_tmp)
+
+print("🏁 训练结束!")
