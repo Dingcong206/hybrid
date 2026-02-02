@@ -56,3 +56,39 @@ def check_features():
     token_energy = np.linalg.norm(data, axis=1)
 
     plt.subplot(2, 1, 2)
+    plt.plot(token_energy[:2048], color='blue', alpha=0.7)
+    plt.title("Token Energy Curve (Temporal Continuity Check)")
+    plt.ylabel("L2 Norm")
+    plt.xlabel("Tokens")
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_REPORT_DIR, "feature_detail.png"))
+    print(f"✅ 细节热图已保存至: {SAVE_REPORT_DIR}/feature_detail.png")
+
+    # --- 4. 统计分布检查 ---
+    plt.figure(figsize=(10, 5))
+    plt.hist(data.flatten(), bins=100, color='green', alpha=0.6)
+    plt.title("Overall Value Distribution")
+    plt.yscale('log')  # 对数坐标查看长尾分布
+    plt.xlabel("Value")
+    plt.ylabel("Frequency (Log Scale)")
+    plt.savefig(os.path.join(SAVE_REPORT_DIR, "value_distribution.png"))
+    print(f"✅ 数值分布图已保存至: {SAVE_REPORT_DIR}/value_distribution.png")
+
+    # --- 5. 跨文件一致性快速扫描 ---
+    print("\n--- 跨文件一致性检查 ---")
+    shapes = []
+    for f in files[:20]:  # 扫描前 20 个
+        d = np.load(os.path.join(FEAT_DIR, f))
+        shapes.append(d.shape)
+
+    unique_shapes = set(shapes)
+    if len(unique_shapes) == 1:
+        print(f"✅ 维度一致性检查通过: 所有文件均为 {list(unique_shapes)[0]}")
+    else:
+        print(f"⚠️ 警告：发现多种维度，请检查提取逻辑！ {unique_shapes}")
+
+
+if __name__ == "__main__":
+    check_features()
