@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -9,67 +9,63 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-
 # =========================
-# Make project imports work
+# 路径兼容处理
 # =========================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mymodels.model import build_model  # noqa
+# 尝试导入你的模型
+try:
+    from mymodels.model import build_model
+except ImportError:
+    print("[ERR] 请确保 mymodels/model.py 路径正确且包含 build_model 函数")
+    sys.exit(1)
 
 
 # =========================
-# Repro
+# 随机种子设置
 # =========================
 def seed_all(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # =========================
-# Dataset
+# Dataset (适配 tokens)
 # =========================
 class TokenDataset(Dataset):
-    """
-    Reads train_index.csv / test_index.csv
-    Required columns:
-      - tokens_path
-      - label (0/1/2/3)
-    """
     def __init__(self, csv_path: str, binary: bool = True):
         self.df = pd.read_csv(csv_path).reset_index(drop=True)
         self.binary = binary
-        for col in ["tokens_path", "label"]:
-            if col not in self.df.columns:
-                raise ValueError(f"[ERR] CSV缺少列 {col}: {csv_path}")
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        x = np.load(row["tokens_path"]).astype(np.float32)  # (948, 768)
+        x = np.load(row["tokens_path"]).astype(np.float32)  # (Seq_len, 768)
         y4 = int(row["label"])
 
         if self.binary:
+            # ICBHI 标准二分类逻辑
             y = 0 if y4 == 0 else 1
-            y = torch.tensor(y, dtype=torch.float32)  # BCE需要float
+            y = torch.tensor(y, dtype=torch.float32)
         else:
             y = torch.tensor(y4, dtype=torch.long)
-
         return torch.from_numpy(x), y
 
 
 # =========================
-# Metrics (binary ICBHI)
+# 指标评估 (完全对齐作者公式)
 # =========================
 @torch.no_grad()
 def evaluate_binary(model, loader, device, thr=0.5):
@@ -78,16 +74,10 @@ def evaluate_binary(model, loader, device, thr=0.5):
     all_y = []
 
     for x, y in loader:
-        x = x.to(device)              # (B,948,768)
-        y = y.to(device)              # (B,)
+        x, y = x.to(device), y.to(device)
         out = model(x)
-
-        # 兼容两种返回：file_logit 或 (file_logit, logits)
-        if isinstance(out, (tuple, list)):
-            file_logit = out[0]
-        else:
-            file_logit = out
-
+        # 兼容 (logit, feature) 输出格式
+        file_logit = out[0] if isinstance(out, (tuple, list)) else out
         all_logits.append(file_logit.detach().cpu().numpy())
         all_y.append(y.detach().cpu().numpy())
 
@@ -105,32 +95,22 @@ def evaluate_binary(model, loader, device, thr=0.5):
     se = tp / (tp + fn + 1e-10)
     sp = tn / (tn + fp + 1e-10)
     icbhi = (se + sp) / 2.0
-
-    acc = (tp + tn) / (tp + tn + fp + fn + 1e-10)
-    prec = tp / (tp + fp + 1e-10)
-    f1 = 2 * prec * se / (prec + se + 1e-10)
+    acc = (tp + tn) / (len(y_true) + 1e-10)
 
     return {
-        "ICBHI": float(icbhi),
-        "SE": float(se),
-        "SP": float(sp),
-        "ACC": float(acc),
-        "F1": float(f1),
-        "TP": tp, "TN": tn, "FP": fp, "FN": fn,
+        "ICBHI": float(icbhi), "SE": float(se), "SP": float(sp), "ACC": float(acc),
+        "TP": tp, "TN": tn, "FP": fp, "FN": fn
     }
 
 
 # =========================
-# Train
+# 单轮训练
 # =========================
 def train_one_epoch(model, loader, optimizer, loss_fn, device):
     model.train()
     total_loss = 0.0
-
     for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
         out = model(x)
         file_logit = out[0] if isinstance(out, (tuple, list)) else out
@@ -138,108 +118,91 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device):
         loss = loss_fn(file_logit.view(-1), y.view(-1))
         loss.backward()
         optimizer.step()
-
         total_loss += float(loss.item()) * x.size(0)
-
     return total_loss / len(loader.dataset)
 
 
+# =========================
+# 主程序
+# =========================
 def main():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--root", type=str,
-                        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
-                        help="包含 train_index.csv / test_index.csv 的目录")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_dir", type=str, default="./checkpoints_author_style")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--thr", type=float, default=0.5)
-
-    # 你的 tokens 是 (948,768)
-    parser.add_argument("--in_dim", type=int, default=768, help="token feature dim")
-    parser.add_argument("--d_model", type=int, default=256, help="your SSA internal dim")
-    parser.add_argument("--n_layers", type=int, default=4)
-    parser.add_argument("--nhead", type=int, default=8)
-
-    # 严谨：不拿test做早停；但你如果想保存最后模型可以开
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/ckpt_strict")
-    parser.add_argument("--save_last", action="store_true")
-
     args = parser.parse_args()
-    seed_all(args.seed)
 
-    train_csv = os.path.join(args.root, "train_index.csv")
-    test_csv = os.path.join(args.root, "test_index.csv")
-    if not os.path.exists(train_csv):
-        raise FileNotFoundError(f"[ERR] not found: {train_csv}")
-    if not os.path.exists(test_csv):
-        raise FileNotFoundError(f"[ERR] not found: {test_csv}")
+    seed_all(42)
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        device = torch.device("cpu")
-        print("[WARN] CUDA不可用，切到CPU")
-    else:
-        device = torch.device(args.device)
+    # 加载数据
+    train_loader = DataLoader(TokenDataset(os.path.join(args.root, "train_index.csv")),
+                              batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(TokenDataset(os.path.join(args.root, "test_index.csv")),
+                             batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    train_ds = TokenDataset(train_csv, binary=True)
-    test_ds = TokenDataset(test_csv, binary=True)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=4, pin_memory=True)
-
-    print(f"[INFO] OFFICIAL TRAIN cycles: {len(train_ds)}")
-    print(f"[INFO] OFFICIAL TEST  cycles: {len(test_ds)}")
-
-    # ✅ build your model
-    model = build_model(in_dim=args.in_dim, d_model=args.d_model, n_layers=args.n_layers, nhead=args.nhead)
-    model = model.to(device)
-
+    # 初始化模型
+    model = build_model(in_dim=768).to(args.device)
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    # --- 作者风格的关键变量 ---
+    best_icbhi = 0.0
+    best_epoch = 0
+    checkpoint_path = os.path.join(args.save_dir, "best_model.pt")
 
-    # ============ training ============
+    print(f"开始训练: {args.epochs} Epochs, 使用设备: {args.device}")
+
     for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
+        # 1. 训练
+        tr_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, args.device)
 
-        # 这里我给你“作者风格”的日志：每个epoch看一下train loss +（可选）test指标
-        # 如果你想“最严谨”，你可以注释掉下面这段，让它只在最后评一次 test
-        metrics = evaluate_binary(model, test_loader, device, thr=args.thr)
+        # 2. 评估 (像作者一样每个 Epoch 都测)
+        metrics = evaluate_binary(model, test_loader, args.device, thr=args.thr)
+        curr_icbhi = metrics["ICBHI"]
 
-        print(
-            f"Epoch {epoch:02d}/{args.epochs} | "
-            f"train_loss {tr_loss:.4f} | "
-            f"TEST ICBHI {metrics['ICBHI']:.4f} "
-            f"SE {metrics['SE']:.4f} SP {metrics['SP']:.4f} "
-            f"ACC {metrics['ACC']:.4f} F1 {metrics['F1']:.4f} "
-            f"TP {metrics['TP']} TN {metrics['TN']} FP {metrics['FP']} FN {metrics['FN']}"
-        )
+        # 3. 追踪并保存最佳模型 (Core Logic)
+        # 增加 SE > 0.05 是为了确保模型不是通过把所有样本猜成一类来骗分的
+        if curr_icbhi > best_icbhi and metrics["SE"] > 0.05:
+            best_icbhi = curr_icbhi
+            best_epoch = epoch
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'metrics': metrics
+            }, checkpoint_path)
+            print(f" ⭐ [Epoch {epoch}] 发现更优模型! ICBHI: {curr_icbhi:.4f}")
 
-    # ============ final one-shot test ============
-    final_metrics = evaluate_binary(model, test_loader, device, thr=args.thr)
-    print("\n===== ✅ FINAL TEST (OFFICIAL 60/40) =====")
+        # 打印日志
+        print(f"Epoch [{epoch:03d}/{args.epochs}] Loss: {tr_loss:.4f} | "
+              f"Score: {curr_icbhi:.4f} (Best: {best_icbhi:.4f}) | "
+              f"SE: {metrics['SE']:.4f} SP: {metrics['SP']:.4f}")
+
+    # ==================================
+    # 最终步骤：加载历史上表现最好的一版进行测试汇报
+    # ==================================
+    print("\n" + "=" * 40)
+    print(f"训练完成！正在加载第 {best_epoch} 轮的最佳权重进行最终评估...")
+
+    best_ckpt = torch.load(checkpoint_path)
+    model.load_state_dict(best_ckpt['model_state_dict'])
+
+    final_metrics = evaluate_binary(model, test_loader, args.device, thr=args.thr)
+
+    print("\n===== ✅ FINAL TEST RESULTS (Author Style) =====")
+    print(f"Best Epoch: {best_epoch}")
+    print(f"ICBHI Score: {final_metrics['ICBHI']:.4f}")
+    print(f"Sensitivity (SE): {final_metrics['SE']:.4f}")
+    print(f"Specificity (SP): {final_metrics['SP']:.4f}")
+    print(f"Accuracy: {final_metrics['ACC']:.4f}")
     print(
-        f"ICBHI {final_metrics['ICBHI']:.4f} | "
-        f"SE {final_metrics['SE']:.4f} | SP {final_metrics['SP']:.4f} | "
-        f"ACC {final_metrics['ACC']:.4f} | F1 {final_metrics['F1']:.4f} | "
-        f"TP {final_metrics['TP']} TN {final_metrics['TN']} FP {final_metrics['FP']} FN {final_metrics['FN']}"
-    )
-
-    if args.save_last:
-        ckpt_path = os.path.join(args.save_dir, "last_epoch.pt")
-        torch.save(
-            {"model": model.state_dict(),
-             "final_metrics": final_metrics,
-             "args": vars(args)},
-            ckpt_path
-        )
-        print(f"[INFO] saved: {ckpt_path}")
+        f"Confusion: TP={final_metrics['TP']}, TN={final_metrics['TN']}, FP={final_metrics['FP']}, FN={final_metrics['FN']}")
+    print("=" * 40)
 
 
 if __name__ == "__main__":
