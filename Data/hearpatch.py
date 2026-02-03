@@ -4,153 +4,147 @@
 import os
 import argparse
 from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-import tensorflow as tf
+from torchaudio import transforms as T
+import tensorflow as tf  # HeAR 使用 TensorFlow
 from tqdm import tqdm
 
-# ============================
-# 1. 常量与基础配置
-# ============================
+# =========================
+# HeAR-aligned constants
+# =========================
 SR = 16000
-TARGET_SAMPLES = 32000
+DURATION_SEC = 2  # HeAR 标准是 2s
+TARGET_SAMPLES = SR * DURATION_SEC  # 32000 samples
 
 
-def lungsound_label(crackles, wheezes):
-    c, w = int(crackles), int(wheezes)
-    if c == 0 and w == 0: return 0
-    if c == 1 and w == 0: return 1
-    if c == 0 and w == 1: return 2
+# =========================
+# 4-class label mapping
+# =========================
+def lungsound_label(crackles: int, wheezes: int) -> int:
+    crackles, wheezes = int(crackles), int(wheezes)
+    if crackles == 0 and wheezes == 0: return 0
+    if crackles == 1 and wheezes == 0: return 1
+    if crackles == 0 and wheezes == 1: return 2
     return 3
 
 
-def process_to_2s_sample(wav: torch.Tensor) -> torch.Tensor:
-    if wav.shape[-1] > TARGET_SAMPLES:
-        step = 1600
-        windows = wav.unfold(-1, TARGET_SAMPLES, step)
-        energies = torch.sum(windows ** 2, dim=-1)
-        best_idx = torch.argmax(energies)
-        return windows[0, best_idx].unsqueeze(0)
+# =========================
+# Audio Utilities (与你之前的 AST 脚本一致)
+# =========================
+def load_wav_resample_mono(wav_path: str, target_sr: int = SR) -> torch.Tensor:
+    wav, orig_sr = torchaudio.load(wav_path)
+    if wav.shape[0] > 1: wav = wav.mean(dim=0, keepdim=True)
+    if orig_sr != target_sr:
+        wav = T.Resample(orig_sr, target_sr)(wav)
+    return wav
+
+
+def fix_to_2s_trunc_or_repeat(x: torch.Tensor) -> torch.Tensor:
+    """HeAR 专用：调整到 2s (32000个采样点)"""
+    if x.shape[-1] >= TARGET_SAMPLES:
+        y = x[..., :TARGET_SAMPLES]
     else:
-        pad_total = TARGET_SAMPLES - wav.shape[-1]
-        pad_left = pad_total // 2
-        pad_right = pad_total - pad_left
-        return torch.nn.functional.pad(wav, (pad_left, pad_right))
+        # 循环填充
+        import math
+        ratio = math.ceil(TARGET_SAMPLES / max(1, x.shape[-1]))
+        y = x.repeat(1, ratio)[..., :TARGET_SAMPLES]
+    return y
 
 
-# ============================
-# 2. 核心处理逻辑
-# ============================
-def process_subset(subset_dir, save_subset_dir, extract_fn):
+# =========================
+# HeAR 特征提取 (替换 AST 的核心)
+# =========================
+def extract_hear_patch_tokens(model_fn, wav_2s: torch.Tensor) -> np.ndarray:
     """
-    处理特定的子集 (train 或 test)
+    输入: (1, 32000) Torch Tensor
+    输出: (128, 1024) Numpy Array (进入 ViT 之前的 Patch Tokens)
     """
-    # 使用 rglob("*.wav") 递归查找所有层级下的 wav 文件
-    wav_files = list(Path(subset_dir).rglob("*.wav"))
+    # 转为 TF 张量格式
+    audio_tf = tf.constant(wav_2s.numpy().reshape(1, TARGET_SAMPLES), dtype=tf.float32)
+    # 调用 HeAR 签名接口
+    outputs = model_fn(audio_wav=audio_tf)
+    # 提取 Patch Embeddings (通常是输出字典中的第一个值)
+    # 形状应为 [1, 128, 1024] -> squeeze 得到 [128, 1024]
+    tokens = list(outputs.values())[0].numpy().squeeze(0)
+    return tokens
 
-    # --- 调试打印：如果这里显示 0，说明路径还是没对准 ---
-    print(f"\n🔍 正在检查目录: {subset_dir}")
-    print(f"📊 该目录下(含子目录)发现 wav 文件数量: {len(wav_files)}")
-    # -----------------------------------------------
 
-    if not wav_files:
-        print(f"⚠️  警告：在 {subset_dir} 中没找到任何 wav 文件，请检查路径深度！")
-        return []
-
-    print(f"📂 开始特征提取 [128, 1024]...")
-    rows = []
-
-    for wav_path in tqdm(wav_files):
-        # 查找同级目录下的标注文件
-        txt_path = wav_path.with_suffix(".txt")
-        if not txt_path.exists():
-            # 如果 wav 和 txt 不在同一个文件夹，尝试在全局搜索
-            continue
-
-        # 加载音频
-        try:
-            wav, orig_sr = torchaudio.load(wav_path)
-            if wav.shape[0] > 1: wav = wav.mean(dim=0, keepdim=True)
-            if orig_sr != SR: wav = torchaudio.transforms.Resample(orig_sr, SR)(wav)
-        except Exception as e:
-            print(f"❌ 加载失败 {wav_path.name}: {e}")
-            continue
-
-        # 解析 ICBHI 周期标注
-        ann = pd.read_csv(txt_path, sep="\t", header=None, names=["Start", "End", "C", "W"])
-
-        # 提取患者 ID (假设文件名格式为 101_1b1_Al_sc_Medusa)
-        patient_id = wav_path.stem.split("_")[0]
-
-        for i, r in ann.iterrows():
-            # 计算采样点索引
-            start_i, end_i = int(r["Start"] * SR), int(r["End"] * SR)
-            cycle = wav[:, start_i:end_i]
-
-            # 过滤过短的周期 (小于 0.1s)
-            if cycle.shape[-1] < 1600:
-                continue
-
-                # 核心操作：智能裁剪/填充到 2s
-            cycle_2s = process_to_2s_sample(cycle)
-            label = lungsound_label(r["C"], r["W"])
-
-            # HeAR 推理提取 Patch Tokens [1, 128, 1024]
-            audio_tf = tf.constant(cycle_2s.numpy().reshape(1, TARGET_SAMPLES), dtype=tf.float32)
-            outputs = extract_fn(audio_wav=audio_tf)
-
-            # 转换为 Numpy 并去掉 Batch 维度 -> (128, 1024)
-            tokens = list(outputs.values())[0].numpy().squeeze(0)
-
-            # 按照患者 ID 分文件夹保存，解决你之前提到的“按患者分割”需求
-            save_path = Path(save_subset_dir) / patient_id
-            save_path.mkdir(parents=True, exist_ok=True)
-
-            npy_name = f"{wav_path.stem}_c{i}_y{label}.npy"
-            npy_full_path = save_path / npy_name
-            np.save(npy_full_path, tokens)
-
-            # 记录索引信息
-            rows.append({
-                "tokens_path": str(npy_full_path),
-                "label": label,
-                "recording": wav_path.stem,
-                "patient_id": patient_id
-            })
-
-    return rows
 def main():
     parser = argparse.ArgumentParser()
-    # 路径已根据你的截图修正为 ast
-    parser.add_argument("--src_root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
-    parser.add_argument("--save_root", type=str, default="/data/dingcong/hybrid/icbhi_hear_patch_128_1024")
+    # 路径完全沿用你 AST 脚本的设置
+    parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_files")
+    parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_hear_patch_128_1024")
     parser.add_argument("--hear_path", type=str,
                         default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/spectrogram_frontend")
     args = parser.parse_args()
 
-    # --- 修正点：首先创建根目录 ---
-    os.makedirs(args.save_root, exist_ok=True)
+    # 1. 加载 HeAR 模型
+    print(f"📦 Loading HeAR Model from: {args.hear_path}")
+    hear_model = tf.saved_model.load(args.hear_path)
+    extract_fn = hear_model.signatures["serving_default"]
 
-    print("📦 Loading HeAR Model...")
-    model = tf.saved_model.load(args.hear_path)
-    extract_fn = model.signatures["serving_default"]
+    # 2. 自动定位官方划分文件 (沿用你 AST 脚本逻辑)
+    # 这里为了简便，假设你已经知道 split 文件位置或使用你 AST 的 find_official_split_file
+    from pathlib import Path
+    split_path = os.path.join(args.data_dir, "official_split.txt")
+    # 如果不存在，请手动修正此路径
+    split_df = pd.read_csv(split_path, sep='\t', names=['file', 'set'])
+    split_map = dict(zip(split_df['file'], split_df['set']))
 
-    for subset in ["train", "test"]:
-        src_dir = Path(args.src_root) / subset
-        dst_dir = Path(args.save_root) / subset
+    # 3. 创建目录
+    for s in ["train", "test"]: os.makedirs(os.path.join(args.out_dir, s), exist_ok=True)
 
-        if src_dir.exists():
-            indices = process_subset(src_dir, dst_dir, extract_fn)
-            if indices:
-                csv_path = Path(args.save_root) / f"{subset}_index.csv"
-                pd.DataFrame(indices).to_csv(csv_path, index=False)
-                print(f"✅ {subset} 索引已保存至: {csv_path}")
-        else:
-            print(f"⚠️  警告：源目录不存在 {src_dir}")
+    # 4. 扫描文件并处理
+    wav_files = list(Path(args.data_dir).glob("*.wav"))
+    all_rows = []
 
-    print(f"\n🚀 所有流程已完成！")
+    for wav_path in tqdm(wav_files):
+        tag = split_map.get(wav_path.stem) or split_map.get(wav_path.name)
+        if not tag: continue
+
+        txt_path = wav_path.with_suffix(".txt")
+        if not txt_path.exists(): continue
+
+        wav = load_wav_resample_mono(str(wav_path))
+        ann = pd.read_csv(txt_path, sep="\t", header=None, names=["Start", "End", "C", "W"])
+        patient_id = wav_path.stem.split("_")[0]
+
+        for i, r in ann.iterrows():
+            start_i, end_i = int(r["Start"] * SR), int(r["End"] * SR)
+            cycle = wav[:, start_i:end_i]
+            if cycle.shape[-1] < 1600: continue
+
+            # 统一到 2s
+            cycle_2s = fix_to_2s_trunc_or_repeat(cycle)
+
+            # 提取 HeAR Tokens (128, 1024)
+            tokens = extract_hear_patch_tokens(extract_fn, cycle_2s)
+
+            # 保存
+            save_subdir = os.path.join(args.out_dir, tag, patient_id)
+            os.makedirs(save_subdir, exist_ok=True)
+            npy_name = f"{wav_path.stem}_c{i}_y{lungsound_label(r['C'], r['W'])}.npy"
+            npy_path = os.path.join(save_subdir, npy_name)
+            np.save(npy_path, tokens)
+
+            all_rows.append({
+                "tokens_path": npy_path,
+                "label": lungsound_label(r["C"], r["W"]),
+                "patient_id": patient_id,
+                "set": tag
+            })
+
+    # 5. 保存索引 CSV
+    full_df = pd.DataFrame(all_rows)
+    for s in ["train", "test"]:
+        full_df[full_df['set'] == s].to_csv(os.path.join(args.out_dir, f"{s}_index.csv"), index=False)
+
+    print(f"🚀 DONE! Tokens saved to {args.out_dir}. Shape: {tokens.shape}")
 
 
 if __name__ == "__main__":
