@@ -51,22 +51,43 @@ def fix_to_2s_trunc_or_repeat(x: torch.Tensor) -> torch.Tensor:
 # =========================
 # HeAR 特征提取 (进入 ViT 之前的 Patch Tokens)
 # =========================
+# ... 保持之前的 load_wav 和 fix_to_2s 函数不变 ...
+
 def extract_hear_patch_tokens(model_fn, wav_2s: torch.Tensor) -> np.ndarray:
     """
-    输入: (1, 32000) Torch Tensor
-    输出: (128, 1024) Numpy Array (Patch Projection 后, 进入 ViT 前)
+    自适应抓取 1024 维的 Patch Tokens
     """
-    # 转为 TF 张量
-    audio_tf = tf.constant(wav_2s.numpy().reshape(1, TARGET_SAMPLES), dtype=tf.float32)
+    # 转换为 TensorFlow 张量
+    audio_tf = tf.constant(wav_2s.numpy().reshape(1, 32000), dtype=tf.float32)
 
-    # 调用 get_patch_embeddings 签名
-    # 这会输出 {'patch_embeddings': <Tensor shape=(1, 128, 1024)>}
+    # 调用 serving_default 接口
     outputs = model_fn(audio_wav=audio_tf)
 
-    # 提取结果并去掉 batch 维度 -> (128, 1024)
-    tokens = outputs['patch_embeddings'].numpy().squeeze(0)
-    return tokens
+    # 【核心逻辑】遍历所有输出结果，自动寻找末尾维度是 1024 的那一个
+    # 因为 Large 编码器进入 ViT 前的投影层输出形状一定是 (1, 128, 1024)
+    for key, val in outputs.items():
+        if len(val.shape) == 3 and val.shape[2] == 1024:
+            return val.numpy().squeeze(0)
 
+    # 兜底：如果没找到，取第一个输出
+    res = list(outputs.values())[0].numpy()
+    return res.squeeze(0)
+
+
+def main():
+    # ... args 解析 ...
+
+    # 设置为你验证成功的路径
+    hear_path = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large"
+
+    print(f"📦 加载 HeAR Large Encoder: {hear_path}")
+    hear_model = tf.saved_model.load(hear_path)
+
+    # 使用你刚才验证出的 'serving_default'
+    extract_fn = hear_model.signatures["serving_default"]
+    print("✅ 成功关联核心接口: serving_default")
+
+    # ... 剩下的文件循环和保存逻辑 ...
 
 def main():
     parser = argparse.ArgumentParser()
