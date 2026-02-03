@@ -62,6 +62,9 @@ class BiMambaBlock(nn.Module):
 # =========================
 # 3. SSA 层 (单层定义)
 # =========================
+# =========================
+# 3. SSA 层 (3 Mamba -> 1 Attention -> 3 Mamba)
+# =========================
 class SSA_Layer(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
@@ -73,18 +76,19 @@ class SSA_Layer(nn.Module):
             nn.GELU(),
         )
 
-        # 2) 前置 4 个 BiMamba
-        self.mambas_pre = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(4)])
+        # 2) 前置 3 个 BiMamba (调整处)
+        self.mambas_pre = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(3)
+        ])
 
-        # 3) 中间 2 个 Attention 层
-        self.attn1_ln = nn.LayerNorm(d_model)
-        self.attn1 = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        # 3) 中间 1 个 Attention 层 (调整处)
+        self.attn_ln = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
 
-        self.attn2_ln = nn.LayerNorm(d_model)
-        self.attn2 = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-
-        # 4) 后置 4 个 BiMamba
-        self.mambas_post = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(4)])
+        # 4) 后置 3 个 BiMamba (调整处)
+        self.mambas_post = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(3)
+        ])
 
         # 5) 门控残差
         self.gate = nn.Sequential(
@@ -98,28 +102,23 @@ class SSA_Layer(nn.Module):
         # Local Conv
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
 
-        # Pre Mambas
+        # Pre Mambas (3 layers)
         for blk in self.mambas_pre:
             x = blk(x)
 
-        # Dual Attention
-        x_n1 = self.attn1_ln(x)
-        x_a1, _ = self.attn1(x_n1, x_n1, x_n1, key_padding_mask=mask)
-        x = x + x_a1
+        # Single Attention (1 layer)
+        x_n = self.attn_ln(x)
+        # 注意：mask 处理 padding
+        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
+        x = x + x_a
 
-        x_n2 = self.attn2_ln(x)
-        x_a2, _ = self.attn2(x_n2, x_n2, x_n2, key_padding_mask=mask)
-        x = x + x_a2
-
-        # Post Mambas
+        # Post Mambas (3 layers)
         for blk in self.mambas_post:
             x = blk(x)
 
         # Gated Residual
         g = self.gate(x.mean(dim=1, keepdim=True))
         return res + g * x
-
-
 # =========================
 # 4. 完整的 SSA 模型（方案B：直接输出 4类 logits）
 # =========================
