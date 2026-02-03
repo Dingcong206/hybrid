@@ -13,7 +13,7 @@ except ImportError:
     print("⚠️ 未安装 mamba_ssm。需要的话安装：pip install mamba-ssm causal-conv1d")
 
 # =========================
-# 1) 位置编码函数（你缺的就是这个）
+# 1) 位置编码
 # =========================
 def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
     pe = torch.zeros(seq_len, dim, device=device)
@@ -27,7 +27,7 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
     return pe
 
 # =========================
-# 2) BiMambaBlock（你也缺了这个）
+# 2) BiMambaBlock（双向）
 # =========================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
@@ -53,7 +53,9 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B,T,D)
+        """
+        x: (B,T,D)
+        """
         h = self.ln1(x)
         h_f = self.fwd(h)
         h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
@@ -61,62 +63,7 @@ class BiMambaBlock(nn.Module):
         return x + self.mlp(self.ln2(x))
 
 # =========================
-# 3) SE Block（你写的 그대로）
-# =========================
-class SE_Block(nn.Module):
-    def __init__(self, ch, reduction=16):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(ch, ch // reduction, bias=False),
-            nn.SiLU(),
-            nn.Linear(ch // reduction, ch, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x: (B, T, D)
-        b, t, d = x.size()
-        y = torch.mean(x, dim=1)            # (B,D)
-        y = self.fc(y).view(b, 1, d)        # (B,1,D)
-        return x * y.expand_as(x)
-
-# =========================
-# 4) 改进后的 SSA Layer（你写的 + 加一个 mask-aware mean 可选）
-# =========================
-class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=7, padding=3, groups=d_model),
-            nn.BatchNorm1d(d_model),
-            nn.SiLU(),
-        )
-
-        self.mamba_pre = BiMambaBlock(d_model, dropout=dropout)
-
-        self.attn_ln = _rmsnorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-
-        self.se = SE_Block(d_model)
-
-    def forward(self, x, mask=None):
-        # 1) local conv
-        x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
-
-        # 2) bimamba
-        x = self.mamba_pre(x)
-
-        # 3) attention
-        x_n = self.attn_ln(x)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
-        x = x + x_a
-
-        # 4) SE
-        x = self.se(x)
-        return x
-
-# =========================
-# 5) ICBHI 专用 Pooling（你写的 그대로）
+# 3) ICBHI Pooling：Attention pooling + Max pooling
 # =========================
 class ICBHI_Pooling(nn.Module):
     def __init__(self, d_model):
@@ -135,6 +82,7 @@ class ICBHI_Pooling(nn.Module):
         attn_w = torch.softmax(attn_scores, dim=1)
         feat_weighted = torch.sum(attn_w * x, dim=1)  # (B,D)
 
+        # max pooling（屏蔽 padding）
         if mask is not None:
             x_for_max = x.masked_fill(mask.unsqueeze(-1), -1e9)
         else:
@@ -144,7 +92,91 @@ class ICBHI_Pooling(nn.Module):
         return feat_weighted + feat_max
 
 # =========================
-# 6) 主模型：支持 return_feature（路线A用）
+# 4) 并行层：Conv -> 并行(3×BiMamba + 1×Attn) -> softmax融合 -> FFN
+# =========================
+class ParallelConv3BiMamba1AttnLayer(nn.Module):
+    """
+    结构：
+      1) Depthwise Conv 残差
+      2) Norm
+      3) 并行：BiMamba#1/#2/#3 + Attention
+      4) Softmax 融合四路输出
+      5) 残差 + FFN
+    """
+    def __init__(self, d_model, nhead=8, dropout=0.3, conv_k=7,
+                 mamba_dropout=0.3, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+
+        # 0) local depthwise conv
+        self.local = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
+            nn.BatchNorm1d(d_model),
+            nn.SiLU(),
+        )
+
+        # 1) 输入归一化
+        self.norm_in = _rmsnorm(d_model)
+
+        # 2) 并行 3 个 BiMamba
+        self.bimambas = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=mamba_dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(3)
+        ])
+
+        # 3) 并行 1 个 Attention
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+
+        # 4) 融合：输出 (B,T,4) 权重，对应 [b1,b2,b3,a]
+        self.fuse_logits = nn.Linear(d_model, 4)
+        self.drop = nn.Dropout(dropout)
+
+        # 5) FFN 残差
+        self.norm_ffn = _rmsnorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, mask=None):
+        """
+        x: (B,T,D)
+        mask: (B,T) True=PAD
+        """
+        # 0) local conv residual
+        x = x + self.local(x.transpose(1, 2)).transpose(1, 2)
+
+        # 1) normalize for parallel branches
+        x_n = self.norm_in(x)
+
+        # padding token 尽量不影响 mamba/融合
+        if mask is not None:
+            x_n = x_n.masked_fill(mask.unsqueeze(-1), 0.0)
+
+        # 2) parallel branches
+        b_outs = [blk(x_n) for blk in self.bimambas]  # 3*(B,T,D)
+        a_out, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)  # (B,T,D)
+
+        outs = torch.stack(b_outs + [a_out], dim=2)  # (B,T,4,D)
+
+        # 3) softmax weights
+        w = torch.softmax(self.fuse_logits(x_n), dim=-1)  # (B,T,4)
+        if mask is not None:
+            w = w.masked_fill(mask.unsqueeze(-1), 0.0)
+
+        mix = (outs * w.unsqueeze(-1)).sum(dim=2)  # (B,T,D)
+
+        # 4) residual
+        x = x + self.drop(mix)
+
+        # 5) FFN residual
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+# =========================
+# 5) 主模型（支持 return_feature，路线A用）
 # =========================
 class SSA_Model_HeARTokens(nn.Module):
     def __init__(
@@ -156,29 +188,52 @@ class SSA_Model_HeARTokens(nn.Module):
         dropout=0.3,
         max_len=4096,
         num_classes=4,
+        conv_k=7,
+        mamba_dropout=None,
+        d_state=16,
+        d_conv=4,
+        expand=2,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_classes = num_classes
 
+        if mamba_dropout is None:
+            mamba_dropout = dropout
+
+        # 输入投影
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, d_model),
             nn.SiLU(),
             _rmsnorm(d_model),
         )
 
+        # 位置编码
         pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
+        # 堆叠并行层
         self.layers = nn.ModuleList([
-            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout)
+            ParallelConv3BiMamba1AttnLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dropout=dropout,
+                conv_k=conv_k,
+                mamba_dropout=mamba_dropout,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+            )
             for _ in range(n_layers)
         ])
 
         self.norm = _rmsnorm(d_model)
+
+        # pooling
         self.pool = ICBHI_Pooling(d_model)
 
+        # 这两个头：路线A用不上（因为 backbone 返回 feature），但保留兼容路线B
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.SiLU(),
@@ -188,7 +243,11 @@ class SSA_Model_HeARTokens(nn.Module):
         self.token_head = nn.Linear(d_model, num_classes)
 
     def forward(self, x, mask=None, return_feature=False):
-        # x: (B,T,in_dim)
+        """
+        x: (B,T,in_dim)
+        mask: (B,T) True=PAD
+        return_feature=True -> (file_feature, token_features)
+        """
         x = self.input_proj(x)
         T = x.shape[1]
         x = x + self.pe[:, :T, :].to(x.device)
@@ -196,6 +255,7 @@ class SSA_Model_HeARTokens(nn.Module):
 
         for layer in self.layers:
             x = layer(x, mask=mask)
+
         x = self.norm(x)
 
         file_feature = self.pool(x, mask=mask)  # (B,D)
@@ -208,7 +268,7 @@ class SSA_Model_HeARTokens(nn.Module):
         return file_logits, token_logits
 
 # =========================
-# 7) SSA_Backbone（你缺的就是这个）
+# 6) 路线A：Backbone 封装
 # =========================
 class SSA_Backbone(nn.Module):
     def __init__(self, ssa_model: SSA_Model_HeARTokens):
@@ -221,9 +281,10 @@ class SSA_Backbone(nn.Module):
         return feat
 
 # =========================
-# 8) 工厂函数：build_backbone（路线A训练用）
+# 7) 工厂函数：build_backbone（路线A训练用）
 # =========================
-def build_backbone(in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3, max_len=4096):
+def build_backbone(in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3, max_len=4096,
+                   conv_k=7, mamba_dropout=None, d_state=16, d_conv=4, expand=2):
     ssa = SSA_Model_HeARTokens(
         in_dim=in_dim,
         d_model=d_model,
@@ -232,10 +293,15 @@ def build_backbone(in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3, ma
         dropout=dropout,
         max_len=max_len,
         num_classes=4,
+        conv_k=conv_k,
+        mamba_dropout=mamba_dropout,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
     )
     backbone = SSA_Backbone(ssa)
 
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"✅ ICBHI Optimized SSA Backbone Initialized.")
+    print("✅ Parallel Conv + (3×BiMamba || 1×Attn) Backbone Initialized.")
     print(f"   Parameters: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
