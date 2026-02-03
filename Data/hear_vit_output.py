@@ -131,7 +131,7 @@ def main():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/data/dingcong/hybrid/audio_and_txt_files",
+        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
         help="包含 train/ 和 test/ 的数据目录"
     )
 
