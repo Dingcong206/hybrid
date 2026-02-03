@@ -29,7 +29,7 @@ from mymodels.model import build_model  # 你自己的序列模型（SSA）
 
 
 # ✅ 默认 root：请改成你 “ViT 后输出特征” 的目录
-DEFAULT_ROOT = "/data/dingcong/hybrid/icbhi_hear_vit_outputs"
+DEFAULT_ROOT = "/data/dingcong/hybrid/icbhi_hear_vit_embedding_512"
 
 
 # ============================================================
@@ -144,8 +144,10 @@ def collect_logits(model, loader, device):
         y = y.to(device, non_blocking=True)
 
         out = model(x, mask)
-        file_logit = out[0] if isinstance(out, (tuple, list)) else out
-
+        if isinstance(out, tuple):
+            file_logit, _ = out
+        else:
+            file_logit = out
         all_logits.append(file_logit.detach().float().cpu())
         all_y.append(y.detach().long().cpu())
 
@@ -322,10 +324,12 @@ def main():
 
     # ---------- build model ----------
     if feature_mode == "tokens":
-        # 用你自己的 SSA 序列模型
         model = build_model(
-            in_dim=in_dim, d_model=args.d_model, n_layers=args.n_layers,
-            nhead=args.nhead, dropout=args.dropout
+            in_dim=1024,  # 显式指定对应 HeAR 的 1024
+            d_model=args.d_model,  # 256
+            n_layers=args.n_layers,
+            nhead=args.nhead,
+            dropout=args.dropout
         ).to(device)
     else:
         # embedding 模式：用 MLP（不依赖 mymodels）
