@@ -75,7 +75,7 @@ def main():
 
     # 【关键修改】路径指向 encoder 目录
     parser.add_argument("--hear_path", type=str,
-                        default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/encoder")
+                        default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large")
     args = parser.parse_args()
 
     # 1. 加载 HeAR Encoder 模块
