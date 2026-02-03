@@ -50,65 +50,64 @@ class SSA_Layer(nn.Module):
       -> gated residual
     """
 
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    def __init__(self, in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3, max_len=2000):
         super().__init__()
 
-        # 1. 增强型局部提取 (Depthwise Separable + Dilated)
-        # 增加空洞卷积以在不增加参数量的情况下扩大感受野
-        self.local_extract = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, d_model),
             nn.GELU(),
-            nn.Conv1d(d_model, d_model, kernel_size=5, padding=4, dilation=2, groups=d_model),
-            nn.BatchNorm1d(d_model),
+            nn.LayerNorm(d_model),
         )
 
-        # 2. 并行混合层 (Hybrid Mamba & Attention)
-        # 让 Mamba 处理时序扫描，Attention 处理全局对齐
-        self.mamba_branch = BiMambaBlock(d_model, dropout=dropout)
+        # ✅ 改进方案 1: 使用 register_buffer 预存位置编码
+        # 这样位置编码会随 model.to(device) 自动移动，且不会被作为参数更新
+        pe = sinusoidal_positional_encoding(max_len, d_model, device='cpu')
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
 
-        self.attn_ln = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.layers = nn.ModuleList([
+            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout) for _ in range(n_layers)
+        ])
 
-        # 3. 动态融合门控 (Cross-Gate)
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid()
+        self.norm = nn.LayerNorm(d_model)
+        self.pos_drop = nn.Dropout(p=dropout)  # 建议在加完位置编码后加个 dropout
+
+        # ... (后续的池化和分类层保持不变) ...
+        self.attention_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1)
         )
-
-        # 4. 前馈网络 (FFN) 升级为 SwiGLU 风格 (Transformer 常用优化)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.SiLU(),  # Swish 激活
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.norm_ffn = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, 1)
+        self.token_head = nn.Linear(d_model, 1)
 
     def forward(self, x, mask=None):
-        # x: (B, T, D)
-        shortcut = x
+        """
+        x: (B, T, 1024)
+        mask: (B, T) True=padding
+        """
+        x = self.input_proj(x)  # (B, T, d_model)
 
-        # --- A. 局部卷积分支 ---
-        x_conv = self.local_extract(x.transpose(1, 2)).transpose(1, 2)
-        x = x + x_conv
+        # ✅ 改进方案 2: 根据当前输入的实际 T 裁剪预存的位置编码
+        B, T, D = x.shape
+        # self.pe 是 (1, max_len, D)，截取前 T 个变成 (1, T, D)
+        x = x + self.pe[:, :T, :]
+        x = self.pos_drop(x)
 
-        # --- B. 并行双路分支 ---
-        # 支路1: Mamba (时序敏感)
-        x_mamba = self.mamba_branch(x)
+        for layer in self.layers:
+            x = layer(x, mask=mask)
 
-        # 支路2: Attention (全局对齐)
-        x_n = self.attn_ln(x)
-        x_attn, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
+        x = self.norm(x)
 
-        # 动态融合: 根据特征内容决定两者的权重
-        gate = self.fusion_gate(torch.cat([x_mamba, x_attn], dim=-1))
-        x = (1 - gate) * x_mamba + gate * x_attn
-        x = x + shortcut  # 残差连接
+        # ... (后续池化逻辑保持不变) ...
+        attn_scores = self.attention_net(x)
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+        attn_w = torch.softmax(attn_scores, dim=1)
+        file_feature = torch.sum(attn_w * x, dim=1)
+        file_logit = self.classifier(file_feature).squeeze(-1)
+        token_logits = self.token_head(x).squeeze(-1)
 
-        # --- C. FFN 增强层 ---
-        x = x + self.ffn(self.norm_ffn(x))
-
-        return x
+        return file_logit, token_logits
 
 
 
