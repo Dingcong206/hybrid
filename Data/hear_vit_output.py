@@ -1,4 +1,4 @@
-cat > /data/dingcong/hybrid/tools/verify_hear_vit_output.py << 'EOF'
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -56,4 +56,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
+
