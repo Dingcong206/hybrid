@@ -33,7 +33,6 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, T, D)
         h = self.ln1(x)
         h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h)
@@ -54,10 +53,6 @@ class SSA_Layer(nn.Module):
         self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
 
     def forward(self, x, mask=None):
-        """
-        x: (B, T, D)
-        mask: (B, T)  True=padding(无效位置), False=有效token
-        """
         res = x
 
         # local
@@ -76,12 +71,12 @@ class SSA_Layer(nn.Module):
         return res + g * x
 
 
-class SSA_Model_HeARTokens(nn.Module):
+class SSA_Model_NoDownsample(nn.Module):
     """
-    输入：HeAR tokens (B, T, 1024)，你现在 T≈200（也可变）
-    输出：file_logit (B,), token_logits (B, T)
+    输入：AST patch tokens (B, 948, 768)
+    输出：file_logit (B,), token_logits (B, 948)
     """
-    def __init__(self, in_dim=1024, d_model=256, n_layers=4, nhead=8, dropout=0.3):
+    def __init__(self, in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3):
         super().__init__()
 
         self.input_proj = nn.Sequential(
@@ -96,7 +91,7 @@ class SSA_Model_HeARTokens(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-        # Attention Pooling (learnable)
+        # Attention Pooling
         self.attention_net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
@@ -104,42 +99,37 @@ class SSA_Model_HeARTokens(nn.Module):
         )
 
         self.classifier = nn.Linear(d_model, 1)
-        self.token_head = nn.Linear(d_model, 1)
+        self.patch_head = nn.Linear(d_model, 1)
 
     def forward(self, x, mask=None):
-        """
-        x: (B, T, 1024)
-        mask: (B, T) True=padding
-        """
-        x = self.input_proj(x)  # (B, T, d_model)
+        # x: (B, 948, 768)
+        x = self.input_proj(x)  # (B, 948, 256)
 
         B, T, D = x.shape
-        pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)  # (1,T,D)
+        pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)
         x = x + pos
 
         for layer in self.layers:
             x = layer(x, mask=mask)
 
-        x = self.norm(x)  # (B, T, d_model)
+        x = self.norm(x)  # (B, 948, 256)
 
-        # Attention pooling -> file_feature
-        attn_scores = self.attention_net(x)  # (B, T, 1)
+        # Attention pooling
+        attn_weights = self.attention_net(x)  # (B, 948, 1)
         if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+            attn_weights = attn_weights.masked_fill(mask.unsqueeze(-1), -1e9)
 
-        attn_w = torch.softmax(attn_scores, dim=1)        # (B, T, 1)
-        file_feature = torch.sum(attn_w * x, dim=1)       # (B, d_model)
+        attn_weights = torch.softmax(attn_weights, dim=1)
+        file_feature = torch.sum(attn_weights * x, dim=1)  # (B, 256)
 
         file_logit = self.classifier(file_feature).squeeze(-1)  # (B,)
-        token_logits = self.token_head(x).squeeze(-1)           # (B, T)
+        token_logits = self.patch_head(x).squeeze(-1)           # (B, 948)
 
         return file_logit, token_logits
 
 
-def build_model(in_dim=1024, d_model=256, n_layers=4, nhead=8, dropout=0.3):
-    model = SSA_Model_HeARTokens(
-        in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead, dropout=dropout
-    )
+def build_model(in_dim=768, d_model=256, n_layers=4, nhead=8):
+    model = SSA_Model_NoDownsample(in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead)
     params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA Model for HeAR tokens Initialized. Parameters: {params:,}")
+    print(f"✅ SSA Model (no downsample) Initialized. Parameters: {params:,}")
     return model
