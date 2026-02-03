@@ -81,7 +81,7 @@ class SSA_Model_HeARTokens(nn.Module):
     输入：HeAR tokens (B, T, 1024)，你现在 T≈200（也可变）
     输出：file_logit (B,), token_logits (B, T)
     """
-    def __init__(self, in_dim=1024, d_model=256, n_layers=4, nhead=8, dropout=0.3):
+    def __init__(self, in_dim=1024, d_model=512, n_layers=4, nhead=8, dropout=0.3):
         super().__init__()
 
         self.input_proj = nn.Sequential(
@@ -136,7 +136,7 @@ class SSA_Model_HeARTokens(nn.Module):
         return file_logit, token_logits
 
 
-def build_model(in_dim=1024, d_model=256, n_layers=4, nhead=8, dropout=0.3):
+def build_model(in_dim=1024, d_model=512, n_layers=4, nhead=8, dropout=0.3):
     model = SSA_Model_HeARTokens(
         in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead, dropout=dropout
     )
