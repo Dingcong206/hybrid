@@ -206,7 +206,7 @@ class SSA_Model_HeARTokens(nn.Module):
 # =========================
 # 5. 构建函数：直接返回 4-class 模型（不需要 wrapper）
 # =========================
-def build_model(in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3, num_classes=4):
+def build_model(in_dim=1024, d_model=512, n_layers=4, nhead=8, dropout=0.3, num_classes=4):
     model = SSA_Model_HeARTokens(
         in_dim=in_dim,
         d_model=d_model,
