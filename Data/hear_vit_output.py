@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -22,9 +23,9 @@ from transformers import AutoModel
 SR = 16000
 TARGET_SAMPLES = 32000  # 2 sec * 16k
 
-# =========================
-# Label mapping (ICBHI 4-class)
-# =========================
+# -------------------------
+# ICBHI label mapping (4-class)
+# -------------------------
 def lungsound_label(crackles: int, wheezes: int) -> int:
     c, w = int(crackles), int(wheezes)
     if c == 0 and w == 0: return 0
@@ -32,9 +33,9 @@ def lungsound_label(crackles: int, wheezes: int) -> int:
     if c == 0 and w == 1: return 2
     return 3
 
-# =========================
-# Audio utilities
-# =========================
+# -------------------------
+# Audio utils
+# -------------------------
 def load_wav_resample_mono(wav_path: str, target_sr: int = SR) -> torch.Tensor:
     wav, orig_sr = torchaudio.load(wav_path)  # (C, N)
     if wav.shape[0] > 1:
@@ -65,72 +66,128 @@ def process_to_2s_sample(wav: torch.Tensor) -> torch.Tensor:
     else:
         return wav
 
-# =========================
-# Official split loader
-# =========================
+# -------------------------
+# Official split
+# -------------------------
 def load_official_split(split_file: Path) -> Dict[str, str]:
     """
-    official_split.txt 格式（你之前用过）：
-      <file_stem>\t<train|test>
-    可能是：
-      101_1b1_Al_sc_Meditron\ttrain
+    official_split.txt: <file_stem>\t<train|test>
     """
     df = pd.read_csv(split_file, sep="\t", header=None, names=["file", "set"])
     split_map = dict(zip(df["file"].astype(str), df["set"].astype(str)))
     return split_map
 
 def get_set_for_recording(stem: str, split_map: Dict[str, str]) -> Optional[str]:
-    """
-    同时兼容 split_map 存的是 stem 或 filename 的情况
-    """
     if stem in split_map:
         return split_map[stem]
     if (stem + ".wav") in split_map:
         return split_map[stem + ".wav"]
     return None
 
-# =========================
-# HeAR PyTorch embedding (ViT后)
-# =========================
+# -------------------------
+# Import HeAR preprocess_audio (from Google-Health/hear repo)
+# -------------------------
+def import_preprocess_audio(hear_repo_root: str):
+    """
+    HuggingFace model card uses:
+      audio_utils = importlib.import_module("hear.python.data_processing.audio_utils")
+      preprocess_audio = audio_utils.preprocess_audio
+    我们做成“可控导入”：把 hear repo 根目录加到 sys.path
+    """
+    hear_repo_root = str(hear_repo_root)
+    if hear_repo_root not in sys.path:
+        sys.path.insert(0, hear_repo_root)
+
+    try:
+        import importlib
+        audio_utils = importlib.import_module("hear.python.data_processing.audio_utils")
+        preprocess_audio = audio_utils.preprocess_audio
+        return preprocess_audio
+    except Exception as e:
+        raise RuntimeError(
+            f"无法导入 hear.python.data_processing.audio_utils。\n"
+            f"请确认你已经 git clone 了 Google-Health/hear，并且路径正确。\n"
+            f"当前 hear_repo_root={hear_repo_root}\n"
+            f"原始错误: {repr(e)}"
+        )
+
+# -------------------------
+# HeAR embedding extraction (ViT后 embedding)
+# -------------------------
 @torch.no_grad()
-def hear_vit_embedding(model, wav_2s: torch.Tensor) -> Tuple[np.ndarray, str]:
+def hear_embedding_from_waveform(model, preprocess_audio, wav_2s: torch.Tensor) -> Tuple[np.ndarray, str]:
     """
-    wav_2s: torch Tensor (1, 32000) on device
-    return embedding: (1024,)
+    wav_2s: (1, 32000) float32 on CPU/GPU
+    Correct flow (per model card): waveform -> preprocess_audio -> spectrogram -> model.forward -> embedding
+    Output embedding per HF card: (B, 512).  :contentReference[oaicite:2]{index=2}
     """
-    out = model(wav_2s, return_dict=True)
+    # preprocess_audio expects (B, 32000) on CPU tensor (usually)
+    # 为了稳：先搬到 CPU，再 preprocess；再把谱图搬回 device
+    wav_cpu = wav_2s.detach().float().cpu()  # (1,32000)
+    spec = preprocess_audio(wav_cpu)         # expected spectrogram batch
 
-    # 优先：pooler_output（如果模型定义了pooler）
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        emb = out.pooler_output.squeeze(0)  # (1024,)
-        src = "pooler_output"
-        return emb.detach().cpu().numpy(), src
+    # spec 可能是 torch.Tensor，也可能是 dict；我们兼容
+    if isinstance(spec, dict):
+        # 有些实现会返回 {"pixel_values": ...}
+        if "pixel_values" in spec:
+            spec_in = spec["pixel_values"]
+        else:
+            # 取第一个
+            spec_in = next(iter(spec.values()))
+    else:
+        spec_in = spec
 
-    # 兜底：CLS token = last_hidden_state[:,0,:]
-    if not hasattr(out, "last_hidden_state") or out.last_hidden_state is None:
-        raise RuntimeError("No pooler_output and no last_hidden_state. Cannot get embedding.")
-    emb = out.last_hidden_state[:, 0, :].squeeze(0)  # (1024,)
-    src = "cls_from_last_hidden_state"
-    return emb.detach().cpu().numpy(), src
+    spec_in = spec_in.to(next(model.parameters()).device)
 
-# =========================
-# Per-recording cycle extraction
-# =========================
+    out = model.forward(spec_in, return_dict=True, output_hidden_states=True)
+
+    # 兼容几种输出：最常见是 out 为 Tensor (B,512) 或者 dict-like
+    if isinstance(out, torch.Tensor):
+        emb = out
+        src = "tensor_output"
+    else:
+        # 尝试常见字段
+        if hasattr(out, "embeddings") and out.embeddings is not None:
+            emb = out.embeddings
+            src = "out.embeddings"
+        elif hasattr(out, "pooler_output") and out.pooler_output is not None:
+            emb = out.pooler_output
+            src = "pooler_output"
+        elif hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            # CLS token
+            emb = out.last_hidden_state[:, 0, :]
+            src = "cls_from_last_hidden_state"
+        else:
+            # 兜底：字典取第一个 tensor
+            d = out.to_dict() if hasattr(out, "to_dict") else dict(out)
+            t = None
+            k_used = None
+            for k, v in d.items():
+                if torch.is_tensor(v):
+                    t = v
+                    k_used = k
+                    break
+            if t is None:
+                raise RuntimeError(f"模型输出里找不到 tensor，可用键: {list(d.keys())}")
+            emb = t
+            src = f"dict_first_tensor:{k_used}"
+
+    # emb: (1, D) -> (D,)
+    emb = emb.squeeze(0)
+    return emb.detach().cpu().numpy().astype(np.float32), src
+
+# -------------------------
+# One recording -> cycles
+# -------------------------
 def process_recording(
     wav_path: Path,
     txt_path: Path,
     out_root: Path,
     split_name: str,
     model,
+    preprocess_audio,
     device
 ) -> List[Dict]:
-    """
-    对一个 recording：
-      - 读取 wav
-      - 读取 txt cycles
-      - 对每个 cycle: crop/pad 2s -> vit embedding -> save npy
-    返回 rows（用于 index.csv）
-    """
     wav = load_wav_resample_mono(str(wav_path))  # (1,N)
     ann = pd.read_csv(txt_path, sep="\t", header=None, names=["Start", "End", "C", "W"])
 
@@ -149,14 +206,14 @@ def process_recording(
         y4 = lungsound_label(r["C"], r["W"])
         cycle_2s = process_to_2s_sample(cycle).to(device).float()  # (1,32000)
 
-        emb, emb_src = hear_vit_embedding(model, cycle_2s)          # (1024,)
+        emb, emb_src = hear_embedding_from_waveform(model, preprocess_audio, cycle_2s)
 
         save_subdir = out_root / split_name / patient_id
         save_subdir.mkdir(parents=True, exist_ok=True)
 
         npy_name = f"{recording}_cycle{i:04d}_y{y4}.npy"
         npy_path = save_subdir / npy_name
-        np.save(npy_path, emb.astype(np.float32))
+        np.save(npy_path, emb)
 
         rows.append({
             "tokens_path": str(npy_path),
@@ -181,37 +238,26 @@ def process_recording(
 def main():
     parser = argparse.ArgumentParser()
 
-    # 你的 ICBHI wav/txt 在这里（不要再指向 ast tokens 目录）
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default="/data/dingcong/hybrid/audio_and_txt_files",
-        help="ICBHI wav/txt 根目录（里面直接放 *.wav + *.txt）"
-    )
+    # ICBHI wav/txt 所在目录
+    parser.add_argument("--data_root", type=str, default="/data/dingcong/hybrid/audio_and_txt_files",
+                        help="ICBHI wav/txt 根目录（*.wav + *.txt）")
 
-    # 官方划分文件（你之前就用过）
-    parser.add_argument(
-        "--split_file",
-        type=str,
-        default="/data/dingcong/hybrid/audio_and_txt_files/official_split.txt",
-        help="官方 train/test 划分文件"
-    )
+    # 官方 split
+    parser.add_argument("--split_file", type=str, default="/data/dingcong/hybrid/audio_and_txt_files/official_split.txt",
+                        help="官方 train/test 划分文件")
 
-    # 输出：vit embedding
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="/data/dingcong/hybrid/icbhi_hear_vit_embedding_1024",
-        help="输出目录（会生成 train/test 子目录 + index.csv）"
-    )
+    # 你 clone 的 Google-Health/hear repo 根目录（包含 hear/python/...）
+    parser.add_argument("--hear_repo_root", type=str, default="/data/dingcong/hybrid/hear",
+                        help="Google-Health/hear 仓库根目录（用于导入 preprocess_audio）")
 
-    # 你本地 cache 的 hear-pytorch snapshot（你已经有了）
-    parser.add_argument(
-        "--model_dir",
-        type=str,
-        default="/home/guest1/.cache/huggingface/hub/models--google--hear-pytorch/snapshots/f791cd42437c3e268c8ac84707e3508900f65f1a",
-        help="本地 google/hear-pytorch snapshot 路径"
-    )
+    # 输出目录
+    parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_hear_vit_embedding_512",
+                        help="输出目录（train/test 子目录 + index.csv）")
+
+    # 本地 HF snapshot
+    parser.add_argument("--model_dir", type=str,
+                        default="/home/guest1/.cache/huggingface/hub/models--google--hear-pytorch/snapshots/f791cd42437c3e268c8ac84707e3508900f65f1a",
+                        help="本地 google/hear-pytorch snapshot 路径")
 
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
@@ -227,27 +273,31 @@ def main():
 
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # load split
+    # split
     split_map = load_official_split(split_file)
 
     # device + model
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print("device:", device)
     print("loading model from:", args.model_dir)
-
     model = AutoModel.from_pretrained(args.model_dir, local_files_only=True).to(device)
     model.eval()
     print("✅ model loaded")
 
-    # list all recordings from data_root/*.wav
+    # preprocess_audio
+    preprocess_audio = import_preprocess_audio(args.hear_repo_root)
+    print("✅ preprocess_audio loaded from hear repo")
+
+    # iterate recordings
     wav_files = sorted(data_root.glob("*.wav"))
     if len(wav_files) == 0:
-        raise FileNotFoundError(f"No .wav found under {data_root}. Expected wav/txt in this folder.")
+        raise FileNotFoundError(f"No .wav found under {data_root}")
 
     train_rows: List[Dict] = []
     test_rows: List[Dict] = []
     skipped_no_split = 0
     skipped_no_txt = 0
+    skipped_empty_cycles = 0
 
     for wav_path in tqdm(wav_files, desc="Recordings"):
         recording = wav_path.stem
@@ -267,8 +317,12 @@ def main():
             out_root=out_root,
             split_name=split_name,
             model=model,
+            preprocess_audio=preprocess_audio,
             device=device
         )
+        if len(rows) == 0:
+            skipped_empty_cycles += 1
+            continue
 
         if split_name == "train":
             train_rows.extend(rows)
@@ -286,13 +340,15 @@ def main():
     print("\n✨ Done.")
     print(f"train cycles: {len(df_train)} | test cycles: {len(df_test)}")
     print("saved:", train_index, test_index)
-    print(f"skipped: no_split={skipped_no_split}, no_txt={skipped_no_txt}")
+    print(f"skipped: no_split={skipped_no_split}, no_txt={skipped_no_txt}, empty_cycles={skipped_empty_cycles}")
 
-    # quick sanity print
+    # sanity
     if len(df_train) > 0:
         p = df_train.iloc[0]["tokens_path"]
         arr = np.load(p)
-        print("example embedding shape:", arr.shape, "path:", p)
+        print("example embedding shape:", arr.shape)
+        print("example embedding_source:", df_train.iloc[0]["embedding_source"])
+        print("example path:", p)
 
 if __name__ == "__main__":
     main()
