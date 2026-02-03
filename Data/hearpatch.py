@@ -52,27 +52,49 @@ def fix_to_2s_trunc_or_repeat(x: torch.Tensor) -> torch.Tensor:
 # HeAR 特征提取 (进入 ViT 之前的 Patch Tokens)
 # =========================
 # ... 保持之前的 load_wav 和 fix_to_2s 函数不变 ...
+# ... 之前的导入和 lungsound_label 等函数保持不变 ...
 
 def extract_hear_patch_tokens(model_fn, wav_2s: torch.Tensor) -> np.ndarray:
     """
-    自适应抓取 1024 维的 Patch Tokens
+    进入 ViT 前的 1024 维特征提取
     """
-    # 转换为 TensorFlow 张量
+    # 转换音频为 TensorFlow Tensor
     audio_tf = tf.constant(wav_2s.numpy().reshape(1, 32000), dtype=tf.float32)
 
-    # 调用 serving_default 接口
+    # 【核心修改】调用你验证成功的 'serving_default' 签名
     outputs = model_fn(audio_wav=audio_tf)
 
-    # 【核心逻辑】遍历所有输出结果，自动寻找末尾维度是 1024 的那一个
-    # 因为 Large 编码器进入 ViT 前的投影层输出形状一定是 (1, 128, 1024)
+    # 自动在输出字典中寻找形状末尾为 1024 的特征项
+    # 因为 Large 版本的 Patch Projection 输出一定是 (1, 128, 1024)
     for key, val in outputs.items():
         if len(val.shape) == 3 and val.shape[2] == 1024:
             return val.numpy().squeeze(0)
 
-    # 兜底：如果没找到，取第一个输出
+    # 如果没找到 1024 维，取第一个输出结果
     res = list(outputs.values())[0].numpy()
     return res.squeeze(0)
 
+
+def main():
+    # ... args 解析部分 ...
+
+    # 1. 使用你 ls 指令确认存在的物理路径
+    hear_path = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large"
+
+    print(f"📦 Loading HeAR Large Model from: {hear_path}")
+    hear_model = tf.saved_model.load(hear_path)
+
+    # 2. 【关键修改】使用你截图验证出的接口名称
+    if "serving_default" in hear_model.signatures:
+        extract_fn = hear_model.signatures["serving_default"]
+        print("✅ 成功关联签名: serving_default")
+    else:
+        # 如果连 serving_default 都没有，则取列表第一个
+        first_sig = list(hear_model.signatures.keys())[0]
+        extract_fn = hear_model.signatures[first_sig]
+        print(f"⚠️ 使用备选签名: {first_sig}")
+
+    # ... 剩下的 official_split 加载和文件循环逻辑与你之前的一致 ...
 
 def main():
     # ... args 解析 ...
