@@ -19,12 +19,12 @@ from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
 
 
 # ============================================================
-# 0) 让 `from mymodels.model import build_model` 能导入
+# 0) 让 `from mymodels.model import build_backbone` 能导入
 # ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[0]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mymodels.model import build_model   # ✅ 方案B：model 内部直接输出 (B,4)
+from mymodels.model import build_backbone
 
 
 # ============================================================
@@ -37,6 +37,10 @@ class TokenNPYDataset(Dataset):
             if c not in self.df.columns:
                 raise ValueError(f"CSV 缺少列: {c}，请检查 {csv_path}")
 
+        # for weighted loss (optional)
+        labels = self.df["label"].astype(int).values
+        self.class_counts = np.bincount(labels, minlength=4)
+
     def __len__(self):
         return len(self.df)
 
@@ -46,6 +50,9 @@ class TokenNPYDataset(Dataset):
         y = int(row["label"])               # 0/1/2/3
 
         x = np.load(npy_path)               # (T, D)
+        if x.ndim != 2:
+            raise ValueError(f"npy must be 2D (T,D), got {x.shape} at {npy_path}")
+
         x = torch.from_numpy(x).float()
         return x, torch.tensor(y, dtype=torch.long)
 
@@ -66,6 +73,7 @@ def collate_pad(batch):
 
     x_pad = torch.zeros(B, T_max, D, dtype=torch.float32)
     mask = torch.ones(B, T_max, dtype=torch.bool)
+
     for i, x in enumerate(xs):
         T = x.shape[0]
         x_pad[i, :T] = x
@@ -76,22 +84,23 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 2) 评估：patch-mix 风格 argmax + 4->2 ICBHI
+# 2) 评估：4-class argmax -> 4->2 ICBHI
 # ============================================================
 @torch.no_grad()
-def evaluate_like_patchmix(model, loader, device) -> Dict[str, float]:
-    model.eval()
+def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
+    backbone.eval()
+    classifier.eval()
+
     all_pred4, all_true4 = [], []
 
     for x, mask, y in loader:
-        x = x.to(device)
-        mask = mask.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-        out = model(x, mask)
-        file_logits = out[0] if isinstance(out, (tuple, list)) else out  # ✅ (B,4)
-
-        pred4 = torch.argmax(file_logits, dim=1)  # 4-class argmax
+        feat = backbone(x, mask=mask)              # (B, d_model)
+        logits = classifier(feat)                  # (B, 4)
+        pred4 = torch.argmax(logits, dim=1)
 
         all_pred4.append(pred4.cpu())
         all_true4.append(y.cpu())
@@ -135,7 +144,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 4) 主训练流程：patch-mix 风格：每 epoch 在 TEST 上评估并选 best
+# 4) 主训练流程：每 epoch 在 TEST 上评估并选 best（patchmix-style）
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -155,8 +164,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_patchmix_style")
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA")
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--use_weighted_loss", action="store_true", help="use class-balanced CE")
 
     # tokens 维度（来自 AST patch projection hidden_dim，常见 768）
     parser.add_argument("--in_dim", type=int, default=768)
@@ -164,7 +174,11 @@ def main():
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--max_len", type=int, default=4096)
     parser.add_argument("--num_classes", type=int, default=4)
+
+    # amp
+    parser.add_argument("--amp", action="store_true", help="use mixed precision")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -186,68 +200,88 @@ def main():
     ds_test = TokenNPYDataset(str(test_csv))
 
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True, collate_fn=collate_pad)
+                          num_workers=args.num_workers, pin_memory=True, collate_fn=collate_pad, drop_last=True)
     dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
                          num_workers=args.num_workers, pin_memory=True, collate_fn=collate_pad)
 
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
+    print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
 
-    # ✅ 方案B：直接 build 4-class 模型
-    model = build_model(
+    # Build backbone + classifier (路线A)
+    backbone = build_backbone(
         in_dim=args.in_dim,
         d_model=args.d_model,
         n_layers=args.n_layers,
         nhead=args.nhead,
         dropout=args.dropout,
-        num_classes=args.num_classes
+        max_len=args.max_len
     ).to(device)
 
-    # ✅ sanity check：确认 file_logits 是 (B,4)
+    classifier = nn.Linear(backbone.final_feat_dim, args.num_classes).to(device)
+
+    # sanity check
     x0, m0, y0 = next(iter(dl_train))
     with torch.no_grad():
-        out0 = model(x0.to(device), m0.to(device))
-        file_logits0 = out0[0] if isinstance(out0, (tuple, list)) else out0
-    print("[DEBUG] file_logits shape (must be B,4):", tuple(file_logits0.shape))
+        feat0 = backbone(x0.to(device), mask=m0.to(device))
+        logit0 = classifier(feat0)
+    print("[DEBUG] feat shape:", tuple(feat0.shape), "logits shape:", tuple(logit0.shape))
 
-    # loss/optim/scheduler
-    loss_fn = nn.CrossEntropyLoss()
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # loss
+    if args.use_weighted_loss:
+        counts = ds_train.class_counts.astype(np.float32)
+        w = 1.0 / (counts / counts.sum() + 1e-12)
+        w = w / w.sum()
+        weight = torch.tensor(w, device=device, dtype=torch.float32)
+        print("[INFO] weighted CE weights:", w)
+        loss_fn = nn.CrossEntropyLoss(weight=weight)
+    else:
+        loss_fn = nn.CrossEntropyLoss()
+
+    # optimizer / scheduler (per-step cosine)
+    params = list(backbone.parameters()) + list(classifier.parameters())
+    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     total_steps = args.epochs * max(1, len(dl_train))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     best_icbhi = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (patch-mix style: eval on TEST every epoch)\n")
+    print("\n🚀 Start training (Route-A: backbone->classifier, eval on TEST every epoch)\n")
 
     for epoch in range(1, args.epochs + 1):
-        model.train()
+        backbone.train()
+        classifier.train()
+
         t0 = time.time()
         running = 0.0
 
         for x, mask, y in dl_train:
-            x = x.to(device)
-            mask = mask.to(device)
-            y = y.to(device)  # long, 0~3
+            x = x.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-            out = model(x, mask)
-            file_logits = out[0] if isinstance(out, (tuple, list)) else out  # ✅ (B,4)
-
-            loss = loss_fn(file_logits, y)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                feat = backbone(x, mask=mask)
+                logits = classifier(feat)
+                loss = loss_fn(logits, y)
 
             optim.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optim.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(params, 5.0)
+            scaler.step(optim)
+            scaler.update()
             scheduler.step()
 
             running += float(loss.item())
 
         train_loss = running / max(1, len(dl_train))
 
-        # ✅ 每轮评估 TEST，按 ICBHI 选 best（像 patch-mix）
-        test_m = evaluate_like_patchmix(model, dl_test, device)
+        # eval
+        test_m = evaluate_icbhi(backbone, classifier, dl_test, device)
         icbhi = test_m["ICBHI"]
 
         improved = icbhi > best_icbhi + 1e-6
@@ -256,7 +290,13 @@ def main():
             best_epoch = epoch
             bad_epochs = 0
             torch.save(
-                {"epoch": epoch, "model_state": model.state_dict(), "best_icbhi": best_icbhi, "args": vars(args)},
+                {
+                    "epoch": epoch,
+                    "backbone_state": backbone.state_dict(),
+                    "classifier_state": classifier.state_dict(),
+                    "best_icbhi": best_icbhi,
+                    "args": vars(args),
+                },
                 ckpt_path
             )
             star = "⭐"

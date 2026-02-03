@@ -28,7 +28,7 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
 # 2. 基础 BiMamba 块
 # =========================
 class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.2):
+    def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
         super().__init__()
         if Mamba is None:
             raise RuntimeError(
@@ -37,8 +37,8 @@ class BiMambaBlock(nn.Module):
             )
 
         self.ln1 = nn.LayerNorm(d_model)
-        self.fwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.bwd = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.drop = nn.Dropout(dropout)
 
         self.ln2 = nn.LayerNorm(d_model)
@@ -51,17 +51,16 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
+        """
+        x: (B, T, D)
+        """
         h = self.ln1(x)
-        # 双向 Mamba 合并
         h_f = self.fwd(h)
-        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
+        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])  # 双向
         x = x + self.drop(h_f + h_b)
         return x + self.mlp(self.ln2(x))
 
 
-# =========================
-# 3. SSA 层 (单层定义)
-# =========================
 # =========================
 # 3. SSA 层 (3 Mamba -> 1 Attention -> 3 Mamba)
 # =========================
@@ -69,26 +68,22 @@ class SSA_Layer(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
 
-        # 1) 局部特征提取
+        # 1) 局部特征提取（depthwise conv）
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
         )
 
-        # 2) 前置 3 个 BiMamba (调整处)
-        self.mambas_pre = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(3)
-        ])
+        # 2) 前置 3 个 BiMamba
+        self.mambas_pre = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(3)])
 
-        # 3) 中间 1 个 Attention 层 (调整处)
+        # 3) 中间 1 个 Attention
         self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
 
-        # 4) 后置 3 个 BiMamba (调整处)
-        self.mambas_post = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(3)
-        ])
+        # 4) 后置 3 个 BiMamba
+        self.mambas_post = nn.ModuleList([BiMambaBlock(d_model, dropout=dropout) for _ in range(3)])
 
         # 5) 门控残差
         self.gate = nn.Sequential(
@@ -97,44 +92,57 @@ class SSA_Layer(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        """
+        x: (B, T, D)
+        mask: (B, T) True 表示 padding
+        """
         res = x
 
         # Local Conv
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
 
-        # Pre Mambas (3 layers)
+        # Pre Mambas
         for blk in self.mambas_pre:
             x = blk(x)
 
-        # Single Attention (1 layer)
+        # Single Attention
         x_n = self.attn_ln(x)
-        # 注意：mask 处理 padding
         x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
         x = x + x_a
 
-        # Post Mambas (3 layers)
+        # Post Mambas
         for blk in self.mambas_post:
             x = blk(x)
 
-        # Gated Residual
-        g = self.gate(x.mean(dim=1, keepdim=True))
+        # ✅ Mask-aware gated residual（避免 padding 污染）
+        if mask is None:
+            pooled = x.mean(dim=1, keepdim=True)  # (B,1,D)
+        else:
+            valid = (~mask).unsqueeze(-1).float()  # (B,T,1) 1=valid
+            denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled = (x * valid).sum(dim=1, keepdim=True) / denom
+
+        g = self.gate(pooled)  # (B,1,D)
         return res + g * x
+
+
 # =========================
-# 4. 完整的 SSA 模型（方案B：直接输出 4类 logits）
+# 4. SSA 模型（支持返回 feature）
 # =========================
 class SSA_Model_HeARTokens(nn.Module):
     def __init__(
         self,
-        in_dim=1024,
-        d_model=512,
-        n_layers=6,
+        in_dim=768,
+        d_model=256,
+        n_layers=4,
         nhead=8,
         dropout=0.3,
-        max_len=2000,
-        num_classes=4,   # ✅ 关键：4-class
+        max_len=4096,
+        num_classes=4,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.d_model = d_model
 
         # 输入投影
         self.input_proj = nn.Sequential(
@@ -143,9 +151,9 @@ class SSA_Model_HeARTokens(nn.Module):
             nn.LayerNorm(d_model),
         )
 
-        # 位置编码 buffer
+        # 位置编码 buffer（CPU 初始化，forward 时自动搬到同设备）
         pe = sinusoidal_positional_encoding(max_len, d_model, device='cpu')
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+        self.register_buffer('pe', pe.unsqueeze(0), persistent=False)  # (1, max_len, d_model)
         self.pos_drop = nn.Dropout(dropout)
 
         # 堆叠 SSA 层
@@ -156,29 +164,34 @@ class SSA_Model_HeARTokens(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-        # Attention Pooling
+        # Attention Pooling（文件级 pooling）
         self.attention_net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
             nn.Linear(d_model // 2, 1)
         )
 
-        # ✅ 关键：输出 4 类
+        # （路线B兼容保留：内部 classifier/token_head，可不用）
         self.classifier = nn.Linear(d_model, num_classes)      # (B,4)
-        self.token_head = nn.Linear(d_model, num_classes)      # (B,T,4) 可选
+        self.token_head = nn.Linear(d_model, num_classes)      # (B,T,4)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, return_feature=False):
         """
         x: (B, T, in_dim)
         mask: (B, T) True 表示 padding
-        return:
-          file_logits: (B, num_classes)
-          token_logits: (B, T, num_classes)
+        return_feature=True:
+            file_feature: (B, d_model)
+            token_feature: (B, T, d_model)
+        return_feature=False:
+            file_logits: (B, num_classes)
+            token_logits: (B, T, num_classes)
         """
         # 1) 投影与位置编码
-        x = self.input_proj(x)
+        x = self.input_proj(x)  # (B,T,d_model)
         B, T, D = x.shape
-        x = x + self.pe[:, :T, :]
+
+        # pe 自动 broadcast，且切片到 T
+        x = x + self.pe[:, :T, :].to(x.device)
         x = self.pos_drop(x)
 
         # 2) SSA 堆叠
@@ -195,25 +208,40 @@ class SSA_Model_HeARTokens(nn.Module):
         attn_w = torch.softmax(attn_scores, dim=1)   # (B, T, 1)
         file_feature = torch.sum(attn_w * x, dim=1)  # (B, d_model)
 
-        # 4) 输出 logits（✅不 squeeze）
+        if return_feature:
+            return file_feature, x
+
+        # 4) 输出 logits（路线B兼容）
         file_logits = self.classifier(file_feature)  # (B,4)
         token_logits = self.token_head(x)            # (B,T,4)
-
         return file_logits, token_logits
 
 
 # =========================
-# 5. 构建函数：直接返回 4-class 模型（不需要 wrapper）
+# 5. Backbone Wrapper（路线A）
 # =========================
-def build_model(in_dim=1024, d_model=512, n_layers=4, nhead=8, dropout=0.3, num_classes=4):
-    model = SSA_Model_HeARTokens(
+class SSA_Backbone(nn.Module):
+    def __init__(self, ssa_model: SSA_Model_HeARTokens):
+        super().__init__()
+        self.ssa = ssa_model
+        self.final_feat_dim = ssa_model.d_model  # 直接等于 d_model
+
+    def forward(self, x, mask=None):
+        feat, _ = self.ssa(x, mask=mask, return_feature=True)  # (B,d_model)
+        return feat
+
+
+def build_backbone(in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3, max_len=4096):
+    ssa = SSA_Model_HeARTokens(
         in_dim=in_dim,
         d_model=d_model,
         n_layers=n_layers,
         nhead=nhead,
         dropout=dropout,
-        num_classes=num_classes
+        max_len=max_len,
+        num_classes=4,
     )
-    params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA 4-Class Model Initialized. Parameters: {params:,}")
-    return model
+    backbone = SSA_Backbone(ssa)
+    params = sum(p.numel() for p in backbone.parameters())
+    print(f"✅ SSA Backbone Initialized. Parameters: {params:,} | final_feat_dim={backbone.final_feat_dim}")
+    return backbone
