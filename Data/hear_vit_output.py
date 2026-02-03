@@ -1,58 +1,69 @@
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import importlib
+import argparse
+import numpy as np
 import torch
+import torchaudio
+from torchaudio import transforms as T
+import torch.nn.functional as F
 from transformers import AutoModel
 
-MODEL_DIR = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--google--hear-pytorch/snapshots/"
-    "f791cd42437c3e268c8ac84707e3508900f65f1a"
-)
+SR = 16000
+TARGET_SAMPLES = 32000
 
-HEAR_REPO = "/data/dingcong/hybrid/hear"
+def load_wav_2s(path: str):
+    wav, orig_sr = torchaudio.load(path)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if orig_sr != SR:
+        wav = T.Resample(orig_sr, SR)(wav)
 
+    n = wav.shape[-1]
+    if n > TARGET_SAMPLES:
+        wav = wav[:, :TARGET_SAMPLES]
+    elif n < TARGET_SAMPLES:
+        pad = TARGET_SAMPLES - n
+        wav = F.pad(wav, (pad//2, pad - pad//2))
+    return wav  # (1, 32000)
+
+@torch.no_grad()
 def main():
-    # 让 python 能 import 你本地 hear repo 的 preprocess
-    os.environ["PYTHONPATH"] = HEAR_REPO + ":" + os.environ.get("PYTHONPATH", "")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_dir", required=True)
+    ap.add_argument("--wav", required=True)
+    args = ap.parse_args()
 
-    # 导入 hear 的 preprocess_audio（官方示例就是这个）
-    audio_utils = importlib.import_module("hear.python.data_processing.audio_utils")
-    preprocess_audio = audio_utils.preprocess_audio
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("device:", device)
-    print("MODEL_DIR:", MODEL_DIR)
-
-    model = AutoModel.from_pretrained(MODEL_DIR, local_files_only=True).to(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModel.from_pretrained(args.model_dir, local_files_only=True).to(device)
     model.eval()
-    print("✅ model loaded")
 
-    # 假 2 秒音频： (B, 32000)
-    wav = torch.randn(2, 32000, dtype=torch.float32)
+    x = load_wav_2s(args.wav).to(device).float()  # (1,32000)
 
-    # 前处理（wave -> spec/features）
-    feats = preprocess_audio(wav)  # 通常是 (B, F, T) 或类似
-    print("preprocess_audio output shape:", tuple(feats.shape))
+    out = model(x, return_dict=True)
 
-    with torch.no_grad():
-        out = model(feats.to(device), return_dict=True, output_hidden_states=True)
+    print("\n=== Model output fields ===")
+    for k in out.keys():
+        v = out[k]
+        if hasattr(v, "shape"):
+            print(f"{k}: {tuple(v.shape)}")
+        else:
+            print(f"{k}: {type(v)}")
 
-    # 打印可用字段
-    if hasattr(out, "keys"):
-        print("output keys:", list(out.keys()))
+    # 1) pooler_output (best)
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        emb = out.pooler_output.squeeze(0)
+        source = "pooler_output"
+    else:
+        # 2) CLS from last_hidden_state
+        if not hasattr(out, "last_hidden_state") or out.last_hidden_state is None:
+            raise RuntimeError("No pooler_output and no last_hidden_state. Cannot get ViT embedding.")
+        emb = out.last_hidden_state[:, 0, :].squeeze(0)
+        source = "cls_from_last_hidden_state"
 
-    # 常见候选：ViT token 序列 / 池化 embedding
-    for name in ["pooler_output", "embeddings", "last_hidden_state"]:
-        if hasattr(out, name) and getattr(out, name) is not None:
-            t = getattr(out, name)
-            print(f"{name} shape:", tuple(t.shape))
-
-    if hasattr(out, "hidden_states") and out.hidden_states is not None:
-        print("num hidden_states:", len(out.hidden_states))
-        print("hidden_states[-1] shape:", tuple(out.hidden_states[-1].shape))
+    emb_np = emb.detach().cpu().numpy()
+    print(f"\n✅ ViT embedding source: {source}")
+    print("✅ embedding shape:", emb_np.shape)
+    print("✅ mean/std:", float(emb_np.mean()), float(emb_np.std()))
+    print("✅ nan:", bool(np.isnan(emb_np).any()), "inf:", bool(np.isinf(emb_np).any()))
 
 if __name__ == "__main__":
     main()
