@@ -41,16 +41,37 @@ class BiMambaBlock(nn.Module):
 
 
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
+    """
+    一个 layer 的结构变成：
+    local conv
+      -> BiMamba x3
+      -> Self-Attention x1
+      -> BiMamba x3
+      -> gated residual
+    """
+    def __init__(self, d_model, nhead=8, dropout=0.3, mamba_blocks=3):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
         )
-        self.mamba = BiMambaBlock(d_model, dropout=dropout)
+
+        # ✅ 前 3 个 BiMamba
+        self.mambas_pre = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+        ])
+
+        # ✅ 中间 1 个 Attention
         self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+
+        # ✅ 后 3 个 BiMamba
+        self.mambas_post = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+        ])
+
+        # gated residual
         self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
 
     def forward(self, x, mask=None):
@@ -60,20 +81,26 @@ class SSA_Layer(nn.Module):
         """
         res = x
 
-        # local
+        # 0) local conv
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
 
-        # sequence modeling
-        x = self.mamba(x)
+        # 1) BiMamba x3 (pre)
+        for blk in self.mambas_pre:
+            x = blk(x)
 
-        # global attention
+        # 2) Attention x1
         x_n = self.attn_ln(x)
         x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask, need_weights=False)
         x = x + x_a
 
-        # gated residual
-        g = self.gate(x.mean(dim=1, keepdim=True))
+        # 3) BiMamba x3 (post)
+        for blk in self.mambas_post:
+            x = blk(x)
+
+        # 4) gated residual
+        g = self.gate(x.mean(dim=1, keepdim=True))  # (B,1,D)
         return res + g * x
+
 
 
 class SSA_Model_HeARTokens(nn.Module):
