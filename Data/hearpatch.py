@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_files")
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/hear_tokens")
     parser.add_argument("--hear_path", type=str, default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/spectrogram_frontend")
-    parser.add_argument("--split_file", type=str, default="/data/dingcong/hybrid/audio_and_txt_files/official_split")
+    parser.add_argument("--split_file", type=str, default="/data/dingcong/hybrid/audio_and_txt_files/official_split.txt")
     args = parser.parse_args()
 
     # 1. 初始化模型
