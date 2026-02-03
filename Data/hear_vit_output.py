@@ -117,63 +117,41 @@ def import_preprocess_audio(hear_repo_root: str):
 @torch.no_grad()
 def hear_embedding_from_waveform(model, preprocess_audio, wav_2s: torch.Tensor) -> Tuple[np.ndarray, str]:
     """
-    wav_2s: (1, 32000) float32 on CPU/GPU
-    Correct flow (per model card): waveform -> preprocess_audio -> spectrogram -> model.forward -> embedding
-    Output embedding per HF card: (B, 512).  :contentReference[oaicite:2]{index=2}
+    修改后：提取完整的序列 Embedding (L, D)
+    wav_2s: (1, 32000)
+    返回: (L, 1024) 或 (L, 768) 的 numpy 数组
     """
-    # preprocess_audio expects (B, 32000) on CPU tensor (usually)
-    # 为了稳：先搬到 CPU，再 preprocess；再把谱图搬回 device
-    wav_cpu = wav_2s.detach().float().cpu()  # (1,32000)
-    spec = preprocess_audio(wav_cpu)         # expected spectrogram batch
+    wav_cpu = wav_2s.detach().float().cpu()
+    spec = preprocess_audio(wav_cpu)
 
-    # spec 可能是 torch.Tensor，也可能是 dict；我们兼容
     if isinstance(spec, dict):
-        # 有些实现会返回 {"pixel_values": ...}
-        if "pixel_values" in spec:
-            spec_in = spec["pixel_values"]
-        else:
-            # 取第一个
-            spec_in = next(iter(spec.values()))
+        spec_in = spec["pixel_values"] if "pixel_values" in spec else next(iter(spec.values()))
     else:
         spec_in = spec
 
     spec_in = spec_in.to(next(model.parameters()).device)
 
+    # 1. 运行模型前向传播
     out = model.forward(spec_in, return_dict=True, output_hidden_states=True)
 
-    # 兼容几种输出：最常见是 out 为 Tensor (B,512) 或者 dict-like
-    if isinstance(out, torch.Tensor):
-        emb = out
-        src = "tensor_output"
+    # 2. 提取序列特征 (Last Hidden State)
+    # HeAR (ViT-based) 的 last_hidden_state 形状通常是 (Batch, Seq_Len, Hidden_Dim)
+    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+        emb = out.last_hidden_state  # 形状为 (1, L, D)
+        src = "last_hidden_state_full_sequence"
     else:
-        # 尝试常见字段
-        if hasattr(out, "embeddings") and out.embeddings is not None:
-            emb = out.embeddings
-            src = "out.embeddings"
-        elif hasattr(out, "pooler_output") and out.pooler_output is not None:
-            emb = out.pooler_output
-            src = "pooler_output"
-        elif hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-            # CLS token
-            emb = out.last_hidden_state[:, 0, :]
-            src = "cls_from_last_hidden_state"
+        # 兜底逻辑：如果找不到 last_hidden_state，尝试从 hidden_states 获取最后一层
+        if hasattr(out, "hidden_states") and out.hidden_states is not None:
+            emb = out.hidden_states[-1]
+            src = "hidden_states_last_layer"
         else:
-            # 兜底：字典取第一个 tensor
-            d = out.to_dict() if hasattr(out, "to_dict") else dict(out)
-            t = None
-            k_used = None
-            for k, v in d.items():
-                if torch.is_tensor(v):
-                    t = v
-                    k_used = k
-                    break
-            if t is None:
-                raise RuntimeError(f"模型输出里找不到 tensor，可用键: {list(d.keys())}")
-            emb = t
-            src = f"dict_first_tensor:{k_used}"
+            raise RuntimeError("无法找到序列特征，请检查模型输出字段")
 
-    # emb: (1, D) -> (D,)
+    # 3. 去掉 Batch 维度，保留 (L, D)
+    # 注意：ViT 通常包含一个 CLS token (index 0)，
+    # 如果你不需要 CLS token，可以使用 emb[0, 1:, :]
     emb = emb.squeeze(0)
+
     return emb.detach().cpu().numpy().astype(np.float32), src
 
 # -------------------------
