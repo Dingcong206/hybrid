@@ -3,6 +3,9 @@ import torch.nn as nn
 from mamba_ssm import Mamba
 
 
+# =========================
+# 1. 位置编码函数
+# =========================
 def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
     pe = torch.zeros(seq_len, dim, device=device)
     position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
@@ -15,6 +18,9 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
     return pe
 
 
+# =========================
+# 2. 基础 BiMamba 块
+# =========================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2):
         super().__init__()
@@ -33,148 +39,144 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, T, D)
         h = self.ln1(x)
-        h = self.fwd(h) + torch.flip(self.bwd(torch.flip(h, [1])), [1])
-        x = x + self.drop(h)
+        # 双向 Mamba 合并
+        h_f = self.fwd(h)
+        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
+        x = x + self.drop(h_f + h_b)
         return x + self.mlp(self.ln2(x))
 
 
+# =========================
+# 3. SSA 层 (单层定义)
+# =========================
 class SSA_Layer(nn.Module):
-    """
-    一个 layer 的结构变成：
-    local conv
-      -> BiMamba x3
-      -> Self-Attention x1
-      -> BiMamba x3
-      -> gated residual
-    """
+    def __init__(self, d_model, nhead=8, dropout=0.3, mamba_blocks=3):
+        super().__init__()
+        # 局部卷积提取
+        self.conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
 
+        # 前置 Mamba 组
+        self.mambas_pre = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+        ])
+
+        # 中间注意力层
+        self.attn_ln = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+
+        # 后置 Mamba 组
+        self.mambas_post = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+        ])
+
+        # 门控残差
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+
+    def forward(self, x, mask=None):
+        res = x
+        # 1. 局部特征
+        x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
+
+        # 2. 前置双向 Mamba
+        for blk in self.mambas_pre:
+            x = blk(x)
+
+        # 3. 全局注意力
+        x_n = self.attn_ln(x)
+        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask, need_weights=False)
+        x = x + x_a
+
+        # 4. 后置双向 Mamba
+        for blk in self.mambas_post:
+            x = blk(x)
+
+        # 5. 门控输出
+        g = self.gate(x.mean(dim=1, keepdim=True))
+        return res + g * x
+
+
+# =========================
+# 4. 完整的 SSA 模型
+# =========================
+class SSA_Model_HeARTokens(nn.Module):
     def __init__(self, in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3, max_len=2000):
         super().__init__()
 
+        # 输入投影：将 HeAR 的 1024 映射到 d_model
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
 
-        # ✅ 改进方案 1: 使用 register_buffer 预存位置编码
-        # 这样位置编码会随 model.to(device) 自动移动，且不会被作为参数更新
+        # 位置编码 buffer (不计入梯度，随模型移动)
         pe = sinusoidal_positional_encoding(max_len, d_model, device='cpu')
         self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+        self.pos_drop = nn.Dropout(dropout)
 
+        # 堆叠 SSA 层
         self.layers = nn.ModuleList([
-            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout) for _ in range(n_layers)
+            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout)
+            for _ in range(n_layers)
         ])
 
         self.norm = nn.LayerNorm(d_model)
-        self.pos_drop = nn.Dropout(p=dropout)  # 建议在加完位置编码后加个 dropout
 
-        # ... (后续的池化和分类层保持不变) ...
+        # 注意力池化 (Attention Pooling)
         self.attention_net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
             nn.Linear(d_model // 2, 1)
         )
-        self.classifier = nn.Linear(d_model, 1)
-        self.token_head = nn.Linear(d_model, 1)
+
+        self.classifier = nn.Linear(d_model, 1)  # 文件级分类 logit
+        self.token_head = nn.Linear(d_model, 1)  # Token 级分类 logit
 
     def forward(self, x, mask=None):
         """
-        x: (B, T, 1024)
-        mask: (B, T) True=padding
+        x: (B, T, in_dim)
+        mask: (B, T) True 代表 padding 位置
         """
-        x = self.input_proj(x)  # (B, T, d_model)
-
-        # ✅ 改进方案 2: 根据当前输入的实际 T 裁剪预存的位置编码
+        # 1. 投影与位置编码
+        x = self.input_proj(x)
         B, T, D = x.shape
-        # self.pe 是 (1, max_len, D)，截取前 T 个变成 (1, T, D)
         x = x + self.pe[:, :T, :]
         x = self.pos_drop(x)
 
+        # 2. 经过多层 SSA
         for layer in self.layers:
             x = layer(x, mask=mask)
 
         x = self.norm(x)
 
-        # ... (后续池化逻辑保持不变) ...
-        attn_scores = self.attention_net(x)
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
-        attn_w = torch.softmax(attn_scores, dim=1)
-        file_feature = torch.sum(attn_w * x, dim=1)
-        file_logit = self.classifier(file_feature).squeeze(-1)
-        token_logits = self.token_head(x).squeeze(-1)
-
-        return file_logit, token_logits
-
-
-
-class SSA_Model_HeARTokens(nn.Module):
-    """
-    输入：HeAR tokens (B, T, 1024)，你现在 T≈200（也可变）
-    输出：file_logit (B,), token_logits (B, T)
-    """
-    def __init__(self, in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3):
-        super().__init__()
-
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-        )
-
-        self.layers = nn.ModuleList([
-            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout) for _ in range(n_layers)
-        ])
-
-        self.norm = nn.LayerNorm(d_model)
-
-        # Attention Pooling (learnable)
-        self.attention_net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.Tanh(),
-            nn.Linear(d_model // 2, 1)
-        )
-
-        self.classifier = nn.Linear(d_model, 1)
-        self.token_head = nn.Linear(d_model, 1)
-
-    def forward(self, x, mask=None):
-        """
-        x: (B, T, 1024)
-        mask: (B, T) True=padding
-        """
-        x = self.input_proj(x)  # (B, T, d_model)
-
-        B, T, D = x.shape
-        pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)  # (1,T,D)
-        x = x + pos
-
-        for layer in self.layers:
-            x = layer(x, mask=mask)
-
-        x = self.norm(x)  # (B, T, d_model)
-
-        # Attention pooling -> file_feature
+        # 3. 池化得到全局特征 (File-level)
         attn_scores = self.attention_net(x)  # (B, T, 1)
         if mask is not None:
+            # 屏蔽 padding 部分的权重
             attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
 
-        attn_w = torch.softmax(attn_scores, dim=1)        # (B, T, 1)
-        file_feature = torch.sum(attn_w * x, dim=1)       # (B, d_model)
+        attn_w = torch.softmax(attn_scores, dim=1)  # (B, T, 1)
+        file_feature = torch.sum(attn_w * x, dim=1)  # (B, d_model)
 
+        # 4. 输出层
         file_logit = self.classifier(file_feature).squeeze(-1)  # (B,)
-        token_logits = self.token_head(x).squeeze(-1)           # (B, T)
+        token_logits = self.token_head(x).squeeze(-1)  # (B, T)
 
         return file_logit, token_logits
 
 
-def build_model(in_dim=1024, d_model=512, n_layers=4, nhead=8, dropout=0.3):
+# =========================
+# 5. 构建函数
+# =========================
+def build_model(in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3):
     model = SSA_Model_HeARTokens(
         in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead, dropout=dropout
     )
     params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA Model for HeAR tokens Initialized. Parameters: {params:,}")
+    print(f"✅ SSA Model Initialized. Parameters: {params:,}")
     return model
