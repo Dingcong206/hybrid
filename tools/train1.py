@@ -6,7 +6,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mymodels.model import build_model   # 你自己的 build_model
+from mymodels.model import build_model   # ✅ 方案B：model 内部直接输出 (B,4)
 
 
 # ============================================================
@@ -76,54 +76,7 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 2) Wrapper：让你的 base 模型输出 4 类 logits (B,4)
-#    - 自动推断 embedding 维度
-#    - 如果 base 输出 (B,) 会报错提示你该改模型
-# ============================================================
-class SSA4ClassWrapper(nn.Module):
-    def __init__(self, base_model: nn.Module, num_classes: int = 4, dropout: float = 0.3):
-        super().__init__()
-        self.base = base_model
-        self.num_classes = num_classes
-        self.dropout = dropout
-        self.head = None  # 第一次 forward 自动创建
-
-    def _build_head(self, feat_dim: int):
-        self.head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Dropout(self.dropout),
-            nn.Linear(feat_dim, self.num_classes)
-        )
-
-    def forward(self, x, mask=None):
-        out = self.base(x, mask) if mask is not None else self.base(x)
-
-        # 兼容 tuple/list
-        feat = out[0] if isinstance(out, (tuple, list)) else out
-
-        # 必须是 (B,D) 才能做 4 类
-        if feat.dim() == 1:
-            raise RuntimeError(
-                "❌ 你的 SSA_Model_HeARTokens 当前输出是 (B,) 二分类logit，无法接 4 类 head。\n"
-                "✅ 解决办法：\n"
-                "  1) 让 SSA_Model_HeARTokens.forward 返回 (B,D) 的文件级 embedding（推荐），\n"
-                "     然后由本 wrapper 做 Linear(D,4) 分类；\n"
-                "  2) 或者你直接把 SSA_Model_HeARTokens 内部最后分类层改成 Linear(D,4)，并直接 return (B,4)。"
-            )
-
-        if feat.dim() != 2:
-            raise RuntimeError(f"❌ base 输出维度异常：期望 (B,D)，但得到 {tuple(feat.shape)}")
-
-        B, D = feat.shape
-        if self.head is None:
-            self._build_head(D)
-
-        logits4 = self.head(feat)  # (B,4)
-        return logits4
-
-
-# ============================================================
-# 3) 评估：像 patch-mix 一样 argmax + 4->2 ICBHI
+# 2) 评估：patch-mix 风格 argmax + 4->2 ICBHI
 # ============================================================
 @torch.no_grad()
 def evaluate_like_patchmix(model, loader, device) -> Dict[str, float]:
@@ -135,8 +88,10 @@ def evaluate_like_patchmix(model, loader, device) -> Dict[str, float]:
         mask = mask.to(device)
         y = y.to(device)
 
-        logits4 = model(x, mask)          # (B,4)
-        pred4 = torch.argmax(logits4, dim=1)
+        out = model(x, mask)
+        file_logits = out[0] if isinstance(out, (tuple, list)) else out  # ✅ (B,4)
+
+        pred4 = torch.argmax(file_logits, dim=1)  # 4-class argmax
 
         all_pred4.append(pred4.cpu())
         all_true4.append(y.cpu())
@@ -169,7 +124,7 @@ def evaluate_like_patchmix(model, loader, device) -> Dict[str, float]:
 
 
 # ============================================================
-# 4) 工具：随机种子
+# 3) 工具：随机种子
 # ============================================================
 def set_seed(seed: int = 42):
     import random
@@ -180,7 +135,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 5) 主训练流程：按 patch-mix 风格，每 epoch 在 TEST 上评估并选 best
+# 4) 主训练流程：patch-mix 风格：每 epoch 在 TEST 上评估并选 best
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -203,15 +158,15 @@ def main():
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_patchmix_style")
     parser.add_argument("--patience", type=int, default=10)
 
-    # 你的 tokens 维度（来自 AST patch projection hidden_dim，常见 768）
+    # tokens 维度（来自 AST patch projection hidden_dim，常见 768）
     parser.add_argument("--in_dim", type=int, default=768)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--num_classes", type=int, default=4)
 
     args = parser.parse_args()
-
     set_seed(args.seed)
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
@@ -237,15 +192,22 @@ def main():
 
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
 
-    # build base model (你自己的)
-    base = build_model(in_dim=args.in_dim, d_model=args.d_model, n_layers=args.n_layers, nhead=args.nhead, dropout=args.dropout)
-    model = SSA4ClassWrapper(base_model=base, num_classes=4, dropout=args.dropout).to(device)
+    # ✅ 方案B：直接 build 4-class 模型
+    model = build_model(
+        in_dim=args.in_dim,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        nhead=args.nhead,
+        dropout=args.dropout,
+        num_classes=args.num_classes
+    ).to(device)
 
-    # ✅ 训练前 sanity check：确认输出是 (B,4)
+    # ✅ sanity check：确认 file_logits 是 (B,4)
     x0, m0, y0 = next(iter(dl_train))
     with torch.no_grad():
-        logits0 = model(x0.to(device), m0.to(device))
-    print("[DEBUG] logits shape (must be B,4):", tuple(logits0.shape))
+        out0 = model(x0.to(device), m0.to(device))
+        file_logits0 = out0[0] if isinstance(out0, (tuple, list)) else out0
+    print("[DEBUG] file_logits shape (must be B,4):", tuple(file_logits0.shape))
 
     # loss/optim/scheduler
     loss_fn = nn.CrossEntropyLoss()
@@ -269,8 +231,10 @@ def main():
             mask = mask.to(device)
             y = y.to(device)  # long, 0~3
 
-            logits4 = model(x, mask)           # (B,4)
-            loss = loss_fn(logits4, y)
+            out = model(x, mask)
+            file_logits = out[0] if isinstance(out, (tuple, list)) else out  # ✅ (B,4)
+
+            loss = loss_fn(file_logits, y)
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -282,7 +246,7 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        # ✅ 每轮评估 TEST，按 ICBHI 选 best（像他）
+        # ✅ 每轮评估 TEST，按 ICBHI 选 best（像 patch-mix）
         test_m = evaluate_like_patchmix(model, dl_test, device)
         icbhi = test_m["ICBHI"]
 
