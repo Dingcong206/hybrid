@@ -4,190 +4,214 @@
 import os
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+import math
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchaudio
 from torchaudio import transforms as T
 import tensorflow as tf
 from tqdm import tqdm
 
 # =========================
-# HeAR-aligned constants
+# Constants
 # =========================
 SR = 16000
 DURATION_SEC = 2
-TARGET_SAMPLES = SR * DURATION_SEC  # 32000 samples
+TARGET_SAMPLES = SR * DURATION_SEC  # 32000
 
-
+# =========================
+# Label mapping (ICBHI 4-class)
+# =========================
 def lungsound_label(crackles: int, wheezes: int) -> int:
-    crackles, wheezes = int(crackles), int(wheezes)
-    if crackles == 0 and wheezes == 0: return 0
-    if crackles == 1 and wheezes == 0: return 1
-    if crackles == 0 and wheezes == 1: return 2
+    c, w = int(crackles), int(wheezes)
+    if c == 0 and w == 0: return 0
+    if c == 1 and w == 0: return 1
+    if c == 0 and w == 1: return 2
     return 3
 
-
+# =========================
+# Audio loading
+# =========================
 def load_wav_resample_mono(wav_path: str, target_sr: int = SR) -> torch.Tensor:
-    wav, orig_sr = torchaudio.load(wav_path)
-    if wav.shape[0] > 1: wav = wav.mean(dim=0, keepdim=True)
+    wav, orig_sr = torchaudio.load(wav_path)  # (C, N)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
     if orig_sr != target_sr:
         wav = T.Resample(orig_sr, target_sr)(wav)
-    return wav
+    return wav  # (1, N)
 
-
-def fix_to_2s_trunc_or_repeat(x: torch.Tensor) -> torch.Tensor:
-    if x.shape[-1] >= TARGET_SAMPLES:
-        y = x[..., :TARGET_SAMPLES]
+# =========================
+# Make 2s: energy-max crop if long; center-pad if short
+# =========================
+def process_to_2s_sample(wav: torch.Tensor) -> torch.Tensor:
+    """
+    wav: (1, N)
+    return: (1, 32000)
+    """
+    n = wav.shape[-1]
+    if n > TARGET_SAMPLES:
+        # sliding window find max energy, step=100ms
+        step = 1600  # 0.1s
+        windows = wav.unfold(-1, TARGET_SAMPLES, step)  # (1, num_win, 32000)
+        energies = torch.sum(windows ** 2, dim=-1)      # (1, num_win)
+        best_idx = torch.argmax(energies, dim=-1).item()
+        return windows[0, best_idx].unsqueeze(0)        # (1,32000)
+    elif n < TARGET_SAMPLES:
+        pad_total = TARGET_SAMPLES - n
+        pad_left = pad_total // 2
+        pad_right = pad_total - pad_left
+        return F.pad(wav, (pad_left, pad_right))
     else:
-        import math
-        ratio = math.ceil(TARGET_SAMPLES / max(1, x.shape[-1]))
-        y = x.repeat(1, ratio)[..., :TARGET_SAMPLES]
+        return wav
+
+# =========================
+# TF SavedModel helpers
+# =========================
+def load_tf_model(model_dir: str):
+    m = tf.saved_model.load(model_dir)
+    sigs = list(m.signatures.keys())
+    if "serving_default" not in m.signatures:
+        raise RuntimeError(f"No serving_default in signatures: {sigs}")
+    fn = m.signatures["serving_default"]
+    # auto detect input key
+    in_keys = list(fn.structured_input_signature[1].keys())
+    if len(in_keys) == 0:
+        raise RuntimeError("No input keys found in model signature.")
+    feed_key = in_keys[0]
+    return m, fn, feed_key, sigs
+
+def tf_forward_frontend(fn, feed_key: str, wav_2s: torch.Tensor) -> np.ndarray:
+    """
+    Input: wav_2s torch (1, 32000)
+    Output: feats numpy (T, 48)  [expected from spectrogram_frontend]
+    """
+    audio_tf = tf.constant(wav_2s.numpy().reshape(1, TARGET_SAMPLES), dtype=tf.float32)
+    out = fn(**{feed_key: audio_tf})
+    # take first output
+    first = next(iter(out.values()))
+    arr = first.numpy().squeeze(0)  # (T, 48) typically
+    return arr
+
+# =========================
+# Token projection: (T,48) -> (T,1024)
+# =========================
+def project_48_to_1024(x48: np.ndarray, seed: int = 42) -> np.ndarray:
+    """
+    x48: (T,48)
+    return: (T,1024)
+    Note: This is a learnable projection in a real model.
+          Here we initialize a fixed random matrix so you can SAVE tokens offline.
+          Better: do this projection inside your PyTorch model and train it.
+    """
+    rng = np.random.default_rng(seed)
+    W = rng.standard_normal((48, 1024)).astype(np.float32) / math.sqrt(48.0)
+    b = np.zeros((1024,), dtype=np.float32)
+    x = x48.astype(np.float32) @ W + b
+    return x
+
+def downsample_to_128(x: np.ndarray) -> np.ndarray:
+    """
+    x: (T,1024) -> (128,1024) using linear interpolation along time
+    """
+    xt = torch.from_numpy(x).transpose(0, 1).unsqueeze(0)  # (1,1024,T)
+    yt = F.interpolate(xt, size=128, mode="linear", align_corners=False)
+    y = yt.squeeze(0).transpose(0, 1).cpu().numpy()        # (128,1024)
     return y
 
-
 # =========================
-# HeAR 特征提取 (进入 ViT 之前的 Patch Tokens)
+# Main
 # =========================
-# ... 保持之前的 load_wav 和 fix_to_2s 函数不变 ...
-# ... 之前的导入和 lungsound_label 等函数保持不变 ...
-
-def extract_hear_patch_tokens(model_fn, wav_2s: torch.Tensor) -> np.ndarray:
-    """
-    进入 ViT 前的 1024 维特征提取
-    """
-    # 转换音频为 TensorFlow Tensor
-    audio_tf = tf.constant(wav_2s.numpy().reshape(1, 32000), dtype=tf.float32)
-
-    # 【核心修改】调用你验证成功的 'serving_default' 签名
-    outputs = model_fn(audio_wav=audio_tf)
-
-    # 自动在输出字典中寻找形状末尾为 1024 的特征项
-    # 因为 Large 版本的 Patch Projection 输出一定是 (1, 128, 1024)
-    for key, val in outputs.items():
-        if len(val.shape) == 3 and val.shape[2] == 1024:
-            return val.numpy().squeeze(0)
-
-    # 如果没找到 1024 维，取第一个输出结果
-    res = list(outputs.values())[0].numpy()
-    return res.squeeze(0)
-
-
-def main():
-    # ... args 解析部分 ...
-
-    # 1. 使用你 ls 指令确认存在的物理路径
-    hear_path = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large"
-
-    print(f"📦 Loading HeAR Large Model from: {hear_path}")
-    hear_model = tf.saved_model.load(hear_path)
-
-    # 2. 【关键修改】使用你截图验证出的接口名称
-    if "serving_default" in hear_model.signatures:
-        extract_fn = hear_model.signatures["serving_default"]
-        print("✅ 成功关联签名: serving_default")
-    else:
-        # 如果连 serving_default 都没有，则取列表第一个
-        first_sig = list(hear_model.signatures.keys())[0]
-        extract_fn = hear_model.signatures[first_sig]
-        print(f"⚠️ 使用备选签名: {first_sig}")
-
-    # ... 剩下的 official_split 加载和文件循环逻辑与你之前的一致 ...
-
-def main():
-    # ... args 解析 ...
-
-    # 设置为你验证成功的路径
-    hear_path = "/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large"
-
-    print(f"📦 加载 HeAR Large Encoder: {hear_path}")
-    hear_model = tf.saved_model.load(hear_path)
-
-    # 使用你刚才验证出的 'serving_default'
-    extract_fn = hear_model.signatures["serving_default"]
-    print("✅ 成功关联核心接口: serving_default")
-
-    # ... 剩下的文件循环和保存逻辑 ...
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_files")
-    parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_hear_patch_128_1024")
-
-    # 【关键修改】路径指向 encoder 目录
-    parser.add_argument("--hear_path", type=str,
-                        default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/event_detector_large")
+    parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_tokens_T_1024")
+    parser.add_argument("--frontend_path", type=str, required=True,
+                        help="TF SavedModel dir for spectrogram_frontend")
+    parser.add_argument("--split_file", type=str, default="/data/dingcong/hybrid/audio_and_txt_files/official_split.txt")
+    parser.add_argument("--force_128", action="store_true",
+                        help="if set, downsample tokens to (128,1024) before saving")
+    parser.add_argument("--proj_seed", type=int, default=42,
+                        help="random seed for offline projection 48->1024 (better to learn in-model)")
     args = parser.parse_args()
 
-    # 1. 加载 HeAR Encoder 模块
-    print(f"📦 Loading HeAR Encoder from: {args.hear_path}")
-    hear_model = tf.saved_model.load(args.hear_path)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # 【关键修改】使用 get_patch_embeddings 签名
-    if "get_patch_embeddings" in hear_model.signatures:
-        extract_fn = hear_model.signatures["get_patch_embeddings"]
-        print("✅ 成功关联 'get_patch_embeddings' 签名 (输出维度: 1024)")
-    else:
-        # 兜底方案：打印所有签名供检查
-        print(f"❌ 未找到指定签名。可用签名: {list(hear_model.signatures.keys())}")
-        return
+    print(f"📦 Loading spectrogram_frontend from: {args.frontend_path}")
+    _, fn, feed_key, sigs = load_tf_model(args.frontend_path)
+    print(f"✅ signatures: {sigs}")
+    print(f"✅ input key: {feed_key}")
 
-    # 2. 官方划分文件
-    split_path = os.path.join(args.data_dir, "official_split.txt")
-    split_df = pd.read_csv(split_path, sep='\t', names=['file', 'set'])
-    split_map = dict(zip(split_df['file'], split_df['set']))
+    split_df = pd.read_csv(args.split_file, sep="\t", names=["file", "set"])
+    split_map = dict(zip(split_df["file"], split_df["set"]))
 
-    # 3. 创建目录
-    for s in ["train", "test"]: os.makedirs(os.path.join(args.out_dir, s), exist_ok=True)
-
-    # 4. 扫描并处理
     wav_files = list(Path(args.data_dir).glob("*.wav"))
-    all_rows = []
+    print(f"🔍 Found {len(wav_files)} wav files.")
+
+    index_rows = []
 
     for wav_path in tqdm(wav_files):
-        tag = split_map.get(wav_path.stem) or split_map.get(wav_path.name)
-        if not tag: continue
-
         txt_path = wav_path.with_suffix(".txt")
-        if not txt_path.exists(): continue
+        if not txt_path.exists():
+            continue
 
-        wav = load_wav_resample_mono(str(wav_path))
+        tag = split_map.get(wav_path.stem) or split_map.get(wav_path.name)
+        if not tag:
+            continue
+
+        # load full recording
+        wav = load_wav_resample_mono(str(wav_path))  # (1,N)
+
+        # read cycles
         ann = pd.read_csv(txt_path, sep="\t", header=None, names=["Start", "End", "C", "W"])
         patient_id = wav_path.stem.split("_")[0]
 
         for i, r in ann.iterrows():
-            start_i, end_i = int(r["Start"] * SR), int(r["End"] * SR)
+            start_i = int(float(r["Start"]) * SR)
+            end_i   = int(float(r["End"])   * SR)
             cycle = wav[:, start_i:end_i]
-            if cycle.shape[-1] < 1600: continue
+            if cycle.shape[-1] < 1600:
+                continue
 
-            cycle_2s = fix_to_2s_trunc_or_repeat(cycle)
+            y = lungsound_label(r["C"], r["W"])
+            cycle_2s = process_to_2s_sample(cycle)  # (1,32000)
 
-            # 提取维度为 (128, 1024) 的 Patch Tokens
-            tokens = extract_hear_patch_tokens(extract_fn, cycle_2s)
+            # 1) frontend feats (T,48)
+            x48 = tf_forward_frontend(fn, feed_key, cycle_2s)
 
-            # 按患者 ID 分文件夹保存
-            save_subdir = os.path.join(args.out_dir, tag, patient_id)
-            os.makedirs(save_subdir, exist_ok=True)
-            npy_name = f"{wav_path.stem}_c{i}_y{lungsound_label(r['C'], r['W'])}.npy"
-            npy_path = os.path.join(save_subdir, npy_name)
+            # 2) project to tokens (T,1024)
+            x1024 = project_48_to_1024(x48, seed=args.proj_seed)
+
+            # 3) optional: force to (128,1024)
+            tokens = downsample_to_128(x1024) if args.force_128 else x1024
+
+            # save
+            save_subdir = Path(args.out_dir) / tag / patient_id
+            save_subdir.mkdir(parents=True, exist_ok=True)
+
+            npy_name = f"{wav_path.stem}_cycle{i}_y{y}.npy"
+            npy_path = save_subdir / npy_name
             np.save(npy_path, tokens)
 
-            all_rows.append({
-                "tokens_path": npy_path,
-                "label": lungsound_label(r["C"], r["W"]),
+            index_rows.append({
+                "tokens_path": str(npy_path),
+                "label": y,
+                "recording": wav_path.stem,
                 "patient_id": patient_id,
-                "set": tag
+                "set": tag,
+                "shape": str(tokens.shape),
             })
 
-    # 5. 保存索引
-    full_df = pd.DataFrame(all_rows)
-    for s in ["train", "test"]:
-        full_df[full_df['set'] == s].to_csv(os.path.join(args.out_dir, f"{s}_index.csv"), index=False)
+    df = pd.DataFrame(index_rows)
+    df[df["set"] == "train"].to_csv(Path(args.out_dir) / "train_index.csv", index=False)
+    df[df["set"] == "test"].to_csv(Path(args.out_dir) / "test_index.csv", index=False)
 
-    print(f"🚀 处理完成！最终特征维度: {tokens.shape}")
-
+    print("\n✨ Done.")
+    if len(df) > 0:
+        print("Example saved shape:", df.iloc[-1]["shape"])
+    print("train:", (df["set"] == "train").sum(), " test:", (df["set"] == "test").sum())
 
 if __name__ == "__main__":
     main()
