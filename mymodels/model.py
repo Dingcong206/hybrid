@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
 
+from mymodels.wrapper import SSA4ClassWrapper
 
 # =========================
 # 1. 位置编码函数
@@ -51,55 +52,67 @@ class BiMambaBlock(nn.Module):
 # 3. SSA 层 (单层定义)
 # =========================
 class SSA_Layer(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3, mamba_blocks=3):
+    def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
-        # 局部卷积提取
+
+        # 1. 局部特征提取
         self.conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
         )
 
-        # 前置 Mamba 组
+        # 2. 前置 4 个 BiMamba
         self.mambas_pre = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(4)
         ])
 
-        # 中间注意力层
-        self.attn_ln = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        # 3. 中间 2 个 Attention 层 (带残差和归一化)
+        self.attn1_ln = nn.LayerNorm(d_model)
+        self.attn1 = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
 
-        # 后置 Mamba 组
+        self.attn2_ln = nn.LayerNorm(d_model)
+        self.attn2 = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+
+        # 4. 后置 4 个 BiMamba
         self.mambas_post = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
+            BiMambaBlock(d_model, dropout=dropout) for _ in range(4)
         ])
 
-        # 门控残差
-        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        # 5. 门控残差
+        self.gate = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
 
     def forward(self, x, mask=None):
         res = x
-        # 1. 局部特征
+
+        # --- Local Conv ---
         x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
 
-        # 2. 前置双向 Mamba
+        # --- Pre Mambas (4 layers) ---
         for blk in self.mambas_pre:
             x = blk(x)
 
-        # 3. 全局注意力
-        x_n = self.attn_ln(x)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask, need_weights=False)
-        x = x + x_a
+        # --- Dual Attention (2 layers) ---
+        # 第一层 Attention
+        x_n1 = self.attn1_ln(x)
+        x_a1, _ = self.attn1(x_n1, x_n1, x_n1, key_padding_mask=mask)
+        x = x + x_a1
 
-        # 4. 后置双向 Mamba
+        # 第二层 Attention
+        x_n2 = self.attn2_ln(x)
+        x_a2, _ = self.attn2(x_n2, x_n2, x_n2, key_padding_mask=mask)
+        x = x + x_a2
+
+        # --- Post Mambas (4 layers) ---
         for blk in self.mambas_post:
             x = blk(x)
 
-        # 5. 门控输出
+        # --- Gated Residual ---
         g = self.gate(x.mean(dim=1, keepdim=True))
         return res + g * x
-
-
 # =========================
 # 4. 完整的 SSA 模型
 # =========================
@@ -173,10 +186,19 @@ class SSA_Model_HeARTokens(nn.Module):
 # =========================
 # 5. 构建函数
 # =========================
-def build_model(in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3):
-    model = SSA_Model_HeARTokens(
+def build_model(in_dim=1024, d_model=512, n_layers=6, nhead=8, dropout=0.3, num_classes=4):
+    base = SSA_Model_HeARTokens(
         in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead, dropout=dropout
     )
+
+
+    model = SSA4ClassWrapper(
+        base_model=base,
+        feat_dim=None,  # 先不指定，让 wrapper 自动推断
+        num_classes=num_classes,
+        dropout=dropout
+    )
+
     params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA Model Initialized. Parameters: {params:,}")
+    print(f"✅ SSA 4-Class Model Initialized. Parameters: {params:,}")
     return model
