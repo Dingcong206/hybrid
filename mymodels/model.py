@@ -49,57 +49,66 @@ class SSA_Layer(nn.Module):
       -> BiMamba x3
       -> gated residual
     """
-    def __init__(self, d_model, nhead=8, dropout=0.3, mamba_blocks=3):
+
+    def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model),
-            nn.BatchNorm1d(d_model),
+
+        # 1. 增强型局部提取 (Depthwise Separable + Dilated)
+        # 增加空洞卷积以在不增加参数量的情况下扩大感受野
+        self.local_extract = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
             nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=4, dilation=2, groups=d_model),
+            nn.BatchNorm1d(d_model),
         )
 
-        # ✅ 前 3 个 BiMamba
-        self.mambas_pre = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
-        ])
+        # 2. 并行混合层 (Hybrid Mamba & Attention)
+        # 让 Mamba 处理时序扫描，Attention 处理全局对齐
+        self.mamba_branch = BiMambaBlock(d_model, dropout=dropout)
 
-        # ✅ 中间 1 个 Attention
         self.attn_ln = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
 
-        # ✅ 后 3 个 BiMamba
-        self.mambas_post = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout) for _ in range(mamba_blocks)
-        ])
+        # 3. 动态融合门控 (Cross-Gate)
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
 
-        # gated residual
-        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        # 4. 前馈网络 (FFN) 升级为 SwiGLU 风格 (Transformer 常用优化)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.SiLU(),  # Swish 激活
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+        )
+        self.norm_ffn = nn.LayerNorm(d_model)
 
     def forward(self, x, mask=None):
-        """
-        x: (B, T, D)
-        mask: (B, T)  True=padding(无效位置), False=有效token
-        """
-        res = x
+        # x: (B, T, D)
+        shortcut = x
 
-        # 0) local conv
-        x = x + self.conv(x.transpose(1, 2)).transpose(1, 2)
+        # --- A. 局部卷积分支 ---
+        x_conv = self.local_extract(x.transpose(1, 2)).transpose(1, 2)
+        x = x + x_conv
 
-        # 1) BiMamba x3 (pre)
-        for blk in self.mambas_pre:
-            x = blk(x)
+        # --- B. 并行双路分支 ---
+        # 支路1: Mamba (时序敏感)
+        x_mamba = self.mamba_branch(x)
 
-        # 2) Attention x1
+        # 支路2: Attention (全局对齐)
         x_n = self.attn_ln(x)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask, need_weights=False)
-        x = x + x_a
+        x_attn, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
 
-        # 3) BiMamba x3 (post)
-        for blk in self.mambas_post:
-            x = blk(x)
+        # 动态融合: 根据特征内容决定两者的权重
+        gate = self.fusion_gate(torch.cat([x_mamba, x_attn], dim=-1))
+        x = (1 - gate) * x_mamba + gate * x_attn
+        x = x + shortcut  # 残差连接
 
-        # 4) gated residual
-        g = self.gate(x.mean(dim=1, keepdim=True))  # (B,1,D)
-        return res + g * x
+        # --- C. FFN 增强层 ---
+        x = x + self.ffn(self.norm_ffn(x))
+
+        return x
 
 
 
