@@ -177,6 +177,8 @@ def set_seed(seed: int = 42):
 
 def main():
     parser = argparse.ArgumentParser()
+
+
     parser.add_argument("--root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="包含 train_index.csv / test_index.csv 的目录")
     parser.add_argument("--epochs", type=int, default=50)
@@ -187,7 +189,10 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.15, help="从 train 里划分 val 的比例")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--binary", action="store_true", help="二分类：normal vs abnormal（建议打开）")
+    #parser.add_argument("--binary", action="store_true", help="二分类：normal vs abnormal（建议打开）")
+    parser.add_argument("--binary", action="store_true", default=True,
+                        help="二分类：normal vs abnormal（默认开启）")
+
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints",
                         help="保存 best 模型的目录")
     parser.add_argument("--patience", type=int, default=10, help="val ICBHI 连续多少轮不提升就 early stop")
