@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from mamba_ssm import Mamba
 
 
-# =====================================================
-# 1) 位置编码
-# =====================================================
 def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
     pe = torch.zeros(seq_len, dim, device=device)
     position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
@@ -19,42 +15,6 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device):
     return pe
 
 
-# =====================================================
-# 2) 可配置下采样器：factor=4 / 8 / 16 ...
-#    这里我们用 factor=4，叠两次得到 16x
-# =====================================================
-class Downsampler(nn.Module):
-    def __init__(self, d_model: int, factor: int = 4):
-        super().__init__()
-        self.factor = factor
-
-        # 路径1：卷积下采样
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=factor, stride=factor)
-
-        # 路径2：最大池化下采样（保留突发峰值）
-        self.maxpool = nn.MaxPool1d(kernel_size=factor, stride=factor)
-
-        # 融合
-        self.fuse = nn.Linear(d_model * 2, d_model)
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, T, D)
-        return: (B, T/factor, D)
-        """
-        x_raw = x.transpose(1, 2)  # (B, D, T)
-        x1 = self.conv(x_raw)      # (B, D, T/f)
-        x2 = self.maxpool(x_raw)   # (B, D, T/f)
-
-        x_fused = torch.cat([x1, x2], dim=1).transpose(1, 2)  # (B, T/f, 2D)
-        x_fused = self.fuse(x_fused)                          # (B, T/f, D)
-        return self.norm(x_fused)
-
-
-# =====================================================
-# 3) 双向 Mamba
-# =====================================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2):
         super().__init__()
@@ -79,9 +39,6 @@ class BiMambaBlock(nn.Module):
         return x + self.mlp(self.ln2(x))
 
 
-# =====================================================
-# 4) SSA 层
-# =====================================================
 class SSA_Layer(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
@@ -96,10 +53,6 @@ class SSA_Layer(nn.Module):
         self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
 
     def forward(self, x, mask=None):
-        """
-        x: (B, T, D)
-        mask: (B, T) bool, True=PAD (key_padding_mask 的语义)
-        """
         res = x
 
         # local
@@ -118,15 +71,13 @@ class SSA_Layer(nn.Module):
         return res + g * x
 
 
-# =====================================================
-# 5) 最终模型：两次×4 下采样 -> 2048
-# =====================================================
-class SSA_Model_2k(nn.Module):
-    def __init__(self, in_dim=256, d_model=256, n_layers=4, nhead=8):
+class SSA_Model_NoDownsample(nn.Module):
+    """
+    输入：AST patch tokens (B, 948, 768)
+    输出：file_logit (B,), token_logits (B, 948)
+    """
+    def __init__(self, in_dim=768, d_model=256, n_layers=4, nhead=8, dropout=0.3):
         super().__init__()
-        # 两次 factor=4：32768 -> 8192 -> 2048
-        self.down1 = Downsampler(d_model=in_dim, factor=4)
-        self.down2 = Downsampler(d_model=in_dim, factor=4)
 
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, d_model),
@@ -135,67 +86,50 @@ class SSA_Model_2k(nn.Module):
         )
 
         self.layers = nn.ModuleList([
-            SSA_Layer(d_model=d_model, nhead=nhead) for _ in range(n_layers)
+            SSA_Layer(d_model=d_model, nhead=nhead, dropout=dropout) for _ in range(n_layers)
         ])
 
         self.norm = nn.LayerNorm(d_model)
 
-        # --- Attention Pooling 层 ---
-        # 用于计算每个 patch 的重要程度分数
+        # Attention Pooling
         self.attention_net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
             nn.Linear(d_model // 2, 1)
         )
 
-        # 最终分类头
         self.classifier = nn.Linear(d_model, 1)
-        # 保留 patch_head 用于辅助输出 logits (可选)
         self.patch_head = nn.Linear(d_model, 1)
 
     def forward(self, x, mask=None):
-        # 1. 下采样过程 (保持不变)
-        x = self.down1(x)
-        if mask is not None: mask = mask[:, ::4]
-        x = self.down2(x)
-        if mask is not None: mask = mask[:, ::4]
+        # x: (B, 948, 768)
+        x = self.input_proj(x)  # (B, 948, 256)
 
-        # 2. 特征提取 (保持不变)
-        x = self.input_proj(x)
         B, T, D = x.shape
         pos = sinusoidal_positional_encoding(T, D, x.device).unsqueeze(0)
         x = x + pos
 
         for layer in self.layers:
             x = layer(x, mask=mask)
-        x = self.norm(x)  # (B, 2048, 256)
 
-        # 3. --- 修改点：Attention Pooling ---
-        # 计算注意力权重
-        attn_weights = self.attention_net(x)  # (B, 2048, 1)
+        x = self.norm(x)  # (B, 948, 256)
 
-        # 如果有 mask，将 padding 部分权重设为极小值
+        # Attention pooling
+        attn_weights = self.attention_net(x)  # (B, 948, 1)
         if mask is not None:
             attn_weights = attn_weights.masked_fill(mask.unsqueeze(-1), -1e9)
 
-        attn_weights = torch.softmax(attn_weights, dim=1)  # 归一化权重
-
-        # 加权求和得到文件级特征
+        attn_weights = torch.softmax(attn_weights, dim=1)
         file_feature = torch.sum(attn_weights * x, dim=1)  # (B, 256)
 
-        # 得到文件级别的预测
         file_logit = self.classifier(file_feature).squeeze(-1)  # (B,)
+        token_logits = self.patch_head(x).squeeze(-1)           # (B, 948)
 
-        # 得到局部 patch 的预测 (用于监控或弱监督)
-        logits = self.patch_head(x).squeeze(-1)  # (B, 2048)
+        return file_logit, token_logits
 
-        return file_logit, logits
 
-# =====================================================
-# 6) build_model
-# =====================================================
-def build_model(in_dim=256, d_model=256, n_layers=4, nhead=8):
-    model = SSA_Model_2k(in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead)
+def build_model(in_dim=768, d_model=256, n_layers=4, nhead=8):
+    model = SSA_Model_NoDownsample(in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead)
     params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SSA Model (2k) Initialized. Parameters: {params:,}")
+    print(f"✅ SSA Model (no downsample) Initialized. Parameters: {params:,}")
     return model
