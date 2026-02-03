@@ -185,8 +185,13 @@ def set_seed(seed: int = 42):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--root", type=str, default=True,
-                        help="预处理输出目录，里面必须包含 train_index.csv / test_index.csv")
+    parser.add_argument(
+        "--root",
+        type=str,
+        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
+        help="预处理输出目录（包含 train_index.csv / test_index.csv）"
+    )
+
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
