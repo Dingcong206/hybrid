@@ -105,7 +105,7 @@ def main():
     # 输入路径指向你已经划分好的父目录
     parser.add_argument("--src_root", type=str, default="/data/dingcong/hybrid/icbhi_official_sat_patch_tokens")
     parser.add_argument("--save_root", type=str, default="/data/dingcong/hybrid/icbhi_hear_patch_128_1024")
-    parser.add_argument("--hear_path", type=str, required=True, help="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/spectrogram_frontend")
+    parser.add_argument("--hear_path", type=str, default="/home/guest1/.cache/huggingface/hub/models--google--hear/snapshots/9b2eb2853c426676255cc6ac5804b7f1fe8e563f/event_detector/spectrogram_frontend")
     args = parser.parse_args()
 
     # 1. 加载 HeAR 模型
