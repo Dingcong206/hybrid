@@ -1,294 +1,382 @@
+# mymodels/model.py
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 
-# =============== RMSNorm 兼容（torch 版本不够会没有 nn.RMSNorm） ===============
-def _rmsnorm(dim: int):
-    return nn.RMSNorm(dim) if hasattr(nn, "RMSNorm") else nn.LayerNorm(dim)
+from transformers import AutoModel, AutoConfig
 
-# =============== mamba 依赖 ===============
 try:
     from mamba_ssm import Mamba
-except ImportError:
+except Exception:
     Mamba = None
-    print("⚠️ 未安装 mamba_ssm。需要安装：pip install mamba-ssm causal-conv1d")
 
-# =========================
-# 1) 位置编码
-# =========================
-def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
-    pe = torch.zeros(seq_len, dim, device=device)
-    position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
-    div_term = torch.exp(
-        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        * (-torch.log(torch.tensor(10000.0, device=device)) / dim)
-    )
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
 
-# =========================
-# 2) BiMambaBlock（✅ 无 MLP，仅 SSM 残差）
-# =========================
+# ============================================================
+# 1) AST Feature Extractor (内部选择 hidden_states[layer=12])
+# ============================================================
+class ASTFeatureExtractor(nn.Module):
+    """
+    在模型内部完成：
+      - 调用 HuggingFace AST/Audio transformer
+      - output_hidden_states=True
+      - 取 hidden_states[layer_idx] 作为 token 序列
+
+    forward 输入：
+      ast_inputs: dict，直接传给 AutoModel(**ast_inputs)
+    输出：
+      tokens: (B, T, C)
+    """
+
+    def __init__(self, model_name: str, layer_idx: int = 12, freeze: bool = True):
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+
+        cfg = AutoConfig.from_pretrained(model_name)
+        cfg.output_hidden_states = True  # 确保能返回 hidden_states
+
+        self.ast = AutoModel.from_pretrained(model_name, config=cfg)
+
+        if freeze:
+            for p in self.ast.parameters():
+                p.requires_grad = False
+
+        # 推断输出维度（hidden size）
+        out_dim = getattr(cfg, "hidden_size", None)
+        if out_dim is None and hasattr(cfg, "hidden_sizes"):
+            # 某些模型可能是 hidden_sizes 列表
+            out_dim = cfg.hidden_sizes[-1]
+        if out_dim is None:
+            raise ValueError("无法从 config 推断 hidden size（out_dim），请检查模型类型。")
+
+        self.out_dim = int(out_dim)
+
+    def forward(self, ast_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        ast_inputs: dict, e.g. {"input_values": ..., "attention_mask": ...} 具体键取决于你用的 processor
+        return: tokens (B, T, C)
+        """
+        out = self.ast(**ast_inputs, output_hidden_states=True, return_dict=True)
+        hs = out.hidden_states  # tuple length usually = num_layers + 1
+
+        # 支持负数层索引
+        idx = self.layer_idx if self.layer_idx >= 0 else (len(hs) + self.layer_idx)
+        if idx < 0 or idx >= len(hs):
+            raise IndexError(f"layer_idx={self.layer_idx} 越界：hidden_states 长度={len(hs)}")
+
+        return hs[idx]  # (B,T,C)
+
+
+# ============================================================
+# 2) 基础组件：FFN / BiMamba / Attention
+# ============================================================
+class FFN(nn.Module):
+    def __init__(self, d_model: int, mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        hidden = d_model * mult
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class BiMambaBlock(nn.Module):
     """
-    纯 BiMamba：LN -> (fwd+bwd) -> Dropout -> residual
-    ✅ 不包含任何 MLP/FFN（你要求的）
+    BiMamba: forward + backward (flip) + residual + FFN
+    输入/输出: (B,T,D)
     """
-    def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.1,
+        ffn_mult: int = 4,
+    ):
         super().__init__()
         if Mamba is None:
-            raise RuntimeError(
-                "当前环境没有安装 mamba_ssm，无法使用 BiMambaBlock。\n"
-                "请安装：pip install mamba-ssm causal-conv1d"
-            )
+            raise RuntimeError("mamba_ssm 未安装：pip install mamba-ssm causal-conv1d")
 
-        self.ln = nn.LayerNorm(d_model)
+        self.ln1 = nn.LayerNorm(d_model)
         self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x):
-        # x: (B,T,D)
-        h = self.ln(x)
-        h_f = self.fwd(h)
-        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
-        return x + self.drop(h_f + h_b)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = FFN(d_model, mult=ffn_mult, dropout=dropout)
 
-# =========================
-# 3) AttentionBlock（残差）
-# =========================
-class AttentionBlock(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):
-        super().__init__()
-        self.ln = _rmsnorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-        self.drop = nn.Dropout(dropout)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.ln1(x)
+        y_f = self.fwd(h)
+        y_b = torch.flip(self.bwd(torch.flip(h, dims=[1])), dims=[1])
+        x = x + self.drop(y_f + y_b)
 
-    def forward(self, x, mask=None):
-        x_n = self.ln(x)
-        if mask is not None:
-            x_n = x_n.masked_fill(mask.unsqueeze(-1), 0.0)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
-        return x + self.drop(x_a)
-
-# =========================
-# 4) FFNBlock（残差）——只在 stage 末尾用
-# =========================
-class FFNBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.3, mult=4):
-        super().__init__()
-        self.ln = _rmsnorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, mult * d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mult * d_model, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return x + self.ffn(self.ln(x))
-
-# =========================
-# 5) ICBHI Pooling：Attention pooling + Max pooling
-# =========================
-class ICBHI_Pooling(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.attn_net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.Tanh(),
-            nn.Linear(d_model // 2, 1)
-        )
-
-    def forward(self, x, mask=None):
-        attn_scores = self.attn_net(x)  # (B,T,1)
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
-        attn_w = torch.softmax(attn_scores, dim=1)
-        feat_weighted = torch.sum(attn_w * x, dim=1)  # (B,D)
-
-        if mask is not None:
-            x_for_max = x.masked_fill(mask.unsqueeze(-1), -1e9)
-        else:
-            x_for_max = x
-        feat_max, _ = torch.max(x_for_max, dim=1)  # (B,D)
-
-        return feat_weighted + feat_max
-
-# =========================
-# 6) 一个 Stage（= 可堆叠层）
-#    Attn -> 6×BiMamba(no-MLP) -> Attn -> FFN
-#    ✅ 注意：这里没有 Conv（Conv 只在最开始）
-# =========================
-class StageAttn6BiMambaAttnFFN(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        nhead=8,
-        dropout=0.3,
-        n_bimamba=6,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        ffn_mult=4,
-    ):
-        super().__init__()
-        self.attn1 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
-
-        self.bimambas = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(n_bimamba)
-        ])
-
-        self.attn2 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
-        self.ffn = FFNBlock(d_model, dropout=dropout, mult=ffn_mult)
-
-    def forward(self, x, mask=None):
-        x = self.attn1(x, mask=mask)
-        for blk in self.bimambas:
-            x = blk(x)
-        x = self.attn2(x, mask=mask)
-        x = self.ffn(x)
+        x = x + self.ffn(self.ln2(x))
         return x
 
-# =========================
-# 7) 主模型：PE -> Conv(一次) -> [Stage × n_layers] -> Norm -> Pool
-# =========================
-class SSA_Model_HeARTokens(nn.Module):
+
+class AttnBlock(nn.Module):
+    """
+    用标准 TransformerEncoderLayer 做一个 attention block
+    """
+
+    def __init__(self, d_model: int, nhead: int = 8, dropout: float = 0.1, ffn_mult: int = 4):
+        super().__init__()
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * ffn_mult,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
+        # key_padding_mask: (B,T) True=PAD
+        return self.layer(x, src_key_padding_mask=key_padding_mask)
+
+
+# ============================================================
+# 3) 宏 Block：3 BiMamba + 1 Attention + 3 BiMamba
+# ============================================================
+class MacroBlock313(nn.Module):
+    """
+    一个宏 block 内部固定结构：
+      BiMamba x3 -> Attention x1 -> BiMamba x3
+    """
+
     def __init__(
         self,
-        in_dim=768,
-        d_model=256,
-        n_layers=2,
-        nhead=8,
-        dropout=0.3,
-        max_len=4096,
-        num_classes=4,
-        conv_k=7,
-        n_bimamba=6,     # 每层 6 个 BiMamba
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        ffn_mult=4,
+        d_model: int,
+        nhead: int = 8,
+        dropout: float = 0.2,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        ffn_mult: int = 4,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.num_classes = num_classes
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, d_model),
-            nn.SiLU(),
-            _rmsnorm(d_model),
+        self.pre = nn.ModuleList(
+            [
+                BiMambaBlock(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dropout=dropout,
+                    ffn_mult=ffn_mult,
+                )
+                for _ in range(3)
+            ]
         )
 
-        pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-        self.pos_drop = nn.Dropout(dropout)
+        self.attn = AttnBlock(d_model=d_model, nhead=nhead, dropout=dropout, ffn_mult=ffn_mult)
 
-        # ✅ Conv 只在最开始一次
-        self.front_conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
-            nn.BatchNorm1d(d_model),
-            nn.SiLU(),
+        self.post = nn.ModuleList(
+            [
+                BiMambaBlock(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dropout=dropout,
+                    ffn_mult=ffn_mult,
+                )
+                for _ in range(3)
+            ]
         )
 
-        # ✅ 堆叠 stages
-        self.stages = nn.ModuleList([
-            StageAttn6BiMambaAttnFFN(
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        for blk in self.pre:
+            x = blk(x)
+
+        x = self.attn(x, key_padding_mask=mask)
+
+        for blk in self.post:
+            x = blk(x)
+
+        return x
+
+
+# ============================================================
+# 4) 最终模型：AST(layer=12) + (N个宏block) + pooling + head
+# ============================================================
+class HybridAST_MambaAttn_313(nn.Module):
+    """
+    满足你的要求：
+      - layer=12 在模型内部选
+      - 每个 block 内 3+1+3
+      - 可堆叠 num_blocks 个这样的宏block
+
+    forward 输入：
+      ast_inputs: Dict[str, Tensor]
+      mask: Optional[Tensor]  (B,T) True=PAD
+           如果你不传 mask，会自动全 False（即全有效）
+    输出：
+      logits: (B, num_classes)
+    """
+
+    def __init__(
+        self,
+        ast_name: str,
+        num_classes: int = 4,
+        ast_layer_idx: int = 12,
+        freeze_ast: bool = True,
+        # hybrid backbone
+        d_model: int = 256,
+        num_blocks: int = 2,  # 多少个“宏 block”（每个宏block内部就是3+1+3）
+        nhead: int = 8,
+        dropout: float = 0.2,
+        # mamba
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        # ffn
+        ffn_mult: int = 4,
+        # pooling
+        pooling: str = "mean",  # "mean" or "cls"
+    ):
+        super().__init__()
+        pooling = pooling.lower().strip()
+        if pooling not in ("mean", "cls"):
+            raise ValueError("pooling must be 'mean' or 'cls'")
+
+        self.pooling = pooling
+
+        # 1) AST hidden layer selector
+        self.ast_feat = ASTFeatureExtractor(
+            model_name=ast_name,
+            layer_idx=ast_layer_idx,
+            freeze=freeze_ast,
+        )
+        in_dim = self.ast_feat.out_dim
+
+        # 2) 投影到你的 d_model
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        # 3) 堆叠宏block，每个block内部固定 3+1+3
+        self.blocks = nn.ModuleList(
+            [
+                MacroBlock313(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dropout=dropout,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    ffn_mult=ffn_mult,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+        self.final_feat_dim = d_model
+        self.classifier = nn.Linear(d_model, num_classes)
+
+    def _pool(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B,T,D)
+        mask: (B,T) True=PAD
+        return: (B,D)
+        """
+        if self.pooling == "cls":
+            # 取第一个 token（如果你的 AST 第一个 token 是 CLS/summary token，这个就合理）
+            return x[:, 0, :]
+
+        # mean pooling（忽略 pad）
+        valid = (~mask).float()  # (B,T)
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B,1)
+        pooled = (x * valid.unsqueeze(-1)).sum(dim=1) / denom
+        return pooled
+
+    def forward(self, ast_inputs: Dict[str, torch.Tensor], mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        ast_inputs: HF AutoModel 的输入 dict
+        mask: (B,T) True=PAD；若 None，则自动构造全 False
+        """
+        tokens = self.ast_feat(ast_inputs)  # (B,T,C)
+
+        x = self.drop(self.in_proj(tokens))  # (B,T,d_model)
+
+        B, T, _ = x.shape
+        if mask is None:
+            mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+
+        for blk in self.blocks:
+            x = blk(x, mask)
+
+        pooled = self._pool(x, mask)  # (B,d_model)
+        logits = self.classifier(pooled)
+        return logits
+
+
+# ============================================================
+# 5) 兼容你之前训练脚本的 build_backbone（可选）
+#    如果你还想用 build_backbone + classifier 的训练流程
+# ============================================================
+def build_backbone(
+    # 这里给一个“兼容入口”，但本质返回的是一个能输出 pooled feat 的 backbone
+    ast_name: str,
+    ast_layer_idx: int = 12,
+    freeze_ast: bool = True,
+    d_model: int = 256,
+    num_blocks: int = 2,
+    nhead: int = 8,
+    dropout: float = 0.2,
+    d_state: int = 16,
+    d_conv: int = 4,
+    expand: int = 2,
+    ffn_mult: int = 4,
+    pooling: str = "mean",
+):
+    """
+    返回一个 backbone：forward(ast_inputs, mask)->feat(B,d_model)
+    """
+    class _Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = HybridAST_MambaAttn_313(
+                ast_name=ast_name,
+                num_classes=4,  # 这里无所谓，后面不走 classifier
+                ast_layer_idx=ast_layer_idx,
+                freeze_ast=freeze_ast,
                 d_model=d_model,
+                num_blocks=num_blocks,
                 nhead=nhead,
                 dropout=dropout,
-                n_bimamba=n_bimamba,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
                 ffn_mult=ffn_mult,
+                pooling=pooling,
             )
-            for _ in range(n_layers)
-        ])
+            self.final_feat_dim = self.net.final_feat_dim
 
-        self.norm = _rmsnorm(d_model)
-        self.pool = ICBHI_Pooling(d_model)
+        def forward(self, ast_inputs: Dict[str, torch.Tensor], mask: Optional[torch.Tensor] = None):
+            # 复用内部流程，但拿 pooled 特征，不走分类头
+            tokens = self.net.ast_feat(ast_inputs)
+            x = self.net.drop(self.net.in_proj(tokens))
+            B, T, _ = x.shape
+            if mask is None:
+                mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+            for blk in self.net.blocks:
+                x = blk(x, mask)
+            feat = self.net._pool(x, mask)
+            return feat
 
-        # 兼容路线B（Route-A 不用，但保留无害）
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, num_classes)
-        )
-        self.token_head = nn.Linear(d_model, num_classes)
-
-    def forward(self, x, mask=None, return_feature=False):
-        x = self.input_proj(x)  # (B,T,D)
-        T = x.shape[1]
-        x = x + self.pe[:, :T, :].to(x.device)
-        x = self.pos_drop(x)
-
-        # ✅ Conv only once
-        x = x + self.front_conv(x.transpose(1, 2)).transpose(1, 2)
-
-        for stage in self.stages:
-            x = stage(x, mask=mask)
-
-        x = self.norm(x)
-        file_feature = self.pool(x, mask=mask)  # (B,D)
-
-        if return_feature:
-            return file_feature, x
-
-        file_logits = self.classifier(file_feature)
-        token_logits = self.token_head(x)
-        return file_logits, token_logits
-
-# =========================
-# 8) Route-A Backbone：输出 (B,d_model)
-# =========================
-class SSA_Backbone(nn.Module):
-    def __init__(self, ssa_model: SSA_Model_HeARTokens):
-        super().__init__()
-        self.ssa = ssa_model
-        self.final_feat_dim = ssa_model.d_model
-
-    def forward(self, x, mask=None):
-        feat, _ = self.ssa(x, mask=mask, return_feature=True)
-        return feat
-
-# =========================
-# 9) build_backbone（Route-A）
-# =========================
-def build_backbone(
-    in_dim=768,
-    d_model=256,
-    n_layers=2,
-    nhead=8,
-    dropout=0.3,
-    max_len=4096,
-    conv_k=7,
-    d_state=16,
-    d_conv=4,
-    expand=2,
-    ffn_mult=4,
-):
-    ssa = SSA_Model_HeARTokens(
-        in_dim=in_dim,
-        d_model=d_model,
-        n_layers=n_layers,
-        nhead=nhead,
-        dropout=dropout,
-        max_len=max_len,
-        num_classes=4,
-        conv_k=conv_k,
-        n_bimamba=6,  # ✅ 固定每层 6 个
-        d_state=d_state,
-        d_conv=d_conv,
-        expand=expand,
-        ffn_mult=ffn_mult,
-    )
-    backbone = SSA_Backbone(ssa)
-
-    params = sum(p.numel() for p in backbone.parameters())
-    print(f"✅ Structure: PE → Conv(once) → [Attn → 6×BiMamba(no-MLP) → Attn → FFN] × {n_layers}")
-    print(f"   Parameters: {params:,} | Feature Dim: {backbone.final_feat_dim}")
-    return backbone
+    return _Backbone()
