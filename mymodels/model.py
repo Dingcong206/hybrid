@@ -168,7 +168,7 @@ class SSA_Model_HeARTokens(nn.Module):
         self,
         in_dim=768,
         d_model=256,
-        n_layers=12,
+        n_layers=4,
         nhead=8,
         dropout=0.3,
         max_len=4096,
