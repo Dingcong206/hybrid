@@ -6,7 +6,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -17,9 +17,10 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
 
+
 # ============================================================
 # 0) 让 `from mymodels.model import build_backbone` 能导入
-#   tools/train1.py -> parents[1] = /data/dingcong/hybrid
+#   tools/ 的上一级是 hybrid/
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -81,79 +82,86 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 2) 评估：改成 logits->p_abn 阈值（可选搜索阈值）
-#   p_abn = 1 - softmax(logits)[:,0]   # 0类=normal
+# 2) 评估：用 abnormal 概率阈值（可扫阈值找 best ICBHI）
+#   p_abnormal = 1 - softmax(logits)[:,0]
 # ============================================================
 @torch.no_grad()
-def collect_probs(backbone, classifier, loader, device) -> Tuple[np.ndarray, np.ndarray]:
+def evaluate_icbhi(
+    backbone,
+    classifier,
+    loader,
+    device,
+    search_thr: bool = True,
+    fixed_thr: float = 0.5
+) -> Dict[str, float]:
     backbone.eval()
     classifier.eval()
 
-    probs_abn, y_true4 = [], []
-    for x, mask, y in loader:
+    all_pabn, all_true2 = [], []
+
+    for x, mask, y4 in loader:
         x = x.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+        y4 = y4.to(device, non_blocking=True)
 
-        feat = backbone(x, mask=mask)          # (B,d)
-        logits = classifier(feat)              # (B,4)
-        p = torch.softmax(logits, dim=1)       # (B,4)
-        p_abn = 1.0 - p[:, 0]                  # abnormal prob
+        feat = backbone(x, mask=mask)          # (B, d_model)
+        logits = classifier(feat)              # (B, 4)
+        prob = torch.softmax(logits, dim=1)    # (B, 4)
 
-        probs_abn.append(p_abn.detach().cpu())
-        y_true4.append(y.detach().cpu())
+        p_abn = 1.0 - prob[:, 0]               # abnormal probability
+        y2 = (y4 != 0).long()                  # GT: 0 normal, 1 abnormal
 
-    probs_abn = torch.cat(probs_abn).numpy()
-    y_true4 = torch.cat(y_true4).numpy()
-    return probs_abn, y_true4
+        all_pabn.append(p_abn.cpu())
+        all_true2.append(y2.cpu())
+
+    p_abn = torch.cat(all_pabn).numpy()
+    y_true2 = torch.cat(all_true2).numpy()
+
+    def metric_from_thr(thr: float):
+        y_pred2 = (p_abn > thr).astype(np.int64)
+        cm = confusion_matrix(y_true2, y_pred2, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+
+        se = tp / (tp + fn + 1e-10)
+        sp = tn / (tn + fp + 1e-10)
+        icbhi = 0.5 * (se + sp)
+
+        acc = accuracy_score(y_true2, y_pred2)
+        f1 = f1_score(y_true2, y_pred2, zero_division=0)
+
+        return icbhi, se, sp, acc, f1, tp, tn, fp, fn
+
+    if search_thr:
+        thrs = np.linspace(0.05, 0.95, 19)  # 0.05,0.10,...0.95
+        best = None
+        for thr in thrs:
+            out = metric_from_thr(float(thr))
+            if (best is None) or (out[0] > best[0]):
+                best = out + (float(thr),)
+
+        icbhi, se, sp, acc, f1, tp, tn, fp, fn, thr_best = best
+        return {
+            "ICBHI": float(icbhi),
+            "SE": float(se),
+            "SP": float(sp),
+            "ACC": float(acc),
+            "F1": float(f1),
+            "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+            "THR": float(thr_best)
+        }
+    else:
+        icbhi, se, sp, acc, f1, tp, tn, fp, fn = metric_from_thr(float(fixed_thr))
+        return {
+            "ICBHI": float(icbhi),
+            "SE": float(se),
+            "SP": float(sp),
+            "ACC": float(acc),
+            "F1": float(f1),
+            "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+            "THR": float(fixed_thr)
+        }
 
 
-def metrics_from_thr(probs_abn: np.ndarray, y_true4: np.ndarray, thr: float) -> Dict[str, float]:
-    # 4->2 true
-    y_true2 = (y_true4 != 0).astype(np.int64)
-    # pred2 by threshold
-    y_pred2 = (probs_abn >= thr).astype(np.int64)
-
-    cm = confusion_matrix(y_true2, y_pred2, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-
-    se = tp / (tp + fn + 1e-10)
-    sp = tn / (tn + fp + 1e-10)
-    icbhi = 0.5 * (se + sp)
-
-    acc = accuracy_score(y_true2, y_pred2)
-    f1 = f1_score(y_true2, y_pred2, zero_division=0)
-
-    return {
-        "thr": float(thr),
-        "ICBHI": float(icbhi),
-        "SE": float(se),
-        "SP": float(sp),
-        "ACC": float(acc),
-        "F1": float(f1),
-        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
-    }
-
-
-@torch.no_grad()
-def evaluate_icbhi(backbone, classifier, loader, device, thr: float = 0.5, search_thr: bool = False) -> Dict[str, float]:
-    probs_abn, y_true4 = collect_probs(backbone, classifier, loader, device)
-
-    if not search_thr:
-        return metrics_from_thr(probs_abn, y_true4, thr)
-
-    # 搜索最优阈值（让 ICBHI 最大）
-    best = None
-    for t in np.linspace(0.05, 0.95, 19):  # 0.05,0.10,...,0.95
-        m = metrics_from_thr(probs_abn, y_true4, float(t))
-        if best is None or m["ICBHI"] > best["ICBHI"]:
-            best = m
-    return best
-
-
-# ============================================================
-# 3) 工具：随机种子
-# ============================================================
 def set_seed(seed: int = 42):
     import random
     random.seed(seed)
@@ -163,7 +171,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 4) 主训练：Route-A (backbone + classifier)
+# 3) 主训练：Route-A (backbone + classifier)
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -175,18 +183,16 @@ def main():
         help="预处理输出目录（包含 train_index.csv / test_index.csv）"
     )
 
-    # ✅ 更稳的默认值（你也可以命令行覆盖）
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-3)
-
+    parser.add_argument("--lr", type=float, default=1e-4)              # ✅ 更稳
+    parser.add_argument("--weight_decay", type=float, default=1e-3)     # ✅ 更稳
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_thr")
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--use_weighted_loss", action="store_true")
 
     # tokens 维度
@@ -194,31 +200,30 @@ def main():
 
     # backbone 参数
     parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--n_layers", type=int, default=4)
+    parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.2)          # ✅ 更稳
     parser.add_argument("--max_len", type=int, default=4096)
 
-    # 并行层局部卷积 kernel（传给你的 build_backbone，如果你的 build_backbone 不收这个参数，会报 TypeError）
+    # model 的可选参数（如果你的 build_backbone 支持就会用到）
     parser.add_argument("--conv_k", type=int, default=7)
     parser.add_argument("--d_state", type=int, default=16)
     parser.add_argument("--d_conv", type=int, default=4)
     parser.add_argument("--expand", type=int, default=2)
+    parser.add_argument("--ffn_mult", type=int, default=4)
 
-    # amp
-    parser.add_argument("--amp", action="store_true")
+    # AMP
+    parser.add_argument("--amp", action="store_true", help="use mixed precision")
 
-    # ✅ 评估阈值
-    parser.add_argument("--thr", type=float, default=0.5, help="abnormal threshold (p_abn >= thr => abnormal)")
-    parser.add_argument("--search_thr", action="store_true", help="search best thr on TEST each epoch")
+    # 阈值搜索
+    parser.add_argument("--search_thr", action="store_true", help="search best threshold on TEST each epoch")
+    parser.add_argument("--fixed_thr", type=float, default=0.5, help="use fixed threshold if not search")
 
     args = parser.parse_args()
     set_seed(args.seed)
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"[INFO] device: {device}")
-    print(f"[INFO] epochs={args.epochs} bs={args.batch_size} lr={args.lr} wd={args.weight_decay} dropout={args.dropout}")
-    print(f"[INFO] eval: thr={args.thr} search_thr={args.search_thr}")
 
     root = Path(args.root)
     train_csv = root / "train_index.csv"
@@ -229,6 +234,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     ckpt_path = os.path.join(args.save_dir, "best_model.pt")
 
+    # Dataset / Loader
     ds_train = TokenNPYDataset(str(train_csv))
     ds_test = TokenNPYDataset(str(test_csv))
 
@@ -246,8 +252,7 @@ def main():
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
     print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
 
-    # backbone + classifier
-    # ⚠️ 注意：如果你的 build_backbone 不接受 conv_k/d_state/d_conv/expand，这里会 TypeError。
+    # Build backbone + classifier
     backbone = build_backbone(
         in_dim=args.in_dim,
         d_model=args.d_model,
@@ -259,18 +264,19 @@ def main():
         d_state=args.d_state,
         d_conv=args.d_conv,
         expand=args.expand,
+        ffn_mult=args.ffn_mult,
     ).to(device)
 
     classifier = nn.Linear(backbone.final_feat_dim, 4).to(device)
 
-    # sanity check
+    # Sanity check
     x0, m0, y0 = next(iter(dl_train))
     with torch.no_grad():
         feat0 = backbone(x0.to(device), mask=m0.to(device))
         logit0 = classifier(feat0)
     print("[DEBUG] feat shape:", tuple(feat0.shape), "logits shape:", tuple(logit0.shape))
 
-    # loss
+    # Loss
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)
         w = 1.0 / (counts / counts.sum() + 1e-12)
@@ -281,6 +287,7 @@ def main():
     else:
         loss_fn = nn.CrossEntropyLoss()
 
+    # Optim / Scheduler
     params = list(backbone.parameters()) + list(classifier.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -298,7 +305,6 @@ def main():
     for epoch in range(1, args.epochs + 1):
         backbone.train()
         classifier.train()
-
         t0 = time.time()
         running = 0.0
 
@@ -324,8 +330,12 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        # eval（阈值法）
-        test_m = evaluate_icbhi(backbone, classifier, dl_test, device, thr=args.thr, search_thr=args.search_thr)
+        # ✅ threshold-based evaluation
+        test_m = evaluate_icbhi(
+            backbone, classifier, dl_test, device,
+            search_thr=args.search_thr,
+            fixed_thr=args.fixed_thr
+        )
         icbhi = test_m["ICBHI"]
 
         improved = icbhi > best_icbhi + 1e-6
@@ -339,7 +349,6 @@ def main():
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
                     "best_icbhi": best_icbhi,
-                    "best_thr": test_m.get("thr", args.thr),
                     "args": vars(args),
                 },
                 ckpt_path
@@ -350,14 +359,13 @@ def main():
             star = " "
 
         dt = time.time() - t0
-        thr_show = test_m.get("thr", args.thr)
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"TEST ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
+            f"TEST ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} THR {test_m['THR']:.2f} | "
             f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
             f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
-            f"thr {thr_show:.2f} | {dt:.1f}s"
+            f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
