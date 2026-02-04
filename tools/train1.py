@@ -59,59 +59,46 @@ def apply_spec_augment(x, max_mask_t=20, max_mask_f=10, num_masks=2):
 
 class TokenNPYDataset(Dataset):
     def __init__(self, csv_path: str, is_train: bool = False):
-        # ... 原有的代码 ...
+        self.csv_path = csv_path
         self.is_train = is_train
+
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"[Dataset] CSV 不存在: {csv_path}")
+
+        df = pd.read_csv(csv_path)
+        if df is None or len(df) == 0:
+            raise ValueError(f"[Dataset] CSV 为空或读取失败: {csv_path}")
+
+        # 必需列
+        for col in ["tokens_path", "label"]:
+            if col not in df.columns:
+                raise KeyError(f"[Dataset] CSV 缺少列 `{col}`，当前列: {df.columns.tolist()}")
+
+        self.df = df.reset_index(drop=True)
+
+        # 二分类映射：0->0, 1/2/3->1
+        raw_labels = self.df["label"].astype(int).values
+        self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels], dtype=np.int64)
+        self.class_counts = np.bincount(self.binary_labels, minlength=2)
+
+        print(f"[Dataset] Loaded {len(self.df)} samples from {csv_path} | "
+              f"class_counts(0/1)={self.class_counts.tolist()} | train={self.is_train}")
+
+    def __len__(self):
+        return len(self.df)
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         x = np.load(row["tokens_path"])
         x = torch.from_numpy(x).float()
-        y = self.binary_labels[idx]
+        y = int(self.binary_labels[idx])
 
+        # 训练才增强
         if self.is_train:
-            # ✅ 在训练阶段应用增强
             x = apply_spec_augment(x, max_mask_t=30, max_mask_f=5, num_masks=2)
 
         return x, torch.tensor(y, dtype=torch.long)
 
-    def __len__(self):
-        return len(self.df)
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        x = np.load(row["tokens_path"])
-        x = torch.from_numpy(x).float()
-        y = self.binary_labels[idx]  # 直接取预处理好的二分类标签
-
-        if self.is_train:
-            # ... 你的 SpecAugment 逻辑 ...
-            pass
-        return x, torch.tensor(y, dtype=torch.long)
-
-
-
-def collate_pad(batch):
-    """
-    batch: List[(x(T,D), y)]
-    return:
-      x_pad: (B, T_max, D)
-      mask : (B, T_max)  True=PAD
-      y    : (B,)
-    """
-    xs, ys = zip(*batch)
-    lens = [x.shape[0] for x in xs]
-    D = xs[0].shape[1]
-    T_max = max(lens)
-    B = len(xs)
-
-    x_pad = torch.zeros(B, T_max, D, dtype=torch.float32)
-    mask = torch.ones(B, T_max, dtype=torch.bool)
-    for i, x in enumerate(xs):
-        T = x.shape[0]
-        x_pad[i, :T] = x
-        mask[i, :T] = False
-
-    y = torch.stack(ys).view(-1)
-    return x_pad, mask, y
 
 
 # ============================================================
