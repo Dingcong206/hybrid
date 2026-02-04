@@ -198,7 +198,7 @@ def main():
                          collate_fn=collate_pad)
 
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
-    print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
+    print(f"[INFO] train class_counts (0/1): {ds_train.class_counts.tolist()}")
 
     # ✅ Build backbone via your init: from mymodels import build_model
     # 要求：build_model 返回 backbone，并且有 backbone.final_feat_dim
@@ -245,7 +245,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
 
     # ✅ AMP 新写法（兼容 torch>=2.0）
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     best_icbhi = -1.0
     best_epoch = -1

@@ -169,13 +169,13 @@ class Stage3Attn3FFN(nn.Module):
 class SSA_Model_HeARTokens(nn.Module):
     def __init__(
             self,
-            in_dim=768,  # AST 原始输出维度
-            d_model=768,  # 保持与 in_dim 一致，不再降维
-            n_layers=8,  # 根据显存可调，论文通常用 6-12 层，但 Mamba 较轻量
-            nhead=8,  # 768 能被 8 整除，OK
+            in_dim=768,
+            d_model=256,  #  改这里
+            n_layers=8,
+            nhead=4,  #  下面我会说 nhead 怎么配更好
             dropout=0.3,
-            max_len=1024,  # ICBHI 8s 对应约 798 tokens，设为 1024 足够
-            num_classes=4,
+            max_len=1024,
+            num_classes=2,
             conv_k=7,
             d_state=16,
             d_conv=4,
@@ -277,7 +277,7 @@ def build_model(
     in_dim=768,
     d_model=256,
     n_layers=12,
-    nhead=8,
+    nhead=4,
     dropout=0.3,
     max_len=4096,
     conv_k=7,
@@ -293,7 +293,7 @@ def build_model(
         nhead=nhead,
         dropout=dropout,
         max_len=max_len,
-        num_classes=4,
+        num_classes=2,
         conv_k=conv_k,
         d_state=d_state,
         d_conv=d_conv,
