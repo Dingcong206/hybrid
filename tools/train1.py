@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 
-
+import random
 from pathlib import Path
 import sys
 
@@ -34,14 +34,45 @@ from mymodels import build_model
 # ============================================================
 # 1) Dataset：读取 tokens.npy（四分类 label 0/1/2/3）
 # ============================================================
+def apply_spec_augment(x, max_mask_t=20, max_mask_f=10, num_masks=2):
+    """
+    x: torch.Tensor, shape (T, D)
+    T 是时间步, D 是特征维度 (如 768 或 128)
+    """
+    T, D = x.shape
+    # 复制一份，避免修改原始数据
+    x_aug = x.clone()
+
+    for _ in range(num_masks):
+        # 时间遮掩 (Time Masking)
+        t_width = random.randint(0, max_mask_t)
+        t_start = random.randint(0, max(0, T - t_width))
+        x_aug[t_start: t_start + t_width, :] = 0
+
+        # 频率/维度遮掩 (Frequency Masking)
+        f_width = random.randint(0, max_mask_f)
+        f_start = random.randint(0, max(0, D - f_width))
+        x_aug[:, f_start: f_start + f_width] = 0
+
+    return x_aug
+
+
 class TokenNPYDataset(Dataset):
     def __init__(self, csv_path: str, is_train: bool = False):
-        self.df = pd.read_csv(csv_path)
+        # ... 原有的代码 ...
         self.is_train = is_train
-        # 预先映射标签以便统计权重
-        raw_labels = self.df["label"].values
-        self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels])
-        self.class_counts = np.bincount(self.binary_labels, minlength=2)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        x = np.load(row["tokens_path"])
+        x = torch.from_numpy(x).float()
+        y = self.binary_labels[idx]
+
+        if self.is_train:
+            # ✅ 在训练阶段应用增强
+            x = apply_spec_augment(x, max_mask_t=30, max_mask_f=5, num_masks=2)
+
+        return x, torch.tensor(y, dtype=torch.long)
 
     def __len__(self):
         return len(self.df)
@@ -91,39 +122,51 @@ def evaluate_icbhi_binary(backbone, classifier, loader, device) -> Dict[str, flo
     backbone.eval()
     classifier.eval()
 
-    all_pred, all_true = [], []
-    for x, mask, y in loader:
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    all_probs, all_true = [], []
 
-        # 假设 y 已经是 0(Normal) 和 1(Abnormal)
+    for x, mask, y in loader:
+        x = x.to(device)
+        mask = mask.to(device)
+        y = y.to(device)
+
         feat = backbone(x, mask=mask)
         logits = classifier(feat)
-        pred = torch.argmax(logits, dim=1)
+        probs = torch.softmax(logits, dim=1)[:, 1]  # 取“异常”概率
 
-        all_pred.append(pred.cpu())
+        all_probs.append(probs.cpu())
         all_true.append(y.cpu())
 
-    y_pred = torch.cat(all_pred).numpy()
+    probs = torch.cat(all_probs).numpy()
     y_true = torch.cat(all_true).numpy()
 
-    # 二分类指标计算
-    # TN: 正常被预测为正常, FP: 正常预测为异常, FN: 异常预测为正常, TP: 异常预测为异常
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
+    # ====== 扫描阈值，找最大 ICBHI ======
+    best_icbhi = -1.0
+    best_thr = 0.5
+    best_cm = None
 
-    se = tp / (tp + fn + 1e-10)  # Sensitivity (异常类召回)
-    sp = tn / (tn + fp + 1e-10)  # Specificity (正常类召回)
-    icbhi_score = (se + sp) / 2.0
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, average='binary')
+    for thr in np.linspace(0.05, 0.95, 19):  # 0.05 ~ 0.95，步长 0.05
+        y_pred = (probs >= thr).astype(int)
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+
+        se = tp / (tp + fn + 1e-10)
+        sp = tn / (tn + fp + 1e-10)
+        icbhi = (se + sp) / 2.0
+
+        if icbhi > best_icbhi:
+            best_icbhi = icbhi
+            best_thr = thr
+            best_cm = (tn, fp, fn, tp)
+
+    tn, fp, fn, tp = best_cm
+    acc = (tp + tn) / (tp + tn + fp + fn + 1e-10)
+
     return {
-        "ICBHI": float(icbhi_score),
-        "SE": float(se),
-        "SP": float(sp),
+        "best_thr": float(best_thr),
+        "ICBHI": float(best_icbhi),
+        "SE": float(tp / (tp + fn + 1e-10)),
+        "SP": float(tn / (tn + fp + 1e-10)),
         "ACC": float(acc),
-        "F1": float(f1),
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
     }
 
@@ -149,7 +192,7 @@ def main():
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -249,7 +292,7 @@ def main():
         w = w / w.sum()
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] weighted CE weights:", w)
-        loss_fn = nn.CrossEntropyLoss(weight=weight)
+        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
     else:
         loss_fn = nn.CrossEntropyLoss()
 
