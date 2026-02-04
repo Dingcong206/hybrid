@@ -1,356 +1,191 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import sys
-import time
-import argparse
-from pathlib import Path
-from typing import Dict
-
-import numpy as np
-import pandas as pd
-
+# mymodels/model.py
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 
-from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
-
-
-# ============================================================
-# 0) 让 `from mymodels.model import build_backbone` 能导入
-#    tools/ 的上一级是 hybrid/
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from mymodels.model import build_backbone
+try:
+    from mamba_ssm import Mamba
+except Exception as e:
+    Mamba = None
 
 
-# ============================================================
-# 1) Dataset：读取 tokens.npy（label 0/1/2/3）
-# ============================================================
-class TokenNPYDataset(Dataset):
-    def __init__(self, csv_path: str):
-        self.df = pd.read_csv(csv_path)
-        for c in ["tokens_path", "label"]:
-            if c not in self.df.columns:
-                raise ValueError(f"CSV 缺少列: {c}，请检查 {csv_path}")
-
-        labels = self.df["label"].astype(int).values
-        self.class_counts = np.bincount(labels, minlength=4)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        npy_path = row["tokens_path"]
-        y = int(row["label"])  # 0/1/2/3
-
-        x = np.load(npy_path)  # (T, D)
-        if x.ndim != 2:
-            raise ValueError(f"npy must be 2D (T,D), got {x.shape} at {npy_path}")
-
-        x = torch.from_numpy(x).float()
-        return x, torch.tensor(y, dtype=torch.long)
-
-
-def collate_pad(batch):
-    """
-    return:
-      x_pad: (B, T_max, D)
-      mask : (B, T_max) True=PAD
-      y    : (B,)
-    """
-    xs, ys = zip(*batch)
-    lens = [x.shape[0] for x in xs]
-    D = xs[0].shape[1]
-    T_max = max(lens)
-    B = len(xs)
-
-    x_pad = torch.zeros(B, T_max, D, dtype=torch.float32)
-    mask = torch.ones(B, T_max, dtype=torch.bool)
-
-    for i, x in enumerate(xs):
-        T = x.shape[0]
-        x_pad[i, :T] = x
-        mask[i, :T] = False
-
-    y = torch.stack(ys).view(-1)
-    return x_pad, mask, y
-
-
-# ============================================================
-# 2) Evaluate：4-class argmax -> 4->2 ICBHI
-#    (和你贴的 patchmix validate 一样：每 epoch eval 一次)
-# ============================================================
-@torch.no_grad()
-def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
-    backbone.eval()
-    classifier.eval()
-
-    all_pred4, all_true4 = [], []
-
-    for x, mask, y in loader:
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        feat = backbone(x, mask=mask)          # (B, d_model)
-        logits = classifier(feat)              # (B, 4)
-        pred4 = torch.argmax(logits, dim=1)
-
-        all_pred4.append(pred4.cpu())
-        all_true4.append(y.cpu())
-
-    y_pred4 = torch.cat(all_pred4).numpy()
-    y_true4 = torch.cat(all_true4).numpy()
-
-    # 4->2: 0=normal, 1/2/3=abnormal
-    y_pred2 = (y_pred4 != 0).astype(np.int64)
-    y_true2 = (y_true4 != 0).astype(np.int64)
-
-    cm = confusion_matrix(y_true2, y_pred2, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-
-    se = tp / (tp + fn + 1e-10)
-    sp = tn / (tn + fp + 1e-10)
-    icbhi = 0.5 * (se + sp)
-
-    acc = accuracy_score(y_true2, y_pred2)
-    f1 = f1_score(y_true2, y_pred2, zero_division=0)
-
-    return {
-        "ICBHI": float(icbhi),
-        "SE": float(se),
-        "SP": float(sp),
-        "ACC": float(acc),
-        "F1": float(f1),
-        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
-    }
-
-
-# ============================================================
-# 3) 工具：随机种子
-# ============================================================
-def set_seed(seed: int = 42):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-# ============================================================
-# 4) Train one epoch（只更新参数）
-# ============================================================
-def train_one_epoch(backbone, classifier, loader, device, optim, scheduler, loss_fn, scaler, amp, grad_clip=5.0):
-    backbone.train()
-    classifier.train()
-
-    params = list(backbone.parameters()) + list(classifier.parameters())
-
-    running = 0.0
-    for x, mask, y in loader:
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.amp.autocast("cuda", enabled=amp):
-            feat = backbone(x, mask=mask)
-            logits = classifier(feat)
-            loss = loss_fn(logits, y)
-
-        optim.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(params, grad_clip)
-        scaler.step(optim)
-        scaler.update()
-        scheduler.step()
-
-        running += float(loss.item())
-
-    return running / max(1, len(loader))
-
-
-# ============================================================
-# 5) 主流程：每 epoch train -> eval -> 用 ICBHI 保存 best
-# ============================================================
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--root",
-        type=str,
-        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
-        help="预处理输出目录（包含 train_index.csv / test_index.csv）"
-    )
-
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda")
-
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_like_patchmix")
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--use_weighted_loss", action="store_true")
-
-    # tokens dim
-    parser.add_argument("--in_dim", type=int, default=768)
-
-    # backbone args（传给 build_backbone）
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--n_layers", type=int, default=2)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--max_len", type=int, default=4096)
-
-    parser.add_argument("--conv_k", type=int, default=7)
-    parser.add_argument("--d_state", type=int, default=16)
-    parser.add_argument("--d_conv", type=int, default=4)
-    parser.add_argument("--expand", type=int, default=2)
-    parser.add_argument("--ffn_mult", type=int, default=4)
-
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--grad_clip", type=float, default=5.0)
-
-    args = parser.parse_args()
-    set_seed(args.seed)
-
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
-    print(f"[INFO] device: {device}")
-
-    root = Path(args.root)
-    train_csv = root / "train_index.csv"
-    test_csv = root / "test_index.csv"
-    if not train_csv.exists() or not test_csv.exists():
-        raise FileNotFoundError(f"找不到：\n{train_csv}\n{test_csv}")
-
-    os.makedirs(args.save_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.save_dir, "best_model.pt")
-
-    # Data
-    ds_train = TokenNPYDataset(str(train_csv))
-    ds_test = TokenNPYDataset(str(test_csv))
-
-    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True,
-                          collate_fn=collate_pad, drop_last=True)
-    dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
-                         num_workers=args.num_workers, pin_memory=True,
-                         collate_fn=collate_pad)
-
-    print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
-    print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
-
-    # Model
-    backbone = build_backbone(
-        in_dim=args.in_dim,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        nhead=args.nhead,
-        dropout=args.dropout,
-        max_len=args.max_len,
-        conv_k=args.conv_k,
-        d_state=args.d_state,
-        d_conv=args.d_conv,
-        expand=args.expand,
-        ffn_mult=args.ffn_mult,
-    ).to(device)
-
-    classifier = nn.Linear(backbone.final_feat_dim, 4).to(device)
-
-    # Sanity
-    x0, m0, _ = next(iter(dl_train))
-    with torch.no_grad():
-        feat0 = backbone(x0.to(device), mask=m0.to(device))
-        logit0 = classifier(feat0)
-    print("[DEBUG] feat shape:", tuple(feat0.shape), "logits shape:", tuple(logit0.shape))
-
-    # Loss
-    if args.use_weighted_loss:
-        counts = ds_train.class_counts.astype(np.float32)
-        w = 1.0 / (counts / counts.sum() + 1e-12)
-        w = w / w.sum()
-        weight = torch.tensor(w, device=device, dtype=torch.float32)
-        print("[INFO] weighted CE weights:", w)
-        loss_fn = nn.CrossEntropyLoss(weight=weight)
-    else:
-        loss_fn = nn.CrossEntropyLoss()
-
-    # Optim/Scheduler
-    params = list(backbone.parameters()) + list(classifier.parameters())
-    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    total_steps = args.epochs * max(1, len(dl_train))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
-
-    best_icbhi = -1.0
-    best_epoch = -1
-    bad_epochs = 0
-
-    print("\n🚀 Start training (PatchMix-like): train -> eval(TEST) -> save best by ICBHI\n")
-
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
-
-        # 1) train one epoch
-        train_loss = train_one_epoch(
-            backbone, classifier, dl_train, device,
-            optim, scheduler, loss_fn, scaler,
-            amp=args.amp, grad_clip=args.grad_clip
+# -------------------------
+# 基础：FFN
+# -------------------------
+class FFN(nn.Module):
+    def __init__(self, d_model: int, mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        hidden = d_model * mult
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
         )
 
-        # 2) eval once per epoch
-        test_m = evaluate_icbhi(backbone, classifier, dl_test, device)
-        icbhi = test_m["ICBHI"]
+    def forward(self, x):
+        return self.net(x)
 
-        # 3) select best by ICBHI & save
-        improved = icbhi > best_icbhi + 1e-6
-        if improved:
-            best_icbhi = icbhi
-            best_epoch = epoch
-            bad_epochs = 0
 
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "backbone_state": backbone.state_dict(),
-                    "classifier_state": classifier.state_dict(),
-                    "best_icbhi": best_icbhi,
-                    "args": vars(args),
-                },
-                ckpt_path
+# -------------------------
+# BiMambaBlock（带残差）
+# -------------------------
+class BiMambaBlock(nn.Module):
+    def __init__(self, d_model: int, d_state=16, d_conv=4, expand=2, dropout=0.1, conv_k: int = 7, ffn_mult: int = 4):
+        super().__init__()
+        if Mamba is None:
+            raise RuntimeError("mamba_ssm 未安装：pip install mamba-ssm causal-conv1d")
+
+        self.ln1 = nn.LayerNorm(d_model)
+        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.drop = nn.Dropout(dropout)
+
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = FFN(d_model, mult=ffn_mult, dropout=dropout)
+
+    def forward(self, x):
+        # x: (B,T,D)
+        h = self.ln1(x)
+        y_f = self.fwd(h)
+        y_b = torch.flip(self.bwd(torch.flip(h, dims=[1])), dims=[1])
+        y = y_f + y_b
+        x = x + self.drop(y)
+
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+# -------------------------
+# Attention Block（1层）
+# -------------------------
+class AttnBlock(nn.Module):
+    def __init__(self, d_model: int, nhead: int = 8, dropout: float = 0.1, ffn_mult: int = 4):
+        super().__init__()
+        # 用标准 TransformerEncoderLayer 作为“attention + FFN”
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * ffn_mult,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+    def forward(self, x, key_padding_mask: torch.Tensor):
+        # key_padding_mask: True=PAD  (和你 collate_pad 对齐)
+        return self.layer(x, src_key_padding_mask=key_padding_mask)
+
+
+# -------------------------
+# 3 + 1 + 3 Backbone
+# -------------------------
+class Hybrid313Backbone(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        d_model: int = 256,
+        dropout: float = 0.2,
+        max_len: int = 4096,
+        # mamba
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        conv_k: int = 7,
+        ffn_mult: int = 4,
+        # attn
+        nhead: int = 8,
+        pre_layers: int = 3,
+        post_layers: int = 3,
+    ):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        self.pre = nn.ModuleList([
+            BiMambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout,
+                conv_k=conv_k,
+                ffn_mult=ffn_mult,
             )
-            star = "⭐"
-        else:
-            bad_epochs += 1
-            star = " "
+            for _ in range(pre_layers)
+        ])
 
-        dt = time.time() - t0
-        print(
-            f"{star} Epoch {epoch:03d}/{args.epochs} | "
-            f"train_loss {train_loss:.4f} | "
-            f"TEST ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
-            f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
-            f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
-            f"{dt:.1f}s"
-        )
+        self.attn = AttnBlock(d_model=d_model, nhead=nhead, dropout=dropout, ffn_mult=ffn_mult)
 
-        # early stop
-        if bad_epochs >= args.patience:
-            print(f"[EARLY STOP] TEST ICBHI 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
-            break
+        self.post = nn.ModuleList([
+            BiMambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout,
+                conv_k=conv_k,
+                ffn_mult=ffn_mult,
+            )
+            for _ in range(post_layers)
+        ])
 
-    print(f"\n✅ DONE. Best ICBHI={best_icbhi:.4f} @ epoch {best_epoch}")
-    print(f"[SAVED] best checkpoint: {ckpt_path}")
+        self.final_feat_dim = d_model
+
+    def forward(self, x, mask: torch.Tensor):
+        """
+        x: (B,T,in_dim)
+        mask: (B,T) True=PAD
+        return: (B, d_model)
+        """
+        x = self.drop(self.in_proj(x))
+
+        for blk in self.pre:
+            x = blk(x)
+
+        x = self.attn(x, key_padding_mask=mask)
+
+        for blk in self.post:
+            x = blk(x)
+
+        # masked mean pooling
+        valid = (~mask).float()  # (B,T)
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B,1)
+        pooled = (x * valid.unsqueeze(-1)).sum(dim=1) / denom  # (B,D)
+        return pooled
 
 
-if __name__ == "__main__":
-    main()
+# -------------------------
+# 你训练脚本调用的入口：build_backbone
+# -------------------------
+def build_backbone(
+    in_dim: int,
+    d_model: int = 256,
+    n_layers: int = 2,      # 兼容旧参数：这里不再用
+    nhead: int = 8,
+    dropout: float = 0.2,
+    max_len: int = 4096,
+    conv_k: int = 7,
+    d_state: int = 16,
+    d_conv: int = 4,
+    expand: int = 2,
+    ffn_mult: int = 4,
+    # 新增：固定 3+1+3
+    pre_layers: int = 3,
+    post_layers: int = 3,
+):
+    return Hybrid313Backbone(
+        in_dim=in_dim,
+        d_model=d_model,
+        dropout=dropout,
+        max_len=max_len,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        conv_k=conv_k,
+        ffn_mult=ffn_mult,
+        nhead=nhead,
+        pre_layers=pre_layers,
+        post_layers=post_layers,
+    )
