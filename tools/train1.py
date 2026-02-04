@@ -20,7 +20,6 @@ from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
 
 # ============================================================
 # 0) 让 `from mymodels.model import build_backbone` 能导入
-#    tools/ 的上一级是 hybrid/
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -84,7 +83,6 @@ def collate_pad(batch):
 
 # ============================================================
 # 2) Evaluate：4-class argmax -> 4->2 ICBHI
-#    (和你贴的 patchmix validate 一样：每 epoch eval 一次)
 # ============================================================
 @torch.no_grad()
 def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
@@ -133,7 +131,7 @@ def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
 
 
 # ============================================================
-# 3) 工具：随机种子
+# 3) seed
 # ============================================================
 def set_seed(seed: int = 42):
     import random
@@ -144,7 +142,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 4) Train one epoch（只更新参数）
+# 4) Train one epoch
 # ============================================================
 def train_one_epoch(backbone, classifier, loader, device, optim, scheduler, loss_fn, scaler, amp, grad_clip=5.0):
     backbone.train()
@@ -177,7 +175,7 @@ def train_one_epoch(backbone, classifier, loader, device, optim, scheduler, loss
 
 
 # ============================================================
-# 5) 主流程：每 epoch train -> eval -> 用 ICBHI 保存 best
+# 5) main
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -206,16 +204,20 @@ def main():
 
     # backbone args（传给 build_backbone）
     parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--n_layers", type=int, default=2)  # 兼容保留：不使用
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--max_len", type=int, default=4096)
+    parser.add_argument("--max_len", type=int, default=4096)  # 兼容保留：不使用
 
     parser.add_argument("--conv_k", type=int, default=7)
     parser.add_argument("--d_state", type=int, default=16)
     parser.add_argument("--d_conv", type=int, default=4)
     parser.add_argument("--expand", type=int, default=2)
     parser.add_argument("--ffn_mult", type=int, default=4)
+
+    # ✅ 新增：堆叠多少个宏block；以及 layer=12 记录
+    parser.add_argument("--num_blocks", type=int, default=2)
+    parser.add_argument("--layer_idx", type=int, default=12)
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--grad_clip", type=float, default=5.0)
@@ -262,6 +264,10 @@ def main():
         d_conv=args.d_conv,
         expand=args.expand,
         ffn_mult=args.ffn_mult,
+
+        # ✅ 新增
+        num_blocks=args.num_blocks,
+        layer_idx=args.layer_idx,
     ).to(device)
 
     classifier = nn.Linear(backbone.final_feat_dim, 4).to(device)
@@ -272,6 +278,7 @@ def main():
         feat0 = backbone(x0.to(device), mask=m0.to(device))
         logit0 = classifier(feat0)
     print("[DEBUG] feat shape:", tuple(feat0.shape), "logits shape:", tuple(logit0.shape))
+    print(f"[INFO] backbone.num_blocks={getattr(backbone, 'num_blocks', 'N/A')} layer_idx={getattr(backbone, 'layer_idx', 'N/A')}")
 
     # Loss
     if args.use_weighted_loss:
@@ -295,23 +302,20 @@ def main():
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (PatchMix-like): train -> eval(TEST) -> save best by ICBHI\n")
+    print("\n🚀 Start training (tokens->Hybrid 3+1+3 macro blocks): train -> eval(TEST) -> save best by ICBHI\n")
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        # 1) train one epoch
         train_loss = train_one_epoch(
             backbone, classifier, dl_train, device,
             optim, scheduler, loss_fn, scaler,
             amp=args.amp, grad_clip=args.grad_clip
         )
 
-        # 2) eval once per epoch
         test_m = evaluate_icbhi(backbone, classifier, dl_test, device)
         icbhi = test_m["ICBHI"]
 
-        # 3) select best by ICBHI & save
         improved = icbhi > best_icbhi + 1e-6
         if improved:
             best_icbhi = icbhi
@@ -343,7 +347,6 @@ def main():
             f"{dt:.1f}s"
         )
 
-        # early stop
         if bad_epochs >= args.patience:
             print(f"[EARLY STOP] TEST ICBHI 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
