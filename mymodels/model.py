@@ -170,7 +170,7 @@ class SSA_Model_HeARTokens(nn.Module):
     def __init__(
             self,
             in_dim=768,
-            d_model=256,  #  改这里
+            d_model=128,  #  改这里
             n_layers=8,
             nhead=4,  #  下面我会说 nhead 怎么配更好
             dropout=0.3,
@@ -233,7 +233,7 @@ class SSA_Model_HeARTokens(nn.Module):
         self.token_head = nn.Linear(d_model, num_classes)
 
     def forward(self, x, mask=None, return_feature=False):
-        # x: (B, 798, 768)
+
         x = self.input_proj(x)
 
         T = x.shape[1]
@@ -248,14 +248,14 @@ class SSA_Model_HeARTokens(nn.Module):
             x = stage(x, mask=mask)
 
         x = self.norm(x)
-        file_feature = self.pool(x, mask=mask)  # (B, 768)
+        file_feature = self.pool(x, mask=mask)
 
         if return_feature:
             return file_feature, x
 
         file_logits = self.classifier(file_feature)
-        token_logits = self.token_head(x)
-        return file_logits, token_logits
+        #token_logits = self.token_head(x)
+        return file_logits
 
 # =========================
 # 8) Route-A Backbone：输出 (B,d_model)
@@ -275,11 +275,11 @@ class SSA_Backbone(nn.Module):
 # =========================
 def build_model(
     in_dim=768,
-    d_model=256,
+    d_model=128,
     n_layers=8,
     nhead=4,
     dropout=0.3,
-    max_len=4096,
+    max_len=512,
     conv_k=7,
     d_state=16,
     d_conv=4,
