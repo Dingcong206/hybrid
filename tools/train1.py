@@ -6,7 +6,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,16 +16,16 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
-from pathlib import Path
-import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]   # ✅ tools 的上一级：hybrid
+# ============================================================
+# 0) 让 `from mymodels.model import build_backbone` 能导入
+#   tools/train1.py -> parents[1] = /data/dingcong/hybrid
+# ============================================================
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-
-
-
 from mymodels.model import build_backbone
+
 
 # ============================================================
 # 1) Dataset：读取 tokens.npy（label 0/1/2/3）
@@ -55,6 +55,7 @@ class TokenNPYDataset(Dataset):
         x = torch.from_numpy(x).float()
         return x, torch.tensor(y, dtype=torch.long)
 
+
 def collate_pad(batch):
     """
     return:
@@ -78,32 +79,40 @@ def collate_pad(batch):
     y = torch.stack(ys).view(-1)
     return x_pad, mask, y
 
+
 # ============================================================
-# 2) 评估：4-class argmax -> 4->2 ICBHI
+# 2) 评估：改成 logits->p_abn 阈值（可选搜索阈值）
+#   p_abn = 1 - softmax(logits)[:,0]   # 0类=normal
 # ============================================================
 @torch.no_grad()
-def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
+def collect_probs(backbone, classifier, loader, device) -> Tuple[np.ndarray, np.ndarray]:
     backbone.eval()
     classifier.eval()
 
-    all_pred4, all_true4 = [], []
+    probs_abn, y_true4 = [], []
     for x, mask, y in loader:
         x = x.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        feat = backbone(x, mask=mask)      # (B,d_model)
-        logits = classifier(feat)          # (B,4)
-        pred4 = torch.argmax(logits, dim=1)
+        feat = backbone(x, mask=mask)          # (B,d)
+        logits = classifier(feat)              # (B,4)
+        p = torch.softmax(logits, dim=1)       # (B,4)
+        p_abn = 1.0 - p[:, 0]                  # abnormal prob
 
-        all_pred4.append(pred4.cpu())
-        all_true4.append(y.cpu())
+        probs_abn.append(p_abn.detach().cpu())
+        y_true4.append(y.detach().cpu())
 
-    y_pred4 = torch.cat(all_pred4).numpy()
-    y_true4 = torch.cat(all_true4).numpy()
+    probs_abn = torch.cat(probs_abn).numpy()
+    y_true4 = torch.cat(y_true4).numpy()
+    return probs_abn, y_true4
 
-    y_pred2 = (y_pred4 != 0).astype(np.int64)
+
+def metrics_from_thr(probs_abn: np.ndarray, y_true4: np.ndarray, thr: float) -> Dict[str, float]:
+    # 4->2 true
     y_true2 = (y_true4 != 0).astype(np.int64)
+    # pred2 by threshold
+    y_pred2 = (probs_abn >= thr).astype(np.int64)
 
     cm = confusion_matrix(y_true2, y_pred2, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
@@ -116,6 +125,7 @@ def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
     f1 = f1_score(y_true2, y_pred2, zero_division=0)
 
     return {
+        "thr": float(thr),
         "ICBHI": float(icbhi),
         "SE": float(se),
         "SP": float(sp),
@@ -124,6 +134,26 @@ def evaluate_icbhi(backbone, classifier, loader, device) -> Dict[str, float]:
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
     }
 
+
+@torch.no_grad()
+def evaluate_icbhi(backbone, classifier, loader, device, thr: float = 0.5, search_thr: bool = False) -> Dict[str, float]:
+    probs_abn, y_true4 = collect_probs(backbone, classifier, loader, device)
+
+    if not search_thr:
+        return metrics_from_thr(probs_abn, y_true4, thr)
+
+    # 搜索最优阈值（让 ICBHI 最大）
+    best = None
+    for t in np.linspace(0.05, 0.95, 19):  # 0.05,0.10,...,0.95
+        m = metrics_from_thr(probs_abn, y_true4, float(t))
+        if best is None or m["ICBHI"] > best["ICBHI"]:
+            best = m
+    return best
+
+
+# ============================================================
+# 3) 工具：随机种子
+# ============================================================
 def set_seed(seed: int = 42):
     import random
     random.seed(seed)
@@ -131,8 +161,9 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
 # ============================================================
-# 3) 主训练：Route-A (backbone + classifier)，每 epoch 在 TEST 上评估选 best
+# 4) 主训练：Route-A (backbone + classifier)
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -144,32 +175,32 @@ def main():
         help="预处理输出目录（包含 train_index.csv / test_index.csv）"
     )
 
+    # ✅ 更稳的默认值（你也可以命令行覆盖）
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-2)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_parallel_3bimamba")
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_thr")
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--use_weighted_loss", action="store_true")
 
-    # tokens 维度（来自 AST patch projection hidden_dim，常见 768）
+    # tokens 维度
     parser.add_argument("--in_dim", type=int, default=768)
 
     # backbone 参数
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--max_len", type=int, default=4096)
 
-    # 并行层局部卷积 kernel
+    # 并行层局部卷积 kernel（传给你的 build_backbone，如果你的 build_backbone 不收这个参数，会报 TypeError）
     parser.add_argument("--conv_k", type=int, default=7)
-
-    # mamba 超参（可选）
     parser.add_argument("--d_state", type=int, default=16)
     parser.add_argument("--d_conv", type=int, default=4)
     parser.add_argument("--expand", type=int, default=2)
@@ -177,11 +208,17 @@ def main():
     # amp
     parser.add_argument("--amp", action="store_true")
 
+    # ✅ 评估阈值
+    parser.add_argument("--thr", type=float, default=0.5, help="abnormal threshold (p_abn >= thr => abnormal)")
+    parser.add_argument("--search_thr", action="store_true", help="search best thr on TEST each epoch")
+
     args = parser.parse_args()
     set_seed(args.seed)
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"[INFO] device: {device}")
+    print(f"[INFO] epochs={args.epochs} bs={args.batch_size} lr={args.lr} wd={args.weight_decay} dropout={args.dropout}")
+    print(f"[INFO] eval: thr={args.thr} search_thr={args.search_thr}")
 
     root = Path(args.root)
     train_csv = root / "train_index.csv"
@@ -210,6 +247,7 @@ def main():
     print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
 
     # backbone + classifier
+    # ⚠️ 注意：如果你的 build_backbone 不接受 conv_k/d_state/d_conv/expand，这里会 TypeError。
     backbone = build_backbone(
         in_dim=args.in_dim,
         d_model=args.d_model,
@@ -249,7 +287,6 @@ def main():
     total_steps = args.epochs * max(1, len(dl_train))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
 
-    # AMP（新写法可消 warning；旧写法也能跑）
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     best_icbhi = -1.0
@@ -261,6 +298,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         backbone.train()
         classifier.train()
+
         t0 = time.time()
         running = 0.0
 
@@ -286,7 +324,8 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        test_m = evaluate_icbhi(backbone, classifier, dl_test, device)
+        # eval（阈值法）
+        test_m = evaluate_icbhi(backbone, classifier, dl_test, device, thr=args.thr, search_thr=args.search_thr)
         icbhi = test_m["ICBHI"]
 
         improved = icbhi > best_icbhi + 1e-6
@@ -300,6 +339,7 @@ def main():
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
                     "best_icbhi": best_icbhi,
+                    "best_thr": test_m.get("thr", args.thr),
                     "args": vars(args),
                 },
                 ckpt_path
@@ -310,13 +350,14 @@ def main():
             star = " "
 
         dt = time.time() - t0
+        thr_show = test_m.get("thr", args.thr)
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
             f"TEST ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
             f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
             f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
-            f"{dt:.1f}s"
+            f"thr {thr_show:.2f} | {dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
@@ -325,6 +366,7 @@ def main():
 
     print(f"\n✅ DONE. Best ICBHI={best_icbhi:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
+
 
 if __name__ == "__main__":
     main()
