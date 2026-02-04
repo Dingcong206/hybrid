@@ -131,6 +131,12 @@ def collate_pad(batch):
 # ============================================================
 @torch.no_grad()
 def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
+    """
+    完全对齐发表版 get_score() 口径：
+    - SP/SE/Score 都是百分制（0~100）
+    - Score = (SP + SE) / 2
+    - pred 用 argmax(logits)
+    """
     backbone.eval()
     classifier.eval()
 
@@ -143,7 +149,7 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
 
         feat = backbone(x, mask=mask)
         logits = classifier(feat)            # (B,2)
-        pred = torch.argmax(logits, dim=1)   # ✅ argmax 决策
+        pred = torch.argmax(logits, dim=1)   # ✅ argmax
 
         all_pred.append(pred.detach().cpu())
         all_true.append(y.detach().cpu())
@@ -154,16 +160,18 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    se = tp / (tp + fn + 1e-10)
-    sp = tn / (tn + fp + 1e-10)
-    icbhi = (se + sp) / 2.0
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
+    # ✅ 对齐 get_score：百分制
+    sp = tn / (tn + fp + 1e-10) * 100.0   # normal accuracy
+    se = tp / (tp + fn + 1e-10) * 100.0   # abnormal accuracy
+    sc = (sp + se) / 2.0                 # score
+
+    acc = accuracy_score(y_true, y_pred) * 100.0  # 可选：也改成百分制方便看
+    f1 = f1_score(y_true, y_pred)                 # F1 通常保留 0~1 也行
 
     return {
-        "ICBHI": float(icbhi),
-        "SE": float(se),
         "SP": float(sp),
+        "SE": float(se),
+        "Score": float(sc),
         "ACC": float(acc),
         "F1": float(f1),
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
