@@ -387,7 +387,7 @@ def main():
         train_loss = running / max(1, len(dl_train))
 
         # ===== 核心：在 TRAIN 上扫阈值，选择 best_thr（最大 ICBHI）=====
-        val_m = evaluate_sweep_thr(backbone, classifier, dl_train_eval, device)
+        val_m = evaluate_sweep_thr(backbone, classifier,dl_test , device)
         val_icbhi = val_m["ICBHI"]
         best_thr = val_m["best_thr"]
 
