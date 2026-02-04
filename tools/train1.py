@@ -176,6 +176,9 @@ def main():
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"[INFO] device: {device}")
     print(f"[INFO] project_root: {PROJECT_ROOT}")
+    print("[DEBUG] device_count:", torch.cuda.device_count())
+    print("[DEBUG] current_device:", torch.cuda.current_device())
+    print("[DEBUG] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 
     root = Path(args.root)
     train_csv = root / "train_index.csv"
