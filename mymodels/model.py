@@ -163,42 +163,51 @@ class Stage3Attn3FFN(nn.Module):
 # =========================
 # 7) 主模型：PE -> Conv(once) -> [Stage × n_layers] -> Norm -> Pool
 # =========================
+# =========================
+# 修改后的主模型：SSA_Model_HeARTokens
+# =========================
 class SSA_Model_HeARTokens(nn.Module):
     def __init__(
-        self,
-        in_dim=768,
-        d_model=256,
-        n_layers=4,
-        nhead=8,
-        dropout=0.3,
-        max_len=4096,
-        num_classes=4,
-        conv_k=7,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        ffn_mult=4,
+            self,
+            in_dim=768,  # AST 原始输出维度
+            d_model=768,  # 保持与 in_dim 一致，不再降维
+            n_layers=4,  # 根据显存可调，论文通常用 6-12 层，但 Mamba 较轻量
+            nhead=8,  # 768 能被 8 整除，OK
+            dropout=0.3,
+            max_len=1024,  # ICBHI 8s 对应约 798 tokens，设为 1024 足够
+            num_classes=4,
+            conv_k=7,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            ffn_mult=4,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_classes = num_classes
 
+        # --- 修改点 1: 移除降维投影，改为轻量级特征整合 ---
+        # 如果你希望完全不改变特征，甚至可以只用 nn.Identity()
         self.input_proj = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            # 仅做线性变换而不改变维度，有助于模型适配后续的 Mamba 结构
             nn.Linear(in_dim, d_model),
-            nn.SiLU(),
-            _rmsnorm(d_model),
+            nn.SiLU()
         )
 
+        # --- 修改点 2: 确保 PE 长度覆盖 AST 的 798 个 tokens ---
         pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
+        # --- 修改点 3: 卷积层维度同步 ---
         self.front_conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
             nn.BatchNorm1d(d_model),
             nn.SiLU(),
         )
 
+        # --- 修改点 4: Stage 结构会自动继承 d_model=768 ---
         self.stages = nn.ModuleList([
             Stage3Attn3FFN(
                 d_model=d_model,
@@ -215,28 +224,31 @@ class SSA_Model_HeARTokens(nn.Module):
         self.norm = _rmsnorm(d_model)
         self.pool = ICBHI_Pooling(d_model)
 
-        # Route-B 兼容（Route-A 不用到，但保留）
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, d_model // 2),  # 增加一层瓶颈层，平滑分类
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, num_classes)
+            nn.Linear(d_model // 2, num_classes)
         )
         self.token_head = nn.Linear(d_model, num_classes)
 
     def forward(self, x, mask=None, return_feature=False):
+        # x: (B, 798, 768)
         x = self.input_proj(x)
+
         T = x.shape[1]
+        # 加上位置编码
         x = x + self.pe[:, :T, :].to(x.device)
         x = self.pos_drop(x)
 
+        # 局部特征增强
         x = x + self.front_conv(x.transpose(1, 2)).transpose(1, 2)
 
         for stage in self.stages:
             x = stage(x, mask=mask)
 
         x = self.norm(x)
-        file_feature = self.pool(x, mask=mask)
+        file_feature = self.pool(x, mask=mask)  # (B, 768)
 
         if return_feature:
             return file_feature, x
