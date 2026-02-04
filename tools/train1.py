@@ -157,7 +157,18 @@ def main():
 
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA")
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--use_weighted_loss", action="store_true", help="use class-balanced CE")
+    parser.add_argument(
+        "--use_weighted_loss",
+        action="store_true",
+        default=True,
+        help="use class-balanced CE"
+    )
+    parser.add_argument(
+        "--no_weighted_loss",
+        action="store_false",
+        dest="use_weighted_loss",
+        help="disable class-balanced CE"
+    )
 
     # ===== model args =====
     parser.add_argument("--in_dim", type=int, default=768)
