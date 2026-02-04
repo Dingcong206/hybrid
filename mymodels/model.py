@@ -171,7 +171,7 @@ class SSA_Model_HeARTokens(nn.Module):
             self,
             in_dim=768,  # AST 原始输出维度
             d_model=768,  # 保持与 in_dim 一致，不再降维
-            n_layers=12,  # 根据显存可调，论文通常用 6-12 层，但 Mamba 较轻量
+            n_layers=8,  # 根据显存可调，论文通常用 6-12 层，但 Mamba 较轻量
             nhead=8,  # 768 能被 8 整除，OK
             dropout=0.3,
             max_len=1024,  # ICBHI 8s 对应约 798 tokens，设为 1024 足够
