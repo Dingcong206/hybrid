@@ -112,9 +112,11 @@ def train_one_epoch(model, loader, device, optim, scheduler, loss_fn, scaler, am
         x, mask, y = x.to(device), mask.to(device), y.to(device)
 
         with torch.amp.autocast('cuda', enabled=amp):
-            # 解包模型输出
             logits, _ = model(x, mask=mask)
-            loss = loss_fn(logits, y)
+
+            # 强制将标签 y 转换为 Long 类型（类别索引）
+            # 同时确保 logits 是 float 类型（由 amp 自动处理，但显式调用更稳）
+            loss = loss_fn(logits, y.long())
 
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
