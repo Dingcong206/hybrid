@@ -164,7 +164,7 @@ def main():
     parser.add_argument("--n_layers", type=int, default=8)   # ✅ 你现在要 12 层
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--max_len", type=int, default=512)
+    parser.add_argument("--max_len", type=int, default=1024)
     parser.add_argument("--num_classes", type=int, default=2)
 
     # amp
