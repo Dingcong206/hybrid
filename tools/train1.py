@@ -332,7 +332,7 @@ def main():
 
         # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
         test_m = evaluate_argmax(backbone, classifier, dl_test, device)
-        test_icbhi = test_m["ICBHI"]
+        test_icbhi = test_m["Score"]
 
         improved = test_icbhi > best_test_icbhi + 1e-6
         if improved:
@@ -358,17 +358,17 @@ def main():
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"TEST(argmax) ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
+            f"TEST(argmax) Score {test_m['Score']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
             f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
             f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
             f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
-            print(f"[EARLY STOP] TEST ICBHI 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
+            print(f"[EARLY STOP] TEST Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best TEST ICBHI={best_test_icbhi:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best TEST Score={best_test_icbhi:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
     # ✅ 最后：加载 best ckpt，再在 TEST 上跑一次 argmax（确认最终结果）
@@ -379,7 +379,7 @@ def main():
 
     final_m = evaluate_argmax(backbone, classifier, dl_test, device)
     print(
-        f"[TEST argmax] ICBHI {final_m['ICBHI']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
+        f"[TEST argmax] Score {final_m['Score']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
         f"ACC {final_m['ACC']:.4f} F1 {final_m['F1']:.4f} | "
         f"TP {final_m['TP']} TN {final_m['TN']} FP {final_m['FP']} FN {final_m['FN']}"
     )
