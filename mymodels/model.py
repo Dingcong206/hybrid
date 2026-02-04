@@ -157,7 +157,7 @@ class SSA_Heavy_12Layer(nn.Module):
         attn_scores = self.attention_pool(x)  # (B, L, 1)
         if mask is not None:
             # 排除 padding 的部分
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e4)
 
         attn_weights = torch.softmax(attn_scores, dim=1)  # (B, L, 1)
 

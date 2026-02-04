@@ -111,7 +111,7 @@ def train_one_epoch(model, loader, device, optim, scheduler, loss_fn, scaler, am
     for x, mask, y in loader:
         x, mask, y = x.to(device), mask.to(device), y.to(device)
 
-        with torch.cuda.amp.autocast(enabled=amp):
+        with torch.amp.autocast('cuda', enabled=amp):
             # 解包模型输出
             logits, _ = model(x, mask=mask)
             loss = loss_fn(logits, y)
@@ -170,7 +170,7 @@ def main():
     # 优化器
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(dl_train))
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     best_icbhi = 0.0
     print(f"🚀 开始训练 Heavy SSA 12层模型 | 显存目标: 24GB | BatchSize: {args.batch_size}")
