@@ -4,7 +4,6 @@
 import os
 import sys
 import time
-import math
 import random
 import argparse
 from pathlib import Path
@@ -45,7 +44,7 @@ def apply_spec_augment(x, max_mask_t=20, max_mask_f=10, num_masks=2):
         if t_width > 0:
             x_aug[t_start:t_start + t_width, :] = 0
 
-        # freq/feature mask
+        # feature mask
         f_width = random.randint(0, max_mask_f)
         f_start = random.randint(0, max(0, D - f_width))
         if f_width > 0:
@@ -76,6 +75,7 @@ class TokenNPYDataset(Dataset):
         self.df = df.reset_index(drop=True)
 
         raw_labels = self.df["label"].astype(int).values
+        # 0=normal, 1=abnormal
         self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels], dtype=np.int64)
         self.class_counts = np.bincount(self.binary_labels, minlength=2)
 
@@ -127,74 +127,10 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 4) 评估：在给定 loader 上扫阈值，返回 best_thr（最大 ICBHI）
+# 4) 评估：argmax(logits)（与发表版一致：无阈值）
 # ============================================================
 @torch.no_grad()
-def evaluate_sweep_thr(backbone, classifier, loader, device) -> Dict[str, float]:
-    backbone.eval()
-    classifier.eval()
-
-    all_probs, all_true = [], []
-
-    for x, mask, y in loader:
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        feat = backbone(x, mask=mask)
-        logits = classifier(feat)
-        probs = torch.softmax(logits, dim=1)[:, 1]  # abnormal prob
-
-        all_probs.append(probs.detach().cpu())
-        all_true.append(y.detach().cpu())
-
-    probs = torch.cat(all_probs).numpy()
-    y_true = torch.cat(all_true).numpy()
-
-    best_icbhi = -1.0
-    best_thr = 0.5
-    best_cm = (0, 0, 0, 0)
-
-    for thr in np.linspace(0.05, 0.95, 19):  # step=0.05
-        y_pred = (probs >= thr).astype(int)
-        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel()
-
-        se = tp / (tp + fn + 1e-10)
-        sp = tn / (tn + fp + 1e-10)
-        icbhi = (se + sp) / 2.0
-
-        if icbhi > best_icbhi:
-            best_icbhi = icbhi
-            best_thr = thr
-            best_cm = (tn, fp, fn, tp)
-
-    tn, fp, fn, tp = best_cm
-    se = tp / (tp + fn + 1e-10)
-    sp = tn / (tn + fp + 1e-10)
-    icbhi = (se + sp) / 2.0
-    acc = (tp + tn) / (tp + tn + fp + fn + 1e-10)
-
-    # 用 best_thr 计算 F1
-    y_pred_best = (probs >= best_thr).astype(int)
-    f1 = f1_score(y_true, y_pred_best)
-
-    return {
-        "best_thr": float(best_thr),
-        "ICBHI": float(icbhi),
-        "SE": float(se),
-        "SP": float(sp),
-        "ACC": float(acc),
-        "F1": float(f1),
-        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
-    }
-
-
-# ============================================================
-# 5) 固定阈值在 Test 上评估一次（最终报告）
-# ============================================================
-@torch.no_grad()
-def evaluate_fixed_thr(backbone, classifier, loader, device, thr: float) -> Dict[str, float]:
+def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
     backbone.eval()
     classifier.eval()
 
@@ -206,12 +142,11 @@ def evaluate_fixed_thr(backbone, classifier, loader, device, thr: float) -> Dict
         y = y.to(device, non_blocking=True)
 
         feat = backbone(x, mask=mask)
-        logits = classifier(feat)
-        probs = torch.softmax(logits, dim=1)[:, 1]
-        pred = (probs >= thr).long()
+        logits = classifier(feat)            # (B,2)
+        pred = torch.argmax(logits, dim=1)   # ✅ argmax 决策
 
-        all_pred.append(pred.cpu())
-        all_true.append(y.cpu())
+        all_pred.append(pred.detach().cpu())
+        all_true.append(y.detach().cpu())
 
     y_pred = torch.cat(all_pred).numpy()
     y_true = torch.cat(all_true).numpy()
@@ -226,7 +161,6 @@ def evaluate_fixed_thr(backbone, classifier, loader, device, thr: float) -> Dict
     f1 = f1_score(y_true, y_pred)
 
     return {
-        "thr": float(thr),
         "ICBHI": float(icbhi),
         "SE": float(se),
         "SP": float(sp),
@@ -237,7 +171,7 @@ def evaluate_fixed_thr(backbone, classifier, loader, device, thr: float) -> Dict
 
 
 # ============================================================
-# 6) Seed
+# 5) Seed
 # ============================================================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -247,7 +181,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 7) Train
+# 6) Train (official Train(60%) train params, official Test(40%) eval + pick best)
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -255,7 +189,7 @@ def main():
     parser.add_argument("--root", type=str,
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -263,12 +197,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_thr")
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_argmax")
     parser.add_argument("--patience", type=int, default=10)
 
     # weighted loss 默认开
-    parser.add_argument("--use_weighted_loss", action="store_true", default=True, help="use class-balanced CE (default ON)")
-    parser.add_argument("--no_weighted_loss", action="store_false", dest="use_weighted_loss", help="disable class-balanced CE")
+    parser.add_argument("--use_weighted_loss", action="store_true", default=True,
+                        help="use class-balanced CE (default ON)")
+    parser.add_argument("--no_weighted_loss", action="store_false", dest="use_weighted_loss",
+                        help="disable class-balanced CE")
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
@@ -288,9 +224,10 @@ def main():
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"[INFO] device: {device}")
     print(f"[INFO] project_root: {PROJECT_ROOT}")
-    print("[DEBUG] device_count:", torch.cuda.device_count())
-    print("[DEBUG] current_device:", torch.cuda.current_device())
-    print("[DEBUG] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+    if device.type == "cuda":
+        print("[DEBUG] device_count:", torch.cuda.device_count())
+        print("[DEBUG] current_device:", torch.cuda.current_device())
+        print("[DEBUG] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 
     root = Path(args.root)
     train_csv = root / "train_index.csv"
@@ -304,18 +241,17 @@ def main():
     ds_train = TokenNPYDataset(str(train_csv), is_train=True)
     ds_test = TokenNPYDataset(str(test_csv), is_train=False)
 
-    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True,
-                          collate_fn=collate_pad, drop_last=True)
+    dl_train = DataLoader(
+        ds_train, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True,
+        collate_fn=collate_pad, drop_last=True
+    )
 
-    # 注意：这里 dl_train_eval 用不 shuffle 的版本做“训练内阈值搜索”（更稳定）
-    dl_train_eval = DataLoader(ds_train, batch_size=args.batch_size, shuffle=False,
-                               num_workers=args.num_workers, pin_memory=True,
-                               collate_fn=collate_pad)
-
-    dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
-                         num_workers=args.num_workers, pin_memory=True,
-                         collate_fn=collate_pad)
+    dl_test = DataLoader(
+        ds_test, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        collate_fn=collate_pad
+    )
 
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
     print(f"[INFO] train class_counts (0/1): {ds_train.class_counts.tolist()}")
@@ -351,11 +287,11 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
-    best_val_icbhi = -1.0
+    best_test_icbhi = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (select best_thr on TRAIN, final test only once)\n")
+    print("\n🚀 Start training (official Train(60%) update params, official Test(40%) eval + pick best, ARGMAX)\n")
 
     for epoch in range(1, args.epochs + 1):
         backbone.train()
@@ -386,14 +322,13 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        # ===== 核心：在 TRAIN 上扫阈值，选择 best_thr（最大 ICBHI）=====
-        val_m = evaluate_sweep_thr(backbone, classifier,dl_test , device)
-        val_icbhi = val_m["ICBHI"]
-        best_thr = val_m["best_thr"]
+        # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
+        test_m = evaluate_argmax(backbone, classifier, dl_test, device)
+        test_icbhi = test_m["ICBHI"]
 
-        improved = val_icbhi > best_val_icbhi + 1e-6
+        improved = test_icbhi > best_test_icbhi + 1e-6
         if improved:
-            best_val_icbhi = val_icbhi
+            best_test_icbhi = test_icbhi
             best_epoch = epoch
             bad_epochs = 0
             torch.save(
@@ -401,8 +336,7 @@ def main():
                     "epoch": epoch,
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
-                    "best_val_icbhi": best_val_icbhi,
-                    "best_thr": best_thr,
+                    "best_test_icbhi": best_test_icbhi,
                     "args": vars(args),
                 },
                 ckpt_path
@@ -416,31 +350,30 @@ def main():
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"TRAIN(best_thr={best_thr:.2f}) ICBHI {val_m['ICBHI']:.4f} SE {val_m['SE']:.4f} SP {val_m['SP']:.4f} | "
-            f"ACC {val_m['ACC']:.4f} F1 {val_m['F1']:.4f} | "
-            f"TP {val_m['TP']} TN {val_m['TN']} FP {val_m['FP']} FN {val_m['FN']} | "
+            f"TEST(argmax) ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
+            f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
+            f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
             f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
-            print(f"[EARLY STOP] TRAIN ICBHI 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
+            print(f"[EARLY STOP] TEST ICBHI 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best TRAIN ICBHI={best_val_icbhi:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best TEST ICBHI={best_test_icbhi:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
-    # ===== 最终：只在 TEST 上评估一次（用保存的 best_thr）=====
-    print("\n🚀 Final TEST evaluation (fixed thr from best checkpoint)\n")
+    # ✅ 最后：加载 best ckpt，再在 TEST 上跑一次 argmax（确认最终结果）
+    print("\n🚀 Final TEST evaluation (argmax from best checkpoint)\n")
     ckpt = torch.load(ckpt_path, map_location=device)
     backbone.load_state_dict(ckpt["backbone_state"])
     classifier.load_state_dict(ckpt["classifier_state"])
-    thr = float(ckpt["best_thr"])
 
-    test_m = evaluate_fixed_thr(backbone, classifier, dl_test, device, thr=thr)
+    final_m = evaluate_argmax(backbone, classifier, dl_test, device)
     print(
-        f"[TEST] thr={test_m['thr']:.2f} | ICBHI {test_m['ICBHI']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
-        f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
-        f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']}"
+        f"[TEST argmax] ICBHI {final_m['ICBHI']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
+        f"ACC {final_m['ACC']:.4f} F1 {final_m['F1']:.4f} | "
+        f"TP {final_m['TP']} TN {final_m['TN']} FP {final_m['FP']} FN {final_m['FN']}"
     )
 
 
