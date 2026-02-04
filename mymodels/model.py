@@ -71,8 +71,7 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x, mask=None):
         x_n = self.ln(x)
-        if mask is not None:
-            x_n = x_n.masked_fill(mask.unsqueeze(-1), 0.0)
+        # 这里不额外 masked_fill，key_padding_mask 已经足够屏蔽 PAD
         x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
         return x + self.drop(x_a)
 
@@ -169,12 +168,12 @@ class SSA_Model_HeARTokens(nn.Module):
         self,
         in_dim=768,
         d_model=256,
-        n_layers=12,       # ✅ 你要 12 层
+        n_layers=12,
         nhead=8,
         dropout=0.3,
         max_len=4096,
         num_classes=4,
-        conv_k=7,          # ✅ Conv 只在最开始做一次
+        conv_k=7,
         d_state=16,
         d_conv=4,
         expand=2,
@@ -194,14 +193,12 @@ class SSA_Model_HeARTokens(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
-        # ✅ front conv（只一次）
         self.front_conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
             nn.BatchNorm1d(d_model),
             nn.SiLU(),
         )
 
-        # ✅ 堆叠 12 层 stage，每层是 3+1+3+FFN
         self.stages = nn.ModuleList([
             Stage3Attn3FFN(
                 d_model=d_model,
@@ -218,7 +215,7 @@ class SSA_Model_HeARTokens(nn.Module):
         self.norm = _rmsnorm(d_model)
         self.pool = ICBHI_Pooling(d_model)
 
-        # Route-B 兼容（Route-A 不用到）
+        # Route-B 兼容（Route-A 不用到，但保留）
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.SiLU(),
@@ -233,10 +230,8 @@ class SSA_Model_HeARTokens(nn.Module):
         x = x + self.pe[:, :T, :].to(x.device)
         x = self.pos_drop(x)
 
-        # ✅ Conv only once
         x = x + self.front_conv(x.transpose(1, 2)).transpose(1, 2)
 
-        # 12 layers
         for stage in self.stages:
             x = stage(x, mask=mask)
 
@@ -264,12 +259,12 @@ class SSA_Backbone(nn.Module):
         return feat
 
 # =========================
-# 9) build_backbone（Route-A）
+# 9) build_model：返回 backbone（Route-A）
 # =========================
-def build_backbone(
+def build_model(
     in_dim=768,
     d_model=256,
-    n_layers=12,     # ✅ 默认 12
+    n_layers=12,
     nhead=8,
     dropout=0.3,
     max_len=4096,
@@ -299,3 +294,13 @@ def build_backbone(
     print(f"✅ Structure: PE → Conv(once) → [3×BiMamba → Attn → 3×BiMamba → FFN] × {n_layers}")
     print(f"   Parameters: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
+
+# ============================================================
+# ✅ 兼容 mymodels/__init__.py
+# 你的 __init__.py 写了：from .model import SSA_Model, build_model
+# 所以必须提供 SSA_Model 这个名字
+# ============================================================
+SSA_Model = SSA_Model_HeARTokens
+
+# （可选）同时兼容以前叫 build_backbone 的脚本
+build_backbone = build_model
