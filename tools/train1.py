@@ -43,6 +43,8 @@ class TokenNPYDataset(Dataset):
         self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels])
         self.class_counts = np.bincount(self.binary_labels, minlength=2)
 
+    def __len__(self):
+        return len(self.df)
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         x = np.load(row["tokens_path"])
