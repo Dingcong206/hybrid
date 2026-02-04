@@ -276,7 +276,7 @@ class SSA_Backbone(nn.Module):
 def build_model(
     in_dim=768,
     d_model=256,
-    n_layers=12,
+    n_layers=8,
     nhead=4,
     dropout=0.3,
     max_len=4096,
