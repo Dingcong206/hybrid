@@ -22,12 +22,11 @@ from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# 确保导入的是我们最新改写的 build_model
 from mymodels.model import build_model
 
 
 # ============================================================
-# 1) Dataset (保持不变，支持 0/1/2/3 四分类)
+# 1) Dataset
 # ============================================================
 class TokenNPYDataset(Dataset):
     def __init__(self, csv_path: str):
@@ -40,7 +39,7 @@ class TokenNPYDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        x = np.load(row["tokens_path"])  # (T, D)
+        x = np.load(row["tokens_path"])
         return torch.from_numpy(x).float(), torch.tensor(int(row["label"]), dtype=torch.long)
 
 
@@ -60,7 +59,7 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 2) Evaluate：适配双输出模型
+# 2) Evaluate
 # ============================================================
 @torch.no_grad()
 def evaluate_icbhi(model, loader, device) -> Dict[str, float]:
@@ -69,13 +68,11 @@ def evaluate_icbhi(model, loader, device) -> Dict[str, float]:
 
     for x, mask, y in loader:
         x, mask = x.to(device), mask.to(device)
-        # 解包：忽略 token_logits，只用 file_logit
+        # 解包：忽略 token_logits
         logits, _ = model(x, mask=mask)
 
-        # 如果你的模型最后一层没接分类器（到4），可能需要在 model.py 调，
-        # 但按目前的 Heavy 模型，logits 已经是 (B, 1) 或者 (B, 4)
-        # ⚠️ 注意：如果你的模型 classifier 输出是 1 (二分类)，请修改 model.py 的 classifier 为输出 4
-        pred4 = torch.argmax(logits, dim=1) if logits.shape[1] > 1 else (torch.sigmoid(logits) > 0.5).long()
+        # 确保在评估时也是 float32 比较稳
+        pred4 = torch.argmax(logits.float(), dim=1) if logits.shape[1] > 1 else (torch.sigmoid(logits) > 0.5).long()
 
         all_pred4.append(pred4.cpu())
         all_true4.append(y.cpu())
@@ -83,7 +80,6 @@ def evaluate_icbhi(model, loader, device) -> Dict[str, float]:
     y_pred4 = torch.cat(all_pred4).numpy()
     y_true4 = torch.cat(all_true4).numpy()
 
-    # ICBHI 标准 4->2 逻辑
     y_pred2 = (y_pred4 != 0).astype(np.int64)
     y_true2 = (y_true4 != 0).astype(np.int64)
 
@@ -97,12 +93,12 @@ def evaluate_icbhi(model, loader, device) -> Dict[str, float]:
         "SE": float(se), "SP": float(sp),
         "ACC": float(accuracy_score(y_true2, y_pred2)),
         "F1": float(f1_score(y_true2, y_pred2, zero_division=0)),
-        "TP": tp, "TN": tn, "FP": fp, "FN": fn
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
     }
 
 
 # ============================================================
-# 3) Train：适配 AMP 和双输出
+# 3) Train：重点修正了 Loss 计算的类型冲突
 # ============================================================
 def train_one_epoch(model, loader, device, optim, scheduler, loss_fn, scaler, amp):
     model.train()
@@ -111,17 +107,21 @@ def train_one_epoch(model, loader, device, optim, scheduler, loss_fn, scaler, am
     for x, mask, y in loader:
         x, mask, y = x.to(device), mask.to(device), y.to(device)
 
+        # 规范化：使用最新的 torch.amp 接口
         with torch.amp.autocast('cuda', enabled=amp):
             logits, _ = model(x, mask=mask)
 
-            # 强制将标签 y 转换为 Long 类型（类别索引）
-            # 同时确保 logits 是 float 类型（由 amp 自动处理，但显式调用更稳）
-            loss = loss_fn(logits, y.long())
+            # 🔥 终极修正：显式将 logits 转为 float32
+            # 这样 loss_fn 内部就不会因为半精度权重和长整型标签产生类型推导冲突
+            loss = loss_fn(logits.float(), y.long())
 
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
+
+        # 梯度剪裁前 unscale
         scaler.unscale_(optim)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
         scaler.step(optim)
         scaler.update()
         scheduler.step()
@@ -138,19 +138,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_heavy_12layer")
-    parser.add_argument("--batch_size", type=int, default=4)  # 24GB 显存建议从 4 开始
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--in_dim", type=int, default=768)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--n_layers", type=int, default=12)
-    parser.add_argument("--amp", action="store_true", default=True)  # 默认开启加速
+    parser.add_argument("--amp", action="store_true", default=True)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 加载数据
+    # Data
     train_csv = Path(args.root) / "train_index.csv"
     test_csv = Path(args.root) / "test_index.csv"
     ds_train = TokenNPYDataset(str(train_csv))
@@ -159,25 +159,27 @@ def main():
                           pin_memory=True)
     dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False, collate_fn=collate_pad, num_workers=4)
 
-    # 初始化模型 (注意：在 model.py 中确保 classifier 的输出维度是 4)
-    # ⚠️ 修改 model.py 中的 self.classifier = nn.Linear(d_model, 4)
+    # Model
     model = build_model(in_dim=args.in_dim, d_model=args.d_model, n_layers=args.n_layers).to(device)
 
-    # 损失函数：处理类别不平衡
+    # Loss：显式指定权重为 float32 且移动到 device
     counts = torch.tensor(ds_train.class_counts, dtype=torch.float32)
     weight = 1.0 / (counts + 1e-6)
     weight = (weight / weight.sum()) * 4.0
-    loss_fn = nn.CrossEntropyLoss(weight=weight.to(device))
+    loss_fn = nn.CrossEntropyLoss(weight=weight.to(device).float())
 
-    # 优化器
+    # Optim
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(dl_train))
+
+    # 规范化：使用新的 GradScaler 接口
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     best_icbhi = 0.0
     print(f"🚀 开始训练 Heavy SSA 12层模型 | 显存目标: 24GB | BatchSize: {args.batch_size}")
 
     for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
         loss = train_one_epoch(model, dl_train, device, optim, scheduler, loss_fn, scaler, args.amp)
         metrics = evaluate_icbhi(model, dl_test, device)
 
@@ -187,8 +189,9 @@ def main():
             best_icbhi = icbhi
             torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pt"))
 
-        print(
-            f"{status} Epoch {epoch:02d} | Loss: {loss:.4f} | ICBHI: {icbhi:.4f} | SE: {metrics['SE']:.4f} | SP: {metrics['SP']:.4f} | F1: {metrics['F1']:.4f}")
+        duration = time.time() - t0
+        print(f"{status} Epoch {epoch:02d} | Loss: {loss:.4f} | ICBHI: {icbhi:.4f} | "
+              f"SE: {metrics['SE']:.4f} | SP: {metrics['SP']:.4f} | F1: {metrics['F1']:.4f} | {duration:.1f}s")
 
     print(f"✅ 训练完成。最高 ICBHI: {best_icbhi:.4f}")
 
