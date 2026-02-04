@@ -123,6 +123,7 @@ def evaluate_icbhi_binary(backbone, classifier, loader, device) -> Dict[str, flo
         "SE": float(se),
         "SP": float(sp),
         "ACC": float(acc),
+        "F1": float(f1),
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
     }
 
