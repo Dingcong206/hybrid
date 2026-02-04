@@ -160,11 +160,11 @@ def main():
 
     # ===== model args =====
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=768)
-    parser.add_argument("--n_layers", type=int, default=12)   # ✅ 你现在要 12 层
-    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--n_layers", type=int, default=8)   # ✅ 你现在要 12 层
+    parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--max_len", type=int, default=4096)
+    parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument("--num_classes", type=int, default=2)
 
     # amp
