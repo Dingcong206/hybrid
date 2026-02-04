@@ -16,12 +16,14 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
+from pathlib import Path
+import sys
 
-# ============================================================
-# 0) 确保能导入 mymodels
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[0]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]   # ✅ tools 的上一级：hybrid
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+
 
 from mymodels.model import build_backbone
 
