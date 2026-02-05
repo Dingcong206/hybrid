@@ -108,7 +108,16 @@ class ICBHI_Pooling(nn.Module):
     def forward(self, x, mask=None):
         attn_scores = self.attn_net(x)  # (B,T,1)
         if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+           # attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+            if mask is not None:
+                mask = mask.to(torch.bool)  # (B, T)
+
+                # 兼容 attn_scores 为 (B,T) 或 (B,T,1)/(B,T,C)
+                if attn_scores.dim() == 2:
+                    attn_scores = attn_scores.masked_fill(mask, -1e9)
+                else:
+                    attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+
         attn_w = torch.softmax(attn_scores, dim=1)
         feat_weighted = torch.sum(attn_w * x, dim=1)  # (B,D)
 
