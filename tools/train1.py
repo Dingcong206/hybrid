@@ -216,7 +216,7 @@ def main():
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--d_model", type=int, default=384)
     parser.add_argument("--n_layers", type=int, default=12)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
