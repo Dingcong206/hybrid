@@ -30,7 +30,7 @@ from mymodels import build_model
 # ============================================================
 # 1) SpecAugment（对 tokens 做维度遮挡）
 # ============================================================
-def apply_spec_augment(x, max_mask_t=20, max_mask_f=10, num_masks=2):
+def apply_spec_augment(x, max_mask_t=120, max_mask_f=32, num_masks=2):
     """
     x: torch.Tensor (T, D)
     """
@@ -198,8 +198,10 @@ def main():
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--accum_steps", type=int, default=4,
+                        help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
+
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -289,8 +291,10 @@ def main():
     else:
         loss_fn = nn.CrossEntropyLoss()
 
+    accum_steps = args.accum_steps
+
     params = list(backbone.parameters()) + list(classifier.parameters())
-    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
     total_steps = args.epochs * max(1, len(dl_train))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
@@ -307,27 +311,32 @@ def main():
 
         t0 = time.time()
         running = 0.0
+        step = 0
 
         for x, mask, y in dl_train:
             x = x.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=args.amp):
-                feat = backbone(x, mask=mask)
-                logits = classifier(feat)
-                loss = loss_fn(logits, y)
+        with torch.amp.autocast("cuda", enabled=args.amp):
+            feat = backbone(x, mask=mask)
+            logits = classifier(feat)
+            loss = loss_fn(logits, y) / accum_steps  # ⭐ 关键：归一化 loss
 
-            optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+        scaler.scale(loss).backward()
+
+
+        running += float(loss.item() * accum_steps)  # 记录真实 loss
+
+        # 只有累积到 accum_steps 才更新参数
+        if (step + 1) % accum_steps == 0:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(params, 5.0)
             scaler.step(optim)
             scaler.update()
             scheduler.step()
-
-            running += float(loss.item())
-
+            optim.zero_grad(set_to_none=True)
+        step += 1
         train_loss = running / max(1, len(dl_train))
 
         # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
