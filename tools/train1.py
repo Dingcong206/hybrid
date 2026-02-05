@@ -313,6 +313,8 @@ def main():
 
         t0 = time.time()
         running = 0.0
+
+        optim.zero_grad(set_to_none=True)  # ✅ 每个 epoch 开始清梯度
         step = 0
 
         for x, mask, y in dl_train:
@@ -320,25 +322,34 @@ def main():
             mask = mask.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", enabled=args.amp):
-            feat = backbone(x, mask=mask)
-            logits = classifier(feat)
-            loss = loss_fn(logits, y) / accum_steps  # ⭐ 关键：归一化 loss
+            with torch.amp.autocast("cuda", enabled=args.amp):
+                feat = backbone(x, mask=mask)
+                logits = classifier(feat)
+                loss = loss_fn(logits, y) / accum_steps  # ✅ 归一化
 
-        scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
+            running += float(loss.item() * accum_steps)
 
+            # ✅ 累积到一定步数才更新
+            if (step + 1) % accum_steps == 0:
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(params, 5.0)
+                scaler.step(optim)
+                scaler.update()
+                scheduler.step()
+                optim.zero_grad(set_to_none=True)
 
-        running += float(loss.item() * accum_steps)  # 记录真实 loss
+            step += 1
 
-        # 只有累积到 accum_steps 才更新参数
-        if (step + 1) % accum_steps == 0:
+        # ✅ 处理“最后不足 accum_steps 的残余梯度”
+        if step % accum_steps != 0:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(params, 5.0)
             scaler.step(optim)
             scaler.update()
             scheduler.step()
             optim.zero_grad(set_to_none=True)
-        step += 1
+
         train_loss = running / max(1, len(dl_train))
 
         # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
