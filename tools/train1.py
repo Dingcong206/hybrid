@@ -228,7 +228,7 @@ def main():
     parser.add_argument("--num_classes", type=int, default=2)
 
     # amp
-    parser.add_argument("--amp", action="store_true", help="use mixed precision")
+    parser.add_argument("--amp", action="store_true", default=Ture, help="use mixed precision")
 
     args = parser.parse_args()
     set_seed(args.seed)
