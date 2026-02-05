@@ -198,6 +198,8 @@ def main():
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="mini-batch size")
     parser.add_argument("--accum_steps", type=int, default=4,
                         help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
 
