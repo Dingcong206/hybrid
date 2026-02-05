@@ -203,7 +203,7 @@ def main():
     parser.add_argument("--accum_steps", type=int, default=8,
                         help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
 
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -220,7 +220,7 @@ def main():
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
