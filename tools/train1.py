@@ -8,7 +8,7 @@ import random
 import argparse
 from pathlib import Path
 from typing import Dict
-
+import math
 import numpy as np
 import pandas as pd
 
@@ -306,6 +306,11 @@ def main():
     bad_epochs = 0
 
     print("\n🚀 Start training (official Train(60%) update params, official Test(40%) eval + pick best, ARGMAX)\n")
+    steps_per_epoch = math.ceil(len(dl_train) / args.accum_steps)
+    total_steps = args.epochs * steps_per_epoch
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     for epoch in range(1, args.epochs + 1):
         backbone.train()
         classifier.train()
