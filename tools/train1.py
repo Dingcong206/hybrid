@@ -306,7 +306,6 @@ def main():
     bad_epochs = 0
 
     print("\n🚀 Start training (official Train(60%) update params, official Test(40%) eval + pick best, ARGMAX)\n")
-
     for epoch in range(1, args.epochs + 1):
         backbone.train()
         classifier.train()
@@ -314,49 +313,42 @@ def main():
         t0 = time.time()
         running = 0.0
 
-        optim.zero_grad(set_to_none=True)  # ✅ 每个 epoch 开始清梯度
-        step = 0
+        # 在每个 epoch 开始前确保梯度清零
+        optim.zero_grad(set_to_none=True)
 
-        for x, mask, y in dl_train:
+        # 使用 enumerate 替代手动管理 step，更安全且逻辑清晰
+        for i, (x, mask, y) in enumerate(dl_train):
             x = x.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # 混合精度训练
             with torch.amp.autocast("cuda", enabled=args.amp):
                 feat = backbone(x, mask=mask)
                 logits = classifier(feat)
-                loss = loss_fn(logits, y) / accum_steps  # ✅ 归一化
+                loss = loss_fn(logits, y) / accum_steps  # 梯度累积时需除以步数进行归一化
 
+            # 反向传播，累积梯度
             scaler.scale(loss).backward()
             running += float(loss.item() * accum_steps)
 
-            # ✅ 累积到一定步数才更新
-            # ... 前面代码不变 ...
-            for i, (x, mask, y) in enumerate(dl_train):  # 使用 enumerate 方便判断
-                x = x.to(device, non_blocking=True)
-                mask = mask.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
+            # 核心修正：判断是否达到累积步数，或者是当前 Epoch 的最后一个 Batch
+            if (i + 1) % accum_steps == 0 or (i + 1) == len(dl_train):
+                # 1. 在 step 之前先 unscale 梯度，以便进行梯度裁剪
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(params, 5.0)
 
-                with torch.amp.autocast("cuda", enabled=args.amp):
-                    feat = backbone(x, mask=mask)
-                    logits = classifier(feat)
-                    loss = loss_fn(logits, y) / accum_steps
+                # 2. 先更新模型参数 (optimizer.step)
+                scaler.step(optim)
+                scaler.update()
 
-                scaler.scale(loss).backward()
-                running += float(loss.item() * accum_steps)
+                # 3. 再更新学习率 (scheduler.step) -> 严格遵守此顺序，警告消除
+                scheduler.step()
 
-                # 每 accum_steps 次，或者到了这个 epoch 的最后一个 batch
-                if (i + 1) % accum_steps == 0 or (i + 1) == len(dl_train):
-                    scaler.unscale_(optim)
-                    torch.nn.utils.clip_grad_norm_(params, 5.0)
+                # 4. 最后清空梯度
+                optim.zero_grad(set_to_none=True)
 
-                    scaler.step(optim)  # 1. 先更新参数
-                    scaler.update()
-
-                    scheduler.step()  # 2. 再更新学习率 (消除警告的关键)
-
-                    optim.zero_grad(set_to_none=True)  # 3. 最后清空
-
+        # 计算平均损失
         train_loss = running / max(1, len(dl_train))
 
         # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
