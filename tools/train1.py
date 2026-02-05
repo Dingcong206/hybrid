@@ -198,12 +198,12 @@ def main():
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=2,
                         help="mini-batch size")
-    parser.add_argument("--accum_steps", type=int, default=4,
+    parser.add_argument("--accum_steps", type=int, default=8,
                         help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
 
-    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -213,22 +213,22 @@ def main():
     parser.add_argument("--patience", type=int, default=10)
 
     # weighted loss 默认开
-    parser.add_argument("--use_weighted_loss", action="store_true", default=True,
+    parser.add_argument("--use_weighted_loss", action="store_true",
                         help="use class-balanced CE (default ON)")
-    parser.add_argument("--no_weighted_loss", action="store_false", dest="use_weighted_loss",
+    parser.add_argument("--no_weighted_loss", action="store_false", default=True,dest="use_weighted_loss",
                         help="disable class-balanced CE")
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--max_len", type=int, default=1024)
     parser.add_argument("--num_classes", type=int, default=2)
 
     # amp
-    parser.add_argument("--amp", action="store_true", help="use mixed precision")
+    parser.add_argument("--amp", action="store_true", default=True,help="use mixed precision")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -300,6 +300,7 @@ def main():
     total_steps = args.epochs * max(1, len(dl_train))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
 
     best_test_icbhi = -1.0
     best_epoch = -1
