@@ -86,7 +86,7 @@ class TokenNPYDataset(Dataset):
 
         # 使用之前提到的较大掩码参数来抑制震荡
         if self.is_train:
-            x = apply_spec_augment(x, max_mask_t=80, max_mask_f=32, num_masks=2)
+            x = apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2)
 
         return x, torch.tensor(y, dtype=torch.long)
 
@@ -214,10 +214,8 @@ def main():
     parser.add_argument("--patience", type=int, default=10)
 
     # weighted loss 默认开
-    parser.add_argument("--use_weighted_loss", action="store_true", default=True,
+    parser.add_argument("--use_weighted_loss", action="store_true",
                         help="use class-balanced CE (default ON)")
-    parser.add_argument("--no_weighted_loss", action="store_false", dest="use_weighted_loss",
-                        help="disable class-balanced CE")
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
@@ -292,7 +290,7 @@ def main():
 
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] weighted CE weights:", w)
-        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
+        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0)
     else:
         loss_fn = nn.CrossEntropyLoss()
 
