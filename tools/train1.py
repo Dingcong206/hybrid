@@ -31,7 +31,7 @@ from mymodels import build_model
 # ============================================================
 # 1) SpecAugment（对 tokens 做维度遮挡）——先弱增强求稳定
 # ============================================================
-def apply_spec_augment(x, max_mask_t=10, max_mask_f=3, num_masks=1):
+def apply_spec_augment(x, max_mask_t=20, max_mask_f=48, num_masks=1):
     T, D = x.shape
     x_aug = x.clone()
     for _ in range(num_masks):
