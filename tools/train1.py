@@ -83,8 +83,8 @@ class TokenNPYDataset(Dataset):
         x = torch.from_numpy(x).float()
         y = int(self.labels[idx])
 
-        if self.is_train:
-            x = apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2)
+        #if self.is_train:
+            #x = apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2)
 
         return x, torch.tensor(y, dtype=torch.long)
 
