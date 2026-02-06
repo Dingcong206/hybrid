@@ -8,7 +8,7 @@ import random
 import argparse
 from pathlib import Path
 from typing import Dict
-
+import math
 import numpy as np
 import pandas as pd
 
@@ -125,41 +125,47 @@ def collate_pad(batch):
 @torch.no_grad()
 def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
     """
-    完全对齐发表版 get_score() 口径：
-    - SP/SE/Score 都是百分制（0~100）
-    - Score = (SP + SE) / 2
-    - pred 用 argmax(logits)
+    对齐 PatchMix 的 two_cls_eval 口径：
+      - 先做 4-class argmax 得 pred4 ∈ {0,1,2,3}
+      - 二分类判断：normal=0，abnormal=pred4>0
+      - SP = 正常类准确率；SE = 异常合并后的召回；Score=(SP+SE)/2
+      - 不用阈值、不用 softmax
     """
     backbone.eval()
     classifier.eval()
 
-    all_pred, all_true = [], []
+    all_pred4, all_true4 = [], []
 
-    for x, mask, y in loader:
+    for x, mask, y4 in loader:
         x = x.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+        y4 = y4.to(device, non_blocking=True)
 
         feat = backbone(x, mask=mask)
-        logits = classifier(feat)            # (B,2)
-        pred = torch.argmax(logits, dim=1)   # ✅ argmax
+        logits4 = classifier(feat)              # (B,4)
+        pred4 = torch.argmax(logits4, dim=1)    # (B,)
 
-        all_pred.append(pred.detach().cpu())
-        all_true.append(y.detach().cpu())
+        all_pred4.append(pred4.detach().cpu())
+        all_true4.append(y4.detach().cpu())
 
-    y_pred = torch.cat(all_pred).numpy()
-    y_true = torch.cat(all_true).numpy()
+    y_pred4 = torch.cat(all_pred4).numpy()
+    y_true4 = torch.cat(all_true4).numpy()
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    # ✅ PatchMix two_cls_eval：0=normal，其余=abnormal（pred>0）
+    y_pred_bin = (y_pred4 > 0).astype(np.int64)
+    y_true_bin = (y_true4 > 0).astype(np.int64)
+
+    cm = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    # ✅ 对齐 get_score：百分制
-    sp = tn / (tn + fp + 1e-10) * 100.0   # normal accuracy
-    se = tp / (tp + fn + 1e-10) * 100.0   # abnormal accuracy
-    sc = (sp + se) / 2.0                 # score
+    sp = tn / (tn + fp + 1e-10) * 100.0
+    se = tp / (tp + fn + 1e-10) * 100.0
+    sc = (sp + se) / 2.0
 
-    acc = accuracy_score(y_true, y_pred) * 100.0  # 可选：也改成百分制方便看
-    f1 = f1_score(y_true, y_pred)                 # F1 通常保留 0~1 也行
+    acc = accuracy_score(y_true_bin, y_pred_bin) * 100.0
+    f1 = f1_score(y_true_bin, y_pred_bin, zero_division=0)
+
+    pred_abn_rate = float((y_pred_bin == 1).mean() * 100.0)
 
     return {
         "SP": float(sp),
@@ -167,8 +173,10 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
         "Score": float(sc),
         "ACC": float(acc),
         "F1": float(f1),
-        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+        "PredAbnRate": float(pred_abn_rate),
     }
+
 
 
 # ============================================================
@@ -196,7 +204,7 @@ def main():
     parser.add_argument("--accum_steps", type=int, default=4,
                         help="gradient accumulation steps (effective batch = batch_size * accum_steps)")
 
-    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -249,7 +257,7 @@ def main():
     dl_train = DataLoader(
         ds_train, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
-        collate_fn=collate_pad, drop_last=True
+        collate_fn=collate_pad, drop_last=False
     )
 
     dl_test = DataLoader(
@@ -259,7 +267,7 @@ def main():
     )
 
     print(f"[INFO] train cycles: {len(ds_train)} | test cycles: {len(ds_test)}")
-    print(f"[INFO] train class_counts (0/1): {ds_train.class_counts.tolist()}")
+    print(f"[INFO] train class_counts (0/1/2/3): {ds_train.class_counts.tolist()}")
 
     backbone = build_model(
         in_dim=args.in_dim,
@@ -278,8 +286,10 @@ def main():
     # loss
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)
-        w = 1.0 / (counts / counts.sum() + 1e-12)
-        w = w / w.sum()
+        freq = counts / counts.sum()
+        w = 1.0 / (np.sqrt(freq) + 1e-12)
+        w = w / w.sum() * 4.0
+
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] weighted CE weights:", w)
         loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
@@ -290,9 +300,12 @@ def main():
 
     params = list(backbone.parameters()) + list(classifier.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
-    total_steps = args.epochs * max(1, len(dl_train))
+    updates_per_epoch = math.ceil(len(dl_train) / accum_steps)
+    total_steps = args.epochs * updates_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+   # scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     best_test_icbhi = -1.0
     best_epoch = -1
@@ -306,30 +319,40 @@ def main():
 
         t0 = time.time()
         running = 0.0
-        step = 0
+        optim.zero_grad(set_to_none=True)  # ✅ 每个 epoch 开始清空一次梯度
 
-        for x, mask, y in dl_train:
+        for i, (x, mask, y) in enumerate(dl_train):
             x = x.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=args.amp):
+            with torch.amp.autocast(device_type=device.type, enabled=args.amp):
                 feat = backbone(x, mask=mask)
                 logits = classifier(feat)
-                loss = loss_fn(logits, y) / accum_steps  # ✅ 归一化
+                loss = loss_fn(logits, y) / accum_steps  # ✅ 关键：除以 accum_steps
 
+            # ✅ 1) 累积梯度
             scaler.scale(loss).backward()
             running += float(loss.item() * accum_steps)
 
-        # 只有累积到 accum_steps 才更新参数
-        if (step + 1) % accum_steps == 0:
+            # ✅ 2) 每 accum_steps 次，更新一次参数
+            if (i + 1) % accum_steps == 0:
+                scaler.unscale_(optim)  # 先反缩放，才能裁剪
+                torch.nn.utils.clip_grad_norm_(params, 5.0)  # 裁剪梯度
+                scaler.step(optim)  # optimizer.step()
+                scaler.update()
+                scheduler.step()  # 如果你按 step 更新学习率，就放这里
+                optim.zero_grad(set_to_none=True)  # 清梯度，开始下一轮累积
+
+        # ✅ 3) 处理“尾巴”：如果最后不足 accum_steps，也要更新一次
+        if len(dl_train) % accum_steps != 0:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(params, 5.0)
             scaler.step(optim)
             scaler.update()
             scheduler.step()
             optim.zero_grad(set_to_none=True)
-        step += 1
+
         train_loss = running / max(1, len(dl_train))
 
         # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
@@ -364,6 +387,8 @@ def main():
             f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
             f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
             f"{dt:.1f}s"
+            f"PredAbn {test_m['PredAbnRate']:.2f}% | "
+
         )
 
         if bad_epochs >= args.patience:
