@@ -181,7 +181,7 @@ class SSA_Model_HeARTokens(nn.Module):
             nhead=4,  #  下面我会说 nhead 怎么配更好
             dropout=0.3,
             max_len=1024,
-            num_classes=2,
+            num_classes=4,
             conv_k=7,
             d_state=16,
             d_conv=4,
@@ -291,6 +291,8 @@ def build_model(
     d_conv=4,
     expand=2,
     ffn_mult=4,
+    num_classes=4,
+
 ):
     ssa = SSA_Model_HeARTokens(
         in_dim=in_dim,
@@ -299,7 +301,8 @@ def build_model(
         nhead=nhead,
         dropout=dropout,
         max_len=max_len,
-        num_classes=2,
+        #num_classes=2,
+        num_classes=num_classes,
         conv_k=conv_k,
         d_state=d_state,
         d_conv=d_conv,
