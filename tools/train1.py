@@ -30,7 +30,7 @@ from mymodels import build_model
 # ============================================================
 # 1) SpecAugment（对 tokens 做维度遮挡）
 # ============================================================
-def apply_spec_augment(x, max_mask_t=120, max_mask_f=32, num_masks=2):
+def apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2):
     """
     x: torch.Tensor (T, D)
     """
@@ -54,12 +54,12 @@ def apply_spec_augment(x, max_mask_t=120, max_mask_f=32, num_masks=2):
 
 
 # ============================================================
-# 2) Dataset：读 tokens.npy + 二分类映射
+# 2) Dataset：读 tokens.npy（四分类 label 0/1/2/3）
 # ============================================================
 class TokenNPYDataset(Dataset):
     def __init__(self, csv_path: str, is_train: bool = False):
         self.csv_path = csv_path
-        self.is_train = is_train  # ✅ 必须先赋值，才能在后面被 self 调用
+        self.is_train = is_train
 
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"[Dataset] CSV 不存在: {csv_path}")
@@ -71,7 +71,6 @@ class TokenNPYDataset(Dataset):
         self.labels = self.df["label"].astype(int).values
         self.class_counts = np.bincount(self.labels, minlength=4)
 
-        # ✅ 现在可以安全地打印 self.is_train 了
         print(f"[Dataset] Loaded {len(self.df)} samples from {csv_path} | "
               f"counts(0/1/2/3)={self.class_counts.tolist()} | train={self.is_train}")
 
@@ -84,11 +83,11 @@ class TokenNPYDataset(Dataset):
         x = torch.from_numpy(x).float()
         y = int(self.labels[idx])
 
-        # 使用之前提到的较大掩码参数来抑制震荡
         if self.is_train:
             x = apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2)
 
         return x, torch.tensor(y, dtype=torch.long)
+
 
 # ============================================================
 # 3) collate：pad + mask
@@ -113,26 +112,48 @@ def collate_pad(batch):
     for i, x in enumerate(xs):
         T = x.shape[0]
         x_pad[i, :T] = x
-        mask[i, :T] = False
+        mask[i, :T] = False  # False = 非 PAD
 
     y = torch.stack(ys).view(-1)
     return x_pad, mask, y
 
 
 # ============================================================
-# 4) 评估：argmax(logits)（与发表版一致：无阈值）
+# 4) PatchMix 风格：get_score（two_cls_eval）
+#    - SP: normal(0) 命中率
+#    - SE: abnormal(1/2/3) 宏平均命中率（注意：two_cls_eval 下 abnormal 命中条件是 pred>0）
+# ============================================================
+def get_score_patchmix_style(hits, counts):
+    eps = 1e-10
+
+    # specificity: class 0
+    sp = (hits[0] / (counts[0] + eps)) * 100.0
+
+    # sensitivity: macro avg of classes 1..K-1
+    se_list = []
+    for c in range(1, len(counts)):
+        se_list.append(hits[c] / (counts[c] + eps))
+    se = (sum(se_list) / max(1, len(se_list))) * 100.0
+
+    score = (sp + se) / 2.0
+    return float(sp), float(se), float(score)
+
+
+# ============================================================
+# 5) 评估：完全对齐 PatchMix validate(two_cls_eval=True)
+#    - pred4=argmax
+#    - hits/counts 逐类统计（异常类只要 pred>0 就算命中，不要求 pred==label）
+#    - SP/SE/Score 用 get_score_patchmix_style 算（异常为宏平均）
+#    另外：为了方便你调参，也输出 confusion matrix 的 TP/TN/FP/FN、ACC、F1、PredAbnRate
 # ============================================================
 @torch.no_grad()
-def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
-    """
-    对齐 PatchMix 的 two_cls_eval 口径：
-      - 先做 4-class argmax 得 pred4 ∈ {0,1,2,3}
-      - 二分类判断：normal=0，abnormal=pred4>0
-      - SP = 正常类准确率；SE = 异常合并后的召回；Score=(SP+SE)/2
-      - 不用阈值、不用 softmax
-    """
+def evaluate_patchmix_two_cls(backbone, classifier, loader, device) -> Dict[str, float]:
     backbone.eval()
     classifier.eval()
+
+    n_cls = 4
+    hits = [0.0] * n_cls
+    counts = [0.0] * n_cls
 
     all_pred4, all_true4 = [], []
 
@@ -148,39 +169,50 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
         all_pred4.append(pred4.detach().cpu())
         all_true4.append(y4.detach().cpu())
 
+        # PatchMix two_cls_eval 统计
+        for i in range(y4.size(0)):
+            yt = int(y4[i].item())
+            yp = int(pred4[i].item())
+            counts[yt] += 1.0
+
+            if yt == 0:
+                if yp == 0:
+                    hits[0] += 1.0
+            else:
+                # abnormal：只要预测为 abnormal（>0）就算命中
+                if yp > 0:
+                    hits[yt] += 1.0
+
+    sp, se, sc = get_score_patchmix_style(hits, counts)
+
+    # 下面这些只是为了打印调参更直观（不影响 PatchMix 的 Score 口径）
     y_pred4 = torch.cat(all_pred4).numpy()
     y_true4 = torch.cat(all_true4).numpy()
-
-    # ✅ PatchMix two_cls_eval：0=normal，其余=abnormal（pred>0）
     y_pred_bin = (y_pred4 > 0).astype(np.int64)
     y_true_bin = (y_true4 > 0).astype(np.int64)
 
     cm = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    sp = tn / (tn + fp + 1e-10) * 100.0
-    se = tp / (tp + fn + 1e-10) * 100.0
-    sc = (sp + se) / 2.0
-
     acc = accuracy_score(y_true_bin, y_pred_bin) * 100.0
     f1 = f1_score(y_true_bin, y_pred_bin, zero_division=0)
-
     pred_abn_rate = float((y_pred_bin == 1).mean() * 100.0)
 
     return {
-        "SP": float(sp),
-        "SE": float(se),
-        "Score": float(sc),
+        "SP": sp,
+        "SE": se,
+        "Score": sc,
         "ACC": float(acc),
         "F1": float(f1),
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
         "PredAbnRate": float(pred_abn_rate),
+        "hits": hits,
+        "counts": counts,
     }
 
 
-
 # ============================================================
-# 5) Seed
+# 6) Seed
 # ============================================================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -190,7 +222,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 6) Train (official Train(60%) train params, official Test(40%) eval + pick best)
+# 7) Train (official Train(60%) update params, official Test(40%) eval + pick best)
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -210,12 +242,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_argmax")
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_patchmix_eval")
     parser.add_argument("--patience", type=int, default=10)
 
-    # weighted loss 默认开
+    # weighted loss：默认关（建议你先稳定跑通）
     parser.add_argument("--use_weighted_loss", action="store_true",
-                        help="use class-balanced CE (default ON)")
+                        help="use class-balanced CE (default OFF)")
+    # 想关就不传；想开就加 --use_weighted_loss
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
@@ -285,12 +318,14 @@ def main():
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)
         freq = counts / counts.sum()
-        w = 1.0 / (np.sqrt(freq) + 1e-12)
+
+        # 这里给你一个更温和的权重（比 1/sqrt(freq) 更稳）
+        w = 1.0 / (np.power(freq, 0.25) + 1e-12)
         w = w / w.sum() * 4.0
 
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] weighted CE weights:", w)
-        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0)
+        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.0)
     else:
         loss_fn = nn.CrossEntropyLoss()
 
@@ -298,18 +333,18 @@ def main():
 
     params = list(backbone.parameters()) + list(classifier.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
+
     updates_per_epoch = math.ceil(len(dl_train) / accum_steps)
     total_steps = args.epochs * updates_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
 
-   # scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    best_test_icbhi = -1.0
+    best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (official Train(60%) update params, official Test(40%) eval + pick best, ARGMAX)\n")
+    print("\n🚀 Start training (Train(60%) update params, Test(40%) eval, PatchMix two_cls_eval scoring)\n")
 
     for epoch in range(1, args.epochs + 1):
         backbone.train()
@@ -317,7 +352,7 @@ def main():
 
         t0 = time.time()
         running = 0.0
-        optim.zero_grad(set_to_none=True)  # ✅ 每个 epoch 开始清空一次梯度
+        optim.zero_grad(set_to_none=True)
 
         for i, (x, mask, y) in enumerate(dl_train):
             x = x.to(device, non_blocking=True)
@@ -327,22 +362,20 @@ def main():
             with torch.amp.autocast(device_type=device.type, enabled=args.amp):
                 feat = backbone(x, mask=mask)
                 logits = classifier(feat)
-                loss = loss_fn(logits, y) / accum_steps  # ✅ 关键：除以 accum_steps
+                loss = loss_fn(logits, y) / accum_steps
 
-            # ✅ 1) 累积梯度
             scaler.scale(loss).backward()
             running += float(loss.item() * accum_steps)
 
-            # ✅ 2) 每 accum_steps 次，更新一次参数
             if (i + 1) % accum_steps == 0:
-                scaler.unscale_(optim)  # 先反缩放，才能裁剪
-                torch.nn.utils.clip_grad_norm_(params, 5.0)  # 裁剪梯度
-                scaler.step(optim)  # optimizer.step()
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(params, 5.0)
+                scaler.step(optim)
                 scaler.update()
-                scheduler.step()  # 如果你按 step 更新学习率，就放这里
-                optim.zero_grad(set_to_none=True)  # 清梯度，开始下一轮累积
+                scheduler.step()
+                optim.zero_grad(set_to_none=True)
 
-        # ✅ 3) 处理“尾巴”：如果最后不足 accum_steps，也要更新一次
+        # tail
         if len(dl_train) % accum_steps != 0:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(params, 5.0)
@@ -353,13 +386,13 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        # ✅ 核心：在官方 TEST(40%) 上用 argmax 评估（与发表版一致）
-        test_m = evaluate_argmax(backbone, classifier, dl_test, device)
-        test_icbhi = test_m["Score"]
+        # ✅ PatchMix two_cls_eval 口径评估
+        test_m = evaluate_patchmix_two_cls(backbone, classifier, dl_test, device)
+        test_score = test_m["Score"]
 
-        improved = test_icbhi > best_test_icbhi + 1e-6
+        improved = test_score > best_score + 1e-6
         if improved:
-            best_test_icbhi = test_icbhi
+            best_score = test_score
             best_epoch = epoch
             bad_epochs = 0
             torch.save(
@@ -367,7 +400,7 @@ def main():
                     "epoch": epoch,
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
-                    "best_test_icbhi": best_test_icbhi,
+                    "best_score": best_score,
                     "args": vars(args),
                 },
                 ckpt_path
@@ -381,32 +414,32 @@ def main():
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"TEST(argmax) Score {test_m['Score']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
+            f"TEST(PatchMixEval) Score {test_m['Score']:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
             f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
             f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
-            f"{dt:.1f}s"
             f"PredAbn {test_m['PredAbnRate']:.2f}% | "
-
+            f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
             print(f"[EARLY STOP] TEST Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best TEST Score={best_test_icbhi:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best TEST Score={best_score:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
-    # ✅ 最后：加载 best ckpt，再在 TEST 上跑一次 argmax（确认最终结果）
-    print("\n🚀 Final TEST evaluation (argmax from best checkpoint)\n")
+    # Final: load best and eval again
+    print("\n🚀 Final TEST evaluation (PatchMix two_cls_eval from best checkpoint)\n")
     ckpt = torch.load(ckpt_path, map_location=device)
     backbone.load_state_dict(ckpt["backbone_state"])
     classifier.load_state_dict(ckpt["classifier_state"])
 
-    final_m = evaluate_argmax(backbone, classifier, dl_test, device)
+    final_m = evaluate_patchmix_two_cls(backbone, classifier, dl_test, device)
     print(
-        f"[TEST argmax] Score {final_m['Score']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
+        f"[TEST PatchMixEval] Score {final_m['Score']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
         f"ACC {final_m['ACC']:.4f} F1 {final_m['F1']:.4f} | "
-        f"TP {final_m['TP']} TN {final_m['TN']} FP {final_m['FP']} FN {final_m['FN']}"
+        f"TP {final_m['TP']} TN {final_m['TN']} FP {final_m['FP']} FN {final_m['FN']} | "
+        f"PredAbn {final_m['PredAbnRate']:.2f}%"
     )
 
 
