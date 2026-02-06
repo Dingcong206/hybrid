@@ -240,8 +240,8 @@ def main():
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--accum_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--accum_steps", type=int, default=8)
 
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
