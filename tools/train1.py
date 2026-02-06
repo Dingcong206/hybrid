@@ -32,12 +32,8 @@ from mymodels import build_model
 # 1) SpecAugment（对 tokens 做维度遮挡）——先弱增强求稳定
 # ============================================================
 def apply_spec_augment(x, max_mask_t=10, max_mask_f=3, num_masks=1):
-    """
-    x: torch.Tensor (T, D)
-    """
     T, D = x.shape
     x_aug = x.clone()
-
     for _ in range(num_masks):
         t_width = random.randint(0, max_mask_t)
         t_start = random.randint(0, max(0, T - t_width))
@@ -48,7 +44,6 @@ def apply_spec_augment(x, max_mask_t=10, max_mask_f=3, num_masks=1):
         f_start = random.randint(0, max(0, D - f_width))
         if f_width > 0:
             x_aug[:, f_start:f_start + f_width] = 0
-
     return x_aug
 
 
@@ -74,7 +69,6 @@ class TokenNPYDataset(Dataset):
         self.df = df.reset_index(drop=True)
 
         raw_labels = self.df["label"].astype(int).values
-        # 0=normal, 1=abnormal
         self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels], dtype=np.int64)
         self.class_counts = np.bincount(self.binary_labels, minlength=2)
 
@@ -174,7 +168,7 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
 
 
 # ============================================================
-# 5) Eval: threshold sweep（找 best Score 的阈值）
+# 5) Eval: threshold sweep（只做参考打印，不用于保存/早停）
 # ============================================================
 @torch.no_grad()
 def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None) -> Dict[str, float]:
@@ -185,7 +179,6 @@ def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None
         thr_list = np.linspace(0.05, 0.95, 19)
 
     all_prob, all_true = [], []
-
     for x, mask, y in loader:
         x = x.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -193,7 +186,6 @@ def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None
 
         feat = backbone(x, mask=mask)
         logits = classifier(feat)  # (B,2)
-
         prob_abn = torch.softmax(logits.float(), dim=1)[:, 1]
         all_prob.append(prob_abn.detach().cpu())
         all_true.append(y.detach().cpu())
@@ -246,7 +238,6 @@ def evaluate_fixed_threshold(backbone, classifier, loader, device, thr=0.5) -> D
     classifier.eval()
 
     all_pred, all_true = [], []
-
     for x, mask, y in loader:
         x = x.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -294,7 +285,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 8) Train
+# 8) Train (✅ ARGMAX 保存 + 早停)
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -310,7 +301,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_thrbest")
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_argmax_best")
     parser.add_argument("--patience", type=int, default=10)
 
     parser.add_argument("--use_weighted_loss", action="store_true", default=True)
@@ -380,9 +371,8 @@ def main():
     params = list(backbone.parameters()) + list(classifier.parameters())
 
     # loss
-    # loss
     if args.use_weighted_loss:
-        counts = ds_train.class_counts.astype(np.float32)  # [N0, N1]
+        counts = ds_train.class_counts.astype(np.float32)
         freq = counts / counts.sum()
         w = 1.0 / (np.sqrt(freq) + 1e-12)
         w = w / w.sum() * 2.0
@@ -394,7 +384,7 @@ def main():
 
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
 
-    # LR schedule: warmup + cosine (按“参数更新步数”计数)
+    # warmup + cosine, step 以“参数更新次数”为单位
     steps_per_epoch = math.ceil(len(dl_train) / args.accum_steps)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = int(0.05 * total_steps)
@@ -407,17 +397,14 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
-    # AMP scaler（别删）
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    # ✅ 建议：保存/早停用 ARGMAX Score（thr-sweep 只打印参考）
+    # ✅ ARGMAX 保存/早停
     best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (Route-A + ARGMAX + THR-SWEEP)\n")
-
-
+    print("\n🚀 Start training (SAVE/EARLYSTOP by ARGMAX; thr-sweep only for logging)\n")
 
     for epoch in range(1, args.epochs + 1):
         backbone.train()
@@ -442,7 +429,8 @@ def main():
 
             if (i + 1) % args.accum_steps == 0 or (i + 1) == len(dl_train):
                 scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(params, 5.0)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+
                 scaler.step(optim)
                 scaler.update()
                 scheduler.step()
@@ -450,16 +438,16 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        # eval both
+        # eval
         test_arg = evaluate_argmax(backbone, classifier, dl_test, device)
-        test_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)
+        test_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)  # 仅打印参考
 
         score_arg = test_arg["Score"]
-        score_best = test_best["Score"]
 
-        improved = score_best > best_score + 1e-6
+        # ✅ 关键：保存/早停用 ARGMAX
+        improved = score_arg > best_score + 1e-6
         if improved:
-            best_score = score_best
+            best_score = score_arg
             best_epoch = epoch
             bad_epochs = 0
             torch.save(
@@ -467,8 +455,8 @@ def main():
                     "epoch": epoch,
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
-                    "best_score": best_score,
-                    "best_thr": test_best["BestThr"],
+                    "best_score_argmax": float(best_score),
+                    "best_thr_log": float(test_best["BestThr"]),  # 仅记录
                     "args": vars(args),
                 },
                 ckpt_path
@@ -482,37 +470,38 @@ def main():
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"ARGMAX Score {score_arg:.4f} SE {test_arg['SE']:.2f} SP {test_arg['SP']:.2f} "
+            f"ARGMAX Score {test_arg['Score']:.4f} SE {test_arg['SE']:.2f} SP {test_arg['SP']:.2f} "
             f"PredAbn {test_arg['PredAbnRate']:.2f}% || "
-            f"BestThr {test_best['BestThr']:.2f} Score {score_best:.4f} "
+            f"(log) BestThr {test_best['BestThr']:.2f} Score {test_best['Score']:.4f} "
             f"SE {test_best['SE']:.2f} SP {test_best['SP']:.2f} PredAbn {test_best['PredAbnRate']:.2f}% | "
             f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
-            print(f"[EARLY STOP] BestThr Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
+            print(f"[EARLY STOP] ARGMAX Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best(thr-sweep) TEST Score={best_score:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best(ARGMAX) TEST Score={best_score:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
-    # final eval from best checkpoint (固定用保存的 best_thr，不再重新扫一遍)
+    # final eval from best checkpoint
     print("\n🚀 Final TEST evaluation (from best checkpoint)\n")
     ckpt = torch.load(ckpt_path, map_location=device)
     backbone.load_state_dict(ckpt["backbone_state"])
     classifier.load_state_dict(ckpt["classifier_state"])
-    best_thr = float(ckpt.get("best_thr", 0.5))
 
     final_arg = evaluate_argmax(backbone, classifier, dl_test, device)
-    final_fix = evaluate_fixed_threshold(backbone, classifier, dl_test, device, thr=best_thr)
+
+    # 如果你仍想看“最终扫阈值”的上限，只做展示（注意：这属于 test 上调参，不要当最终论文结论）
+    final_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)
 
     print(
         f"[FINAL argmax] Score {final_arg['Score']:.4f} SE {final_arg['SE']:.2f} SP {final_arg['SP']:.2f} "
         f"PredAbn {final_arg['PredAbnRate']:.2f}%"
     )
     print(
-        f"[FINAL fixed_thr] Thr {final_fix['Thr']:.2f} Score {final_fix['Score']:.4f} "
-        f"SE {final_fix['SE']:.2f} SP {final_fix['SP']:.2f} PredAbn {final_fix['PredAbnRate']:.2f}%"
+        f"[FINAL (log) bestthr] BestThr {final_best['BestThr']:.2f} Score {final_best['Score']:.4f} "
+        f"SE {final_best['SE']:.2f} SP {final_best['SP']:.2f} PredAbn {final_best['PredAbnRate']:.2f}%"
     )
 
 
