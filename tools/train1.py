@@ -380,6 +380,7 @@ def main():
     params = list(backbone.parameters()) + list(classifier.parameters())
 
     # loss
+    # loss
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)  # [N0, N1]
         freq = counts / counts.sum()
@@ -392,6 +393,8 @@ def main():
         loss_fn = nn.CrossEntropyLoss()
 
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
+
+    # LR schedule: warmup + cosine (按“参数更新步数”计数)
     steps_per_epoch = math.ceil(len(dl_train) / args.accum_steps)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = int(0.05 * total_steps)
@@ -399,20 +402,22 @@ def main():
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
-        # cosine
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
-    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    #scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    # ✅ 用 thr-sweep 的 Score 做保存/早停
+    # AMP scaler（别删）
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
+    # ✅ 建议：保存/早停用 ARGMAX Score（thr-sweep 只打印参考）
     best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
 
     print("\n🚀 Start training (Route-A + ARGMAX + THR-SWEEP)\n")
+
+
 
     for epoch in range(1, args.epochs + 1):
         backbone.train()
