@@ -72,7 +72,7 @@ class TokenNPYDataset(Dataset):
             if col not in df.columns:
                 raise KeyError(f"[Dataset] CSV 缺少列 `{col}`，当前列: {df.columns.tolist()}")
 
-        self.df = df.reset_index(drop=True)
+        self.df = df.reset_index(drop=False)
 
         raw_labels = self.df["label"].astype(int).values
         # 0=normal, 1=abnormal
@@ -285,15 +285,18 @@ def main():
     # loss
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)
-        w = 1.0 / (counts / counts.sum() + 1e-12)
-        w = w / w.sum()
+        freq = counts / counts.sum()
+        w = 1.0 / (np.sqrt(freq) + 1e-12)  # ✅ 温和：sqrt 逆频率
+        w = w / w.sum() * 2.0  # ✅ 二分类保持平均权重≈1
+
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] weighted CE weights:", w)
-        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
+        loss_fn = nn.CrossEntropyLoss(weight=weight)
     else:
         loss_fn = nn.CrossEntropyLoss()
 
     accum_steps = args.accum_steps
+    print("[INFO] class_counts:", counts, "ratio N1/N0:", counts[1] / (counts[0] + 1e-12))
 
     params = list(backbone.parameters()) + list(classifier.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
