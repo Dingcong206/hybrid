@@ -239,7 +239,7 @@ def main():
     parser.add_argument("--root", type=str,
                         default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
                         help="预处理输出目录（包含 train_index.csv / test_index.csv）")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accum_steps", type=int, default=4)
 
@@ -250,7 +250,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_icbhi_binary_score_fixed")
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=20)
 
     # ====== val split ======
     parser.add_argument("--val_ratio", type=float, default=0.1, help="split from train(60%) into val")
@@ -264,7 +264,7 @@ def main():
 
     # ====== model args ======
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.3)
