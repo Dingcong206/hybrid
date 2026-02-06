@@ -58,26 +58,37 @@ def apply_spec_augment(x, max_mask_t=120, max_mask_f=32, num_masks=2):
 # ============================================================
 class TokenNPYDataset(Dataset):
     def __init__(self, csv_path: str, is_train: bool = False):
-        # ... 前面检查代码一致 ...
-        self.df = pd.read_csv(csv_path).reset_index(drop=True)
-        # 保持原始 0,1,2,3 标签
+        self.csv_path = csv_path
+        self.is_train = is_train  # ✅ 必须先赋值，才能在后面被 self 调用
+
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"[Dataset] CSV 不存在: {csv_path}")
+
+        df = pd.read_csv(csv_path)
+        self.df = df.reset_index(drop=True)
+
+        # 确保标签是 0,1,2,3
         self.labels = self.df["label"].astype(int).values
-        # 统计各类别样本数，用于计算 Weighted Loss
         self.class_counts = np.bincount(self.labels, minlength=4)
 
-        print(f"[Dataset] Loaded {len(self.df)} samples | "
+        # ✅ 现在可以安全地打印 self.is_train 了
+        print(f"[Dataset] Loaded {len(self.df)} samples from {csv_path} | "
               f"counts(0/1/2/3)={self.class_counts.tolist()} | train={self.is_train}")
+
+    def __len__(self):
+        return len(self.df)
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        x = torch.from_numpy(np.load(row["tokens_path"])).float()
-        y = int(self.labels[idx]) # 返回 0, 1, 2, 或 3
+        x = np.load(row["tokens_path"])
+        x = torch.from_numpy(x).float()
+        y = int(self.labels[idx])
 
+        # 使用之前提到的较大掩码参数来抑制震荡
         if self.is_train:
-            # 这里的参数建议根据之前的讨论调大
             x = apply_spec_augment(x, max_mask_t=80, max_mask_f=32, num_masks=2)
-        return x, torch.tensor(y, dtype=torch.long)
 
+        return x, torch.tensor(y, dtype=torch.long)
 
 # ============================================================
 # 3) collate：pad + mask
