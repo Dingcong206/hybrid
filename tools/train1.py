@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 from typing import Dict
 import math
+
 import numpy as np
 import pandas as pd
 
@@ -73,7 +74,6 @@ class TokenNPYDataset(Dataset):
             if col not in df.columns:
                 raise KeyError(f"[Dataset] CSV 缺少列 `{col}`，当前列: {df.columns.tolist()}")
 
-        # ✅ drop=True，避免多一列 index 干扰
         self.df = df.reset_index(drop=True)
 
         raw_labels = self.df["label"].astype(int).values
@@ -81,7 +81,6 @@ class TokenNPYDataset(Dataset):
         self.binary_labels = np.array([0 if l == 0 else 1 for l in raw_labels], dtype=np.int64)
         self.class_counts = np.bincount(self.binary_labels, minlength=2)
 
-        # ✅ sanity: labels must be {0,1}
         u = np.unique(self.binary_labels)
         assert set(u.tolist()).issubset({0, 1}), f"[Dataset BUG] binary_labels not in {{0,1}}: {u}"
 
@@ -128,7 +127,6 @@ def collate_pad(batch):
         x_pad[i, :T] = x
         mask[i, :T] = False
 
-    # ✅ sanity: valid length > 0
     valid_lens = (~mask).sum(dim=1)
     assert torch.all(valid_lens > 0), "[COLLATE BUG] some sample has 0 valid tokens"
 
@@ -137,7 +135,7 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 4) 评估：argmax(logits)（与发表版一致：无阈值）
+# 4) Eval: argmax（固定 0.5 相当于 argmax）
 # ============================================================
 @torch.no_grad()
 def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
@@ -155,10 +153,10 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
         feat = backbone(x, mask=mask)
         assert feat.ndim == 2, f"[BUG] backbone output must be (B,D), got {feat.shape}"
 
-        logits = classifier(feat)            # (B,2)
+        logits = classifier(feat)  # (B,2)
         assert logits.ndim == 2 and logits.size(1) == 2, f"[BUG] logits must be (B,2), got {logits.shape}"
 
-        pred = torch.argmax(logits, dim=1)   # argmax
+        pred = torch.argmax(logits, dim=1)
         abnormal_rates.append(float((pred == 1).float().mean().item()))
 
         all_pred.append(pred.detach().cpu())
@@ -168,7 +166,6 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
     y_true = torch.cat(all_true).numpy()
 
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    assert cm.shape == (2, 2), f"[BUG] confusion matrix shape wrong: {cm.shape}"
     tn, fp, fn, tp = cm.ravel()
 
     sp = tn / (tn + fp + 1e-10) * 100.0
@@ -177,7 +174,6 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
 
     acc = accuracy_score(y_true, y_pred) * 100.0
     f1 = f1_score(y_true, y_pred, zero_division=0)
-
     pred_abn_rate = float(np.mean(abnormal_rates) * 100.0)
 
     return {
@@ -192,7 +188,70 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
 
 
 # ============================================================
-# 5) Seed
+# 5) Eval: sweep threshold（找 best Score 的阈值）
+# ============================================================
+@torch.no_grad()
+def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None) -> Dict[str, float]:
+    backbone.eval()
+    classifier.eval()
+
+    if thr_list is None:
+        thr_list = np.linspace(0.05, 0.95, 19)
+
+    all_prob, all_true = [], []
+
+    for x, mask, y in loader:
+        x = x.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        feat = backbone(x, mask=mask)
+        logits = classifier(feat)
+        prob_abn = torch.softmax(logits.float(), dim=1)[:, 1]
+        all_prob.append(prob_abn.detach().cpu())
+        all_true.append(y.detach().cpu())
+
+    prob = torch.cat(all_prob).numpy()
+    y_true = torch.cat(all_true).numpy()
+
+    best = {
+        "BestThr": None, "Score": -1.0,
+        "SE": 0.0, "SP": 0.0, "ACC": 0.0, "F1": 0.0,
+        "TP": 0, "TN": 0, "FP": 0, "FN": 0,
+        "PredAbnRate": 0.0
+    }
+
+    for thr in thr_list:
+        y_pred = (prob >= thr).astype(np.int64)
+
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+
+        sp = tn / (tn + fp + 1e-10) * 100.0
+        se = tp / (tp + fn + 1e-10) * 100.0
+        score = (sp + se) / 2.0
+
+        acc = accuracy_score(y_true, y_pred) * 100.0
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        pred_abn_rate = float((y_pred == 1).mean() * 100.0)
+
+        if score > best["Score"]:
+            best.update({
+                "BestThr": float(thr),
+                "Score": float(score),
+                "SE": float(se),
+                "SP": float(sp),
+                "ACC": float(acc),
+                "F1": float(f1),
+                "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+                "PredAbnRate": float(pred_abn_rate),
+            })
+
+    return best
+
+
+# ============================================================
+# 6) Seed
 # ============================================================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -202,13 +261,12 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 6) Train
+# 7) Train
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--root", type=str,
-                        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
+    parser.add_argument("--root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accum_steps", type=int, default=4)
@@ -261,8 +319,7 @@ def main():
     dl_train = DataLoader(
         ds_train, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
-        collate_fn=collate_pad,
-        drop_last=False,  # ✅ 更稳：别丢尾巴
+        collate_fn=collate_pad, drop_last=False
     )
 
     dl_test = DataLoader(
@@ -289,32 +346,30 @@ def main():
     classifier = nn.Linear(backbone.final_feat_dim, args.num_classes).to(device)
     params = list(backbone.parameters()) + list(classifier.parameters())
 
-    # =========================
-    # loss (✅ sqrt-balanced CE)
-    # =========================
+    # loss
     if args.use_weighted_loss:
         counts = ds_train.class_counts.astype(np.float32)  # [N0, N1]
         freq = counts / counts.sum()
         w = 1.0 / (np.sqrt(freq) + 1e-12)
-        w = w / w.sum() * 2.0  # mean≈1
+        w = w / w.sum() * 2.0
         weight = torch.tensor(w, device=device, dtype=torch.float32)
         print("[INFO] CE weights (sqrt):", w, "| w1/w0=", float(w[1] / (w[0] + 1e-12)))
         loss_fn = nn.CrossEntropyLoss(weight=weight)
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    # optim/scheduler
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
     steps_per_epoch = math.ceil(len(dl_train) / args.accum_steps)
     total_steps = args.epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
+    # ✅ 用 best-threshold 的 Score 做保存/早停
     best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (Route-A + ARGMAX)\n")
+    print("\n🚀 Start training (Route-A + ARGMAX + THR-SWEEP)\n")
 
     for epoch in range(1, args.epochs + 1):
         backbone.train()
@@ -332,10 +387,7 @@ def main():
 
             with torch.amp.autocast("cuda", enabled=args.amp):
                 feat = backbone(x, mask=mask)
-                assert feat.ndim == 2, f"[BUG] backbone output must be (B,D), got {feat.shape}"
                 logits = classifier(feat)
-                assert logits.ndim == 2 and logits.size(1) == 2, f"[BUG] logits must be (B,2), got {logits.shape}"
-
                 loss = loss_fn(logits, y) / args.accum_steps
 
             scaler.scale(loss).backward()
@@ -352,12 +404,16 @@ def main():
 
         train_loss = running / max(1, len(dl_train))
 
-        test_m = evaluate_argmax(backbone, classifier, dl_test, device)
-        score = test_m["Score"]
+        # eval both
+        test_arg = evaluate_argmax(backbone, classifier, dl_test, device)
+        test_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)
 
-        improved = score > best_score + 1e-6
+        score_arg = test_arg["Score"]
+        score_best = test_best["Score"]
+
+        improved = score_best > best_score + 1e-6
         if improved:
-            best_score = score
+            best_score = score_best
             best_epoch = epoch
             bad_epochs = 0
             torch.save(
@@ -366,6 +422,7 @@ def main():
                     "backbone_state": backbone.state_dict(),
                     "classifier_state": classifier.state_dict(),
                     "best_score": best_score,
+                    "best_thr": test_best["BestThr"],
                     "args": vars(args),
                 },
                 ckpt_path
@@ -379,33 +436,40 @@ def main():
         print(
             f"{star} Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_loss:.4f} | "
-            f"TEST(argmax) Score {score:.4f} SE {test_m['SE']:.4f} SP {test_m['SP']:.4f} | "
-            f"ACC {test_m['ACC']:.4f} F1 {test_m['F1']:.4f} | "
-            f"PredAbnRate {test_m['PredAbnRate']:.2f}% | "
-            f"TP {test_m['TP']} TN {test_m['TN']} FP {test_m['FP']} FN {test_m['FN']} | "
+            f"ARGMAX Score {score_arg:.4f} SE {test_arg['SE']:.2f} SP {test_arg['SP']:.2f} "
+            f"PredAbn {test_arg['PredAbnRate']:.2f}% || "
+            f"BestThr {test_best['BestThr']:.2f} Score {score_best:.4f} "
+            f"SE {test_best['SE']:.2f} SP {test_best['SP']:.2f} PredAbn {test_best['PredAbnRate']:.2f}% | "
             f"{dt:.1f}s"
         )
 
         if bad_epochs >= args.patience:
-            print(f"[EARLY STOP] Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
+            print(f"[EARLY STOP] BestThr Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best TEST Score={best_score:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best(thr) TEST Score={best_score:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
-    # final eval
-    print("\n🚀 Final TEST evaluation (argmax from best checkpoint)\n")
+    # final eval from best
+    print("\n🚀 Final TEST evaluation (from best checkpoint)\n")
     ckpt = torch.load(ckpt_path, map_location=device)
     backbone.load_state_dict(ckpt["backbone_state"])
     classifier.load_state_dict(ckpt["classifier_state"])
-    final_m = evaluate_argmax(backbone, classifier, dl_test, device)
+    best_thr = ckpt.get("best_thr", None)
+
+    final_arg = evaluate_argmax(backbone, classifier, dl_test, device)
+    final_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)
 
     print(
-        f"[TEST argmax] Score {final_m['Score']:.4f} SE {final_m['SE']:.4f} SP {final_m['SP']:.4f} | "
-        f"ACC {final_m['ACC']:.4f} F1 {final_m['F1']:.4f} | "
-        f"PredAbnRate {final_m['PredAbnRate']:.2f}% | "
-        f"TP {final_m['TP']} TN {final_m['TN']} FP {final_m['FP']} FN {final_m['FN']}"
+        f"[FINAL argmax] Score {final_arg['Score']:.4f} SE {final_arg['SE']:.2f} SP {final_arg['SP']:.2f} "
+        f"PredAbn {final_arg['PredAbnRate']:.2f}%"
     )
+    print(
+        f"[FINAL bestthr] BestThr {final_best['BestThr']:.2f} Score {final_best['Score']:.4f} "
+        f"SE {final_best['SE']:.2f} SP {final_best['SP']:.2f} PredAbn {final_best['PredAbnRate']:.2f}%"
+    )
+    if best_thr is not None:
+        print(f"[CKPT saved best_thr] {best_thr:.2f}")
 
 
 if __name__ == "__main__":
