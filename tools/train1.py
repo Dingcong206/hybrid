@@ -304,7 +304,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accum_steps", type=int, default=4)
 
-    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -318,8 +318,8 @@ def main():
 
     # model args
     parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--n_layers", type=int, default=12)
+    parser.add_argument("--d_model", type=int, default=768)
+    parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--max_len", type=int, default=1024)
@@ -394,8 +394,18 @@ def main():
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.5, 0.999))
     steps_per_epoch = math.ceil(len(dl_train) / args.accum_steps)
     total_steps = args.epochs * steps_per_epoch
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    warmup_steps = int(0.05 * total_steps)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        # cosine
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
+    #scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     # ✅ 用 thr-sweep 的 Score 做保存/早停
     best_score = -1.0
