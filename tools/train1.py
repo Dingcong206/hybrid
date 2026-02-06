@@ -218,7 +218,7 @@ def main():
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--max_len", type=int, default=1024)
-    parser.add_argument("--num_classes", type=int, default=2)
+    parser.add_argument("--num_classes", type=int, default=4)
 
     # amp
     parser.add_argument("--amp", action="store_true", help="use mixed precision")
