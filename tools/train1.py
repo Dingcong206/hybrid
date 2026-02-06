@@ -29,8 +29,7 @@ from mymodels import build_model
 
 
 # ============================================================
-# 1) SpecAugment（对 tokens 做维度遮挡）
-#    ✅ 默认减弱，先求稳定；你之后再加大
+# 1) SpecAugment（对 tokens 做维度遮挡）——先弱增强求稳定
 # ============================================================
 def apply_spec_augment(x, max_mask_t=10, max_mask_f=3, num_masks=1):
     """
@@ -40,13 +39,11 @@ def apply_spec_augment(x, max_mask_t=10, max_mask_f=3, num_masks=1):
     x_aug = x.clone()
 
     for _ in range(num_masks):
-        # time mask
         t_width = random.randint(0, max_mask_t)
         t_start = random.randint(0, max(0, T - t_width))
         if t_width > 0:
             x_aug[t_start:t_start + t_width, :] = 0
 
-        # feature mask
         f_width = random.randint(0, max_mask_f)
         f_start = random.randint(0, max(0, D - f_width))
         if f_width > 0:
@@ -106,13 +103,6 @@ class TokenNPYDataset(Dataset):
 # 3) collate：pad + mask
 # ============================================================
 def collate_pad(batch):
-    """
-    batch: List[(x(T,D), y)]
-    return:
-      x_pad: (B, T_max, D)
-      mask : (B, T_max)  True=PAD
-      y    : (B,)
-    """
     xs, ys = zip(*batch)
     lens = [x.shape[0] for x in xs]
     D = xs[0].shape[1]
@@ -135,7 +125,7 @@ def collate_pad(batch):
 
 
 # ============================================================
-# 4) Eval: argmax（固定 0.5 相当于 argmax）
+# 4) Eval: argmax
 # ============================================================
 @torch.no_grad()
 def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
@@ -151,14 +141,10 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
         y = y.to(device, non_blocking=True)
 
         feat = backbone(x, mask=mask)
-        assert feat.ndim == 2, f"[BUG] backbone output must be (B,D), got {feat.shape}"
-
         logits = classifier(feat)  # (B,2)
-        assert logits.ndim == 2 and logits.size(1) == 2, f"[BUG] logits must be (B,2), got {logits.shape}"
-
         pred = torch.argmax(logits, dim=1)
-        abnormal_rates.append(float((pred == 1).float().mean().item()))
 
+        abnormal_rates.append(float((pred == 1).float().mean().item()))
         all_pred.append(pred.detach().cpu())
         all_true.append(y.detach().cpu())
 
@@ -188,7 +174,7 @@ def evaluate_argmax(backbone, classifier, loader, device) -> Dict[str, float]:
 
 
 # ============================================================
-# 5) Eval: sweep threshold（找 best Score 的阈值）
+# 5) Eval: threshold sweep（找 best Score 的阈值）
 # ============================================================
 @torch.no_grad()
 def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None) -> Dict[str, float]:
@@ -206,7 +192,8 @@ def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None
         y = y.to(device, non_blocking=True)
 
         feat = backbone(x, mask=mask)
-        logits = classifier(feat)
+        logits = classifier(feat)  # (B,2)
+
         prob_abn = torch.softmax(logits.float(), dim=1)[:, 1]
         all_prob.append(prob_abn.detach().cpu())
         all_true.append(y.detach().cpu())
@@ -215,7 +202,7 @@ def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None
     y_true = torch.cat(all_true).numpy()
 
     best = {
-        "BestThr": None, "Score": -1.0,
+        "BestThr": 0.5, "Score": -1.0,
         "SE": 0.0, "SP": 0.0, "ACC": 0.0, "F1": 0.0,
         "TP": 0, "TN": 0, "FP": 0, "FN": 0,
         "PredAbnRate": 0.0
@@ -251,7 +238,53 @@ def evaluate_sweep_threshold(backbone, classifier, loader, device, thr_list=None
 
 
 # ============================================================
-# 6) Seed
+# 6) Eval: fixed threshold（用 ckpt 保存的 best_thr）
+# ============================================================
+@torch.no_grad()
+def evaluate_fixed_threshold(backbone, classifier, loader, device, thr=0.5) -> Dict[str, float]:
+    backbone.eval()
+    classifier.eval()
+
+    all_pred, all_true = [], []
+
+    for x, mask, y in loader:
+        x = x.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        feat = backbone(x, mask=mask)
+        logits = classifier(feat)  # (B,2)
+        prob_abn = torch.softmax(logits.float(), dim=1)[:, 1]
+        pred = (prob_abn >= thr).long()
+
+        all_pred.append(pred.detach().cpu())
+        all_true.append(y.detach().cpu())
+
+    y_pred = torch.cat(all_pred).numpy()
+    y_true = torch.cat(all_true).numpy()
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    sp = tn / (tn + fp + 1e-10) * 100.0
+    se = tp / (tp + fn + 1e-10) * 100.0
+    score = (sp + se) / 2.0
+
+    acc = accuracy_score(y_true, y_pred) * 100.0
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    pred_abn_rate = float((y_pred == 1).mean() * 100.0)
+
+    return {
+        "Thr": float(thr),
+        "SP": float(sp), "SE": float(se), "Score": float(score),
+        "ACC": float(acc), "F1": float(f1),
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+        "PredAbnRate": float(pred_abn_rate),
+    }
+
+
+# ============================================================
+# 7) Seed
 # ============================================================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -261,7 +294,7 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# 7) Train
+# 8) Train
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -277,7 +310,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_argmax_fixed")
+    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_routeA_thrbest")
     parser.add_argument("--patience", type=int, default=10)
 
     parser.add_argument("--use_weighted_loss", action="store_true", default=True)
@@ -364,7 +397,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    # ✅ 用 best-threshold 的 Score 做保存/早停
+    # ✅ 用 thr-sweep 的 Score 做保存/早停
     best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
@@ -377,7 +410,6 @@ def main():
 
         t0 = time.time()
         running = 0.0
-
         optim.zero_grad(set_to_none=True)
 
         for i, (x, mask, y) in enumerate(dl_train):
@@ -396,7 +428,6 @@ def main():
             if (i + 1) % args.accum_steps == 0 or (i + 1) == len(dl_train):
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(params, 5.0)
-
                 scaler.step(optim)
                 scaler.update()
                 scheduler.step()
@@ -447,29 +478,27 @@ def main():
             print(f"[EARLY STOP] BestThr Score 连续 {args.patience} 轮无提升，停止于 epoch {epoch}（best@{best_epoch}）")
             break
 
-    print(f"\n✅ DONE. Best(thr) TEST Score={best_score:.4f} @ epoch {best_epoch}")
+    print(f"\n✅ DONE. Best(thr-sweep) TEST Score={best_score:.4f} @ epoch {best_epoch}")
     print(f"[SAVED] best checkpoint: {ckpt_path}")
 
-    # final eval from best
+    # final eval from best checkpoint (固定用保存的 best_thr，不再重新扫一遍)
     print("\n🚀 Final TEST evaluation (from best checkpoint)\n")
     ckpt = torch.load(ckpt_path, map_location=device)
     backbone.load_state_dict(ckpt["backbone_state"])
     classifier.load_state_dict(ckpt["classifier_state"])
-    best_thr = ckpt.get("best_thr", None)
+    best_thr = float(ckpt.get("best_thr", 0.5))
 
     final_arg = evaluate_argmax(backbone, classifier, dl_test, device)
-    final_best = evaluate_sweep_threshold(backbone, classifier, dl_test, device)
+    final_fix = evaluate_fixed_threshold(backbone, classifier, dl_test, device, thr=best_thr)
 
     print(
         f"[FINAL argmax] Score {final_arg['Score']:.4f} SE {final_arg['SE']:.2f} SP {final_arg['SP']:.2f} "
         f"PredAbn {final_arg['PredAbnRate']:.2f}%"
     )
     print(
-        f"[FINAL bestthr] BestThr {final_best['BestThr']:.2f} Score {final_best['Score']:.4f} "
-        f"SE {final_best['SE']:.2f} SP {final_best['SP']:.2f} PredAbn {final_best['PredAbnRate']:.2f}%"
+        f"[FINAL fixed_thr] Thr {final_fix['Thr']:.2f} Score {final_fix['Score']:.4f} "
+        f"SE {final_fix['SE']:.2f} SP {final_fix['SP']:.2f} PredAbn {final_fix['PredAbnRate']:.2f}%"
     )
-    if best_thr is not None:
-        print(f"[CKPT saved best_thr] {best_thr:.2f}")
 
 
 if __name__ == "__main__":
