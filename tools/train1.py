@@ -142,10 +142,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--accum_steps", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--specaug", action="store_true", default=True)
-    parser.add_argument("--use_pos_weight", action="store_true", default=True)
+    parser.add_argument("--use_pos_weight", action="store_true", default=False)
     parser.add_argument("--amp", action="store_true", default=True)
     # ====== SpecAugment 具体参数 (补充缺失项) ======
     parser.add_argument("--max_mask_t", type=int, default=10, help="时间维度最大遮挡长度")
@@ -157,9 +157,9 @@ def main():
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--nhead", type=int, default=4)
     # 阈值扫描配置
-    parser.add_argument("--thr_min", type=float, default=0.2)
-    parser.add_argument("--thr_max", type=float, default=0.8)
-    parser.add_argument("--thr_step", type=float, default=0.05)
+    parser.add_argument("--thr_min", type=float, default=0.01)
+    parser.add_argument("--thr_max", type=float, default=0.99)
+    parser.add_argument("--thr_step", type=float, default=0.01)
 
     args = parser.parse_args()
     random.seed(42);
@@ -225,6 +225,9 @@ def main():
         # 每轮结束后，直接在测试集上通过扫描阈值获取最佳 ICBHI Score
         res = scan_best_threshold(backbone, classifier, dl_test, device, thr_list)
         score = res["ICBHI"]
+        # ❗️ 如果 TP==0（SE=0），不允许保存为 best
+        if res["TP"] == 0:
+            improved = False
 
         improved = score > best_score + 1e-7
         if improved:
