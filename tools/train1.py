@@ -42,8 +42,8 @@ CONFIG = {
 
     # model
     "IN_DIM": 768,
-    "D_MODEL": 256,
-    "N_LAYERS": 12,
+    "D_MODEL": 512,
+    "N_LAYERS": 8,
     "NHEAD": 4,
     "DROPOUT": 0.3,
     "MAX_LEN": 1024,
