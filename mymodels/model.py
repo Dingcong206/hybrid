@@ -12,6 +12,7 @@ except ImportError:
     Mamba = None
     print("⚠️ 未安装 mamba_ssm。需要安装：pip install mamba-ssm causal-conv1d")
 
+
 # =========================
 # 1) 位置编码
 # =========================
@@ -26,8 +27,10 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
 
+
 # =========================
 # 2) BiMambaBlock（双向 + FFN）
+#   ✅ 保留内部 MLP（更强表征）
 # =========================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
@@ -59,6 +62,7 @@ class BiMambaBlock(nn.Module):
         x = x + self.drop(h_f + h_b)
         return x + self.mlp(self.ln2(x))
 
+
 # =========================
 # 3) AttentionBlock（残差）
 # =========================
@@ -71,30 +75,13 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x, mask=None):
         x_n = self.ln(x)
-        # 这里不额外 masked_fill，key_padding_mask 已经足够屏蔽 PAD
         x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
         return x + self.drop(x_a)
 
-# =========================
-# 4) FFNBlock（残差）
-# =========================
-class FFNBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.3, mult=4):
-        super().__init__()
-        self.ln = _rmsnorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, mult * d_model),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mult * d_model, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return x + self.ffn(self.ln(x))
 
 # =========================
-# 5) ICBHI Pooling：Attn pooling + Max pooling
+# 4) ICBHI Pooling：Attn pooling + Mean pooling
+#   ✅ 把 max pooling 改成 mean（更稳、更泛化）
 # =========================
 class ICBHI_Pooling(nn.Module):
     def __init__(self, d_model):
@@ -108,29 +95,29 @@ class ICBHI_Pooling(nn.Module):
     def forward(self, x, mask=None):
         attn_scores = self.attn_net(x)  # (B,T,1)
         if mask is not None:
-            #attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), -1e9)
-            neg_inf = torch.finfo(attn_scores.dtype).min  # fp16 下约 -65504
+            neg_inf = torch.finfo(attn_scores.dtype).min
             attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), neg_inf)
 
         attn_w = torch.softmax(attn_scores, dim=1)
         feat_weighted = torch.sum(attn_w * x, dim=1)  # (B,D)
 
+        # ✅ mean pooling with mask
         if mask is not None:
-            #x_for_max = x.masked_fill(mask.unsqueeze(-1), -1e9)
-            neg_inf_x = torch.finfo(x.dtype).min
-            x_for_max = x.masked_fill(mask.unsqueeze(-1), neg_inf_x)
-
+            x_valid = x.masked_fill(mask.unsqueeze(-1), 0.0)
+            denom = (~mask).sum(dim=1).clamp(min=1).unsqueeze(-1)  # (B,1)
+            feat_mean = x_valid.sum(dim=1) / denom
         else:
-            x_for_max = x
-        feat_max, _ = torch.max(x_for_max, dim=1)  # (B,D)
+            feat_mean = x.mean(dim=1)
 
-        return feat_weighted + feat_max
+        return feat_weighted + feat_mean
+
 
 # =========================
-# 6) 一个 Stage（= 1 layer）
-#    3×BiMamba -> 1×Attn -> 3×BiMamba -> FFN
+# 5) 一个 Stage（= 1 layer）
+#    3×BiMamba -> 1×Attn -> 3×BiMamba
+#   ✅ 删除 Stage 尾部 FFN（避免 “MLP 过量”）
 # =========================
-class Stage3Attn3FFN(nn.Module):
+class Stage3Attn3(nn.Module):
     def __init__(
         self,
         d_model,
@@ -139,7 +126,6 @@ class Stage3Attn3FFN(nn.Module):
         d_state=16,
         d_conv=4,
         expand=2,
-        ffn_mult=4,
     ):
         super().__init__()
 
@@ -155,74 +141,68 @@ class Stage3Attn3FFN(nn.Module):
             for _ in range(3)
         ])
 
-        self.ffn = FFNBlock(d_model, dropout=dropout, mult=ffn_mult)
-
     def forward(self, x, mask=None):
         for blk in self.pre_mambas:
             x = blk(x)
         x = self.attn(x, mask=mask)
         for blk in self.post_mambas:
             x = blk(x)
-        x = self.ffn(x)
         return x
 
+
 # =========================
-# 7) 主模型：PE -> Conv(once) -> [Stage × n_layers] -> Norm -> Pool
-# =========================
-# =========================
-# 修改后的主模型：SSA_Model_HeARTokens
+# 6) 主模型：PE -> Conv(once) -> [Stage × n_layers] -> Norm -> Pool
+#   ✅ 你要的：d_model=512, n_layers=8
+#   ✅ Conv 改成 DW + PW（更强表达）
 # =========================
 class SSA_Model_HeARTokens(nn.Module):
     def __init__(
-            self,
-            in_dim=768,
-            d_model=128,  #  改这里
-            n_layers=8,
-            nhead=4,  #  下面我会说 nhead 怎么配更好
-            dropout=0.3,
-            max_len=1024,
-            num_classes=4,
-            conv_k=7,
-            d_state=16,
-            d_conv=4,
-            expand=2,
-            ffn_mult=4,
+        self,
+        in_dim=768,
+        d_model=512,     # ✅ 512
+        n_layers=8,      # ✅ 8 layers
+        nhead=8,         # ✅ 512/8=64 合理
+        dropout=0.3,
+        max_len=1024,
+        num_classes=4,
+        conv_k=7,
+        d_state=16,
+        d_conv=4,
+        expand=2,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_classes = num_classes
 
-        # --- 修改点 1: 移除降维投影，改为轻量级特征整合 ---
-        # 如果你希望完全不改变特征，甚至可以只用 nn.Identity()
+        # 输入投影
         self.input_proj = nn.Sequential(
             nn.LayerNorm(in_dim),
-            # 仅做线性变换而不改变维度，有助于模型适配后续的 Mamba 结构
             nn.Linear(in_dim, d_model),
             nn.SiLU()
         )
 
-        # --- 修改点 2: 确保 PE 长度覆盖 AST 的 798 个 tokens ---
+        # PE
         pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
-        # --- 修改点 3: 卷积层维度同步 ---
+        # ✅ Conv: depthwise + pointwise（通道混合更强）
         self.front_conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
+            nn.Conv1d(d_model, d_model, kernel_size=1),   # ✅ pointwise
             nn.BatchNorm1d(d_model),
             nn.SiLU(),
         )
 
-        # --- 修改点 4: Stage 结构会自动继承 d_model=768 ---
+        # Stages
         self.stages = nn.ModuleList([
-            Stage3Attn3FFN(
+            Stage3Attn3(
                 d_model=d_model,
                 nhead=nhead,
                 dropout=dropout,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
-                ffn_mult=ffn_mult,
             )
             for _ in range(n_layers)
         ])
@@ -230,24 +210,22 @@ class SSA_Model_HeARTokens(nn.Module):
         self.norm = _rmsnorm(d_model)
         self.pool = ICBHI_Pooling(d_model)
 
+        # 分类头（保持你原来的“瓶颈层 + dropout”）
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),  # 增加一层瓶颈层，平滑分类
+            nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, num_classes)
         )
-        self.token_head = nn.Linear(d_model, num_classes)
 
     def forward(self, x, mask=None, return_feature=False):
-
+        # x: (B,T,in_dim)
         x = self.input_proj(x)
 
         T = x.shape[1]
-        # 加上位置编码
         x = x + self.pe[:, :T, :].to(x.device)
         x = self.pos_drop(x)
 
-        # 局部特征增强
         x = x + self.front_conv(x.transpose(1, 2)).transpose(1, 2)
 
         for stage in self.stages:
@@ -259,12 +237,12 @@ class SSA_Model_HeARTokens(nn.Module):
         if return_feature:
             return file_feature, x
 
-        file_logits = self.classifier(file_feature)
-        #token_logits = self.token_head(x)
-        return file_logits
+        logits = self.classifier(file_feature)
+        return logits
+
 
 # =========================
-# 8) Route-A Backbone：输出 (B,d_model)
+# 7) Backbone：输出 (B, d_model)
 # =========================
 class SSA_Backbone(nn.Module):
     def __init__(self, ssa_model: SSA_Model_HeARTokens):
@@ -276,23 +254,23 @@ class SSA_Backbone(nn.Module):
         feat, _ = self.ssa(x, mask=mask, return_feature=True)
         return feat
 
+
 # =========================
-# 9) build_model：返回 backbone（Route-A）
+# 8) build_model：返回 backbone（Route-A）
+#   ✅ 默认就是 512 / 8layer
 # =========================
 def build_model(
     in_dim=768,
-    d_model=128,
-    n_layers=8,
-    nhead=4,
+    d_model=512,     # ✅ 默认 512
+    n_layers=8,      # ✅ 默认 8
+    nhead=8,         # ✅ 默认 8
     dropout=0.3,
-    max_len=512,
+    max_len=1024,
     conv_k=7,
     d_state=16,
     d_conv=4,
     expand=2,
-    ffn_mult=4,
     num_classes=4,
-
 ):
     ssa = SSA_Model_HeARTokens(
         in_dim=in_dim,
@@ -301,27 +279,22 @@ def build_model(
         nhead=nhead,
         dropout=dropout,
         max_len=max_len,
-        #num_classes=2,
         num_classes=num_classes,
         conv_k=conv_k,
         d_state=d_state,
         d_conv=d_conv,
         expand=expand,
-        ffn_mult=ffn_mult,
     )
     backbone = SSA_Backbone(ssa)
 
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"✅ Structure: PE → Conv(once) → [3×BiMamba → Attn → 3×BiMamba → FFN] × {n_layers}")
+    print(f"✅ Structure: PE → DW+PW Conv(once) → [3×BiMamba → Attn → 3×BiMamba] × {n_layers}")
     print(f"   Parameters: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
 
+
 # ============================================================
-# ✅ 兼容 mymodels/__init__.py
-# 你的 __init__.py 写了：from .model import SSA_Model, build_model
-# 所以必须提供 SSA_Model 这个名字
+# 兼容 mymodels/__init__.py
 # ============================================================
 SSA_Model = SSA_Model_HeARTokens
-
-# （可选）同时兼容以前叫 build_backbone 的脚本
 build_backbone = build_model
