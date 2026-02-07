@@ -27,7 +27,7 @@ CONFIG = {
     "ROOT": "/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",  # 含 train_index.csv / test_index.csv
 
     # train
-    "EPOCHS": 100,
+    "EPOCHS": 30,
     "BATCH_SIZE": 2,
     "ACCUM_STEPS": 8,
 
@@ -38,7 +38,7 @@ CONFIG = {
     "DEVICE": "cuda",
 
     "SAVE_DIR": "/data/dingcong/hybrid/checkpoints_icbhi_4cls_like_author",  # 你可改回你自己的目录
-    "PATIENCE": 15,
+    "PATIENCE": 10,
 
     # model
     "IN_DIM": 768,
