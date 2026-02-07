@@ -154,7 +154,7 @@ def main():
     # 模型结构参数
     parser.add_argument("--in_dim", type=int, default=768)
     parser.add_argument("--d_model", type=int, default=512)
-    parser.add_argument("--n_layers", type=int, default=8)
+    parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--nhead", type=int, default=4)
     # 阈值扫描配置
     parser.add_argument("--thr_min", type=float, default=0.01)
