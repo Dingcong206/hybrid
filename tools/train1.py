@@ -44,8 +44,8 @@ CONFIG = {
     "IN_DIM": 768,
     "D_MODEL": 512,
     "N_LAYERS": 8,
-    "NHEAD": 4,
-    "DROPOUT": 0.3,
+    "NHEAD": 8,
+    "DROPOUT": 0.2,
     "MAX_LEN": 1024,
 
     # aug (默认关闭，与你现在一致)

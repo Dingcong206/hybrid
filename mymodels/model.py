@@ -1,16 +1,12 @@
 import torch
 import torch.nn as nn
-
+try:
+    from mamba_ssm import Mamba
+except Exception:
+    Mamba = None
 # =============== RMSNorm 兼容 ===============
 def _rmsnorm(dim: int):
     return nn.RMSNorm(dim) if hasattr(nn, "RMSNorm") else nn.LayerNorm(dim)
-
-# =============== mamba 依赖 ===============
-try:
-    from mamba_ssm import Mamba
-except ImportError:
-    Mamba = None
-    print("⚠️ 未安装 mamba_ssm。需要安装：pip install mamba-ssm causal-conv1d")
 
 
 # =========================
@@ -159,13 +155,13 @@ class SSA_Model_HeARTokens(nn.Module):
     def __init__(
         self,
         in_dim=768,
-        d_model=512,     # ✅ 512
-        n_layers=8,      # ✅ 8 layers
-        nhead=8,         # ✅ 512/8=64 合理
+        d_model=512,     #  512
+        n_layers=8,      #  8 layers
+        nhead=8,         # 512/8=64 合理
         dropout=0.3,
         max_len=1024,
         num_classes=4,
-        conv_k=7,
+        conv_k=5,
         d_state=16,
         d_conv=4,
         expand=2,
@@ -186,13 +182,11 @@ class SSA_Model_HeARTokens(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
-        # ✅ Conv: depthwise + pointwise（通道混合更强）
         self.front_conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=d_model),
-            nn.Conv1d(d_model, d_model, kernel_size=1),   # ✅ pointwise
-            nn.BatchNorm1d(d_model),
+            nn.Conv1d(d_model, d_model, kernel_size=conv_k, padding=conv_k // 2, groups=1, bias=False),
             nn.SiLU(),
         )
+        self.front_ln = nn.LayerNorm(d_model)
 
         # Stages
         self.stages = nn.ModuleList([
@@ -225,8 +219,8 @@ class SSA_Model_HeARTokens(nn.Module):
         T = x.shape[1]
         x = x + self.pe[:, :T, :].to(x.device)
         x = self.pos_drop(x)
-
-        x = x + self.front_conv(x.transpose(1, 2)).transpose(1, 2)
+        y = self.front_conv(x.transpose(1, 2)).transpose(1, 2)  # (B,T,C)
+        x = x + self.front_ln(y)
 
         for stage in self.stages:
             x = stage(x, mask=mask)
@@ -266,7 +260,7 @@ def build_model(
     nhead=8,         # ✅ 默认 8
     dropout=0.3,
     max_len=1024,
-    conv_k=7,
+    conv_k=5,
     d_state=16,
     d_conv=4,
     expand=2,
@@ -288,7 +282,7 @@ def build_model(
     backbone = SSA_Backbone(ssa)
 
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"✅ Structure: PE → DW+PW Conv(once) → [3×BiMamba → Attn → 3×BiMamba] × {n_layers}")
+    print(f"Structure: PE → Conv1D(once, k={conv_k}, groups=1) × {n_layers}")
     print(f"   Parameters: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
 
