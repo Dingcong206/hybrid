@@ -145,7 +145,9 @@ class SSA_Model_HeARTokens(nn.Module):
             nn.Linear(in_dim, d_model),
             nn.SiLU()
         )
+        self.d_model = d_model
 
+        self.num_classes = num_classes
         # 位置编码
         pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
