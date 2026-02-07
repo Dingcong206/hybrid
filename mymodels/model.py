@@ -218,3 +218,8 @@ def build_model(in_dim=768, d_model=512, n_layers=4, nhead=8, num_classes=1):
     print(f"Structure: RMSNorm + 1:1 Mamba-Attn Stage x {n_layers}")
     print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
+# ============================================================
+# ✅ 模仿旧版：添加别名，确保兼容 __init__.py 的导入
+# ============================================================
+SSA_Model = SSA_Model_HeARTokens  # 让旧代码能找到 SSA_Model
+build_backbone = build_model      # 如果旧版用到了这个名字
