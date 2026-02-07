@@ -144,9 +144,13 @@ def main():
     parser.add_argument("--accum_steps", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--specaug", action="store_true", default=True)  # 建议开启
-    parser.add_argument("--use_pos_weight", action="store_true", default=True)  # 强烈建议开启
+    parser.add_argument("--specaug", action="store_true", default=True)
+    parser.add_argument("--use_pos_weight", action="store_true", default=True)
     parser.add_argument("--amp", action="store_true", default=True)
+    # ====== SpecAugment 具体参数 (补充缺失项) ======
+    parser.add_argument("--max_mask_t", type=int, default=10, help="时间维度最大遮挡长度")
+    parser.add_argument("--max_mask_f", type=int, default=4, help="特征维度最大遮挡长度")
+    parser.add_argument("--num_masks", type=int, default=2, help="遮挡的数量")
     # 模型结构参数
     parser.add_argument("--in_dim", type=int, default=768)
     parser.add_argument("--d_model", type=int, default=512)
@@ -188,8 +192,8 @@ def main():
                                   weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                            T_max=args.epochs * (len(dl_train) // args.accum_steps))
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
     thr_list = np.arange(args.thr_min, args.thr_max, args.thr_step).tolist()
     best_score, best_epoch, best_thr = -1.0, -1, 0.5
     bad_count = 0
