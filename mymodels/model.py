@@ -230,3 +230,5 @@ def build_model(in_dim=768, d_model=512, n_layers=8, nhead=8, dropout=0.3, **kwa
     backbone = SSA_Backbone(ssa)
     print(f"Structure: RMSNorm Based SSA-Net | Params: {sum(p.numel() for p in backbone.parameters()):,}")
     return backbone
+# /data/dingcong/hybrid/mymodels/model.py 文件的最后
+SSA_Model = SSA_Model_HeARTokens
