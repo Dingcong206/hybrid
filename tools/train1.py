@@ -250,7 +250,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_icbhi_binary_score_fixed")
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=15)
 
     # ====== val split ======
     parser.add_argument("--val_ratio", type=float, default=0.1, help="split from train(60%) into val")
