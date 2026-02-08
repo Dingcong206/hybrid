@@ -197,7 +197,7 @@ class SSA_Model_FbankToSSA(nn.Module):
         self,
         in_dim=768,
         d_model=512,
-        n_layers=6,
+        n_layers=2,
         nhead=8,
         dropout=0.3,
         max_len=1024,
