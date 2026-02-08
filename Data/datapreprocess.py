@@ -5,7 +5,7 @@ import os
 import math
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,9 +13,14 @@ import torch
 import torchaudio
 from torchaudio import transforms as T
 
-# HuggingFace AST
 from transformers import ASTModel
 
+
+# ============================================================
+# ✅ 写死路径（你要改路径只改这里两行）
+# ============================================================
+DATA_DIR = "/data/dingcong/hybrid/audio_and_txt_files"          # 你的 ICBHI wav+txt 目录
+OUT_DIR  = "/data/dingcong/hybrid/icbhi_official_fbank"         # 输出目录（train/test + csv）
 
 # =========================
 # Paper-aligned constants
@@ -66,7 +71,6 @@ def find_official_split_file(data_dir: str) -> str:
         if c.exists():
             return str(c)
 
-    # fallback: recursive search
     for c in list(p.rglob("official_split.txt"))[:20]:
         return str(c)
 
@@ -82,8 +86,8 @@ def find_official_split_file(data_dir: str) -> str:
 
 def load_official_split(split_path: str) -> Dict[str, str]:
     """
-    Make matching robust:
-    - Accept keys in split file as: 'xxx.wav' OR 'xxx' OR 'path/to/xxx.wav'
+    Robust matching:
+    - Accept keys as: 'xxx.wav' OR 'xxx' OR 'path/to/xxx.wav'
     - Store BOTH: basename-with-ext AND stem-without-ext
     """
     mapping: Dict[str, str] = {}
@@ -102,15 +106,11 @@ def load_official_split(split_path: str) -> Dict[str, str]:
             if tag not in ("train", "test"):
                 continue
 
-            # normalize: drop directories
-            name = Path(raw).name               # xxx.wav OR xxx
-            stem = Path(name).stem              # xxx
+            name = Path(raw).name
+            stem = Path(name).stem
 
-            # store multiple keys
-            mapping[name] = tag                 # xxx.wav OR xxx
-            mapping[stem] = tag                 # xxx
-
-            # if split file provides no extension, also register xxx.wav (common case)
+            mapping[name] = tag
+            mapping[stem] = tag
             if "." not in name:
                 mapping[f"{name}.wav"] = tag
 
@@ -207,7 +207,7 @@ def wav_to_fbank_798x128(wav_8s: torch.Tensor) -> np.ndarray:
         frame_shift=FRAME_SHIFT_MS     # 10ms
     )  # (T, 128)
 
-    # paper sentence: standard normalization with mean/std
+    # paper normalization
     fbank = (fbank - FBANK_MEAN) / FBANK_STD
 
     # force frames to 798
@@ -223,44 +223,6 @@ def wav_to_fbank_798x128(wav_8s: torch.Tensor) -> np.ndarray:
 
 
 # =========================
-# AST patch projection (encoder BEFORE)
-# =========================
-def get_ast_projection_conv(ast_model: ASTModel):
-    """
-    Find the Conv2d projection module mapping spectrogram -> patch embeddings.
-    HF AST commonly uses:
-      ast_model.embeddings.patch_embeddings.projection
-    """
-    if hasattr(ast_model, "embeddings") and hasattr(ast_model.embeddings, "patch_embeddings"):
-        pe = ast_model.embeddings.patch_embeddings
-        if hasattr(pe, "projection"):
-            return pe.projection
-        if hasattr(pe, "proj"):
-            return pe.proj
-    raise AttributeError("无法在 ASTModel 中找到 patch projection Conv2d（projection/proj）。")
-
-
-@torch.no_grad()
-def fbank_to_patch_tokens(ast_model: ASTModel, fbank_798x128: np.ndarray, device: torch.device) -> np.ndarray:
-    """
-    Input: fbank shape (798, 128) [time, mel]
-    AST patch projection expects: (B, 1, freq, time) = (1,1,128,798)
-    Output: patch tokens (num_patches, hidden_dim) BEFORE encoder
-    """
-    # (time, mel) -> (mel, time)
-    x = torch.from_numpy(fbank_798x128).transpose(0, 1)  # (128, 798)
-    x = x.unsqueeze(0).unsqueeze(0).to(device)          # (1,1,128,798)
-
-    conv = get_ast_projection_conv(ast_model)
-    y = conv(x)  # (B, hidden, f', t')
-
-    # flatten patches -> tokens
-    y = y.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
-    tokens = y[0].detach().cpu().numpy().astype(np.float32)
-    return tokens
-
-
-# =========================
 # Pair finding
 # =========================
 def find_wav_txt_pairs(data_dir: str) -> List[Tuple[str, str]]:
@@ -272,19 +234,21 @@ def find_wav_txt_pairs(data_dir: str) -> List[Tuple[str, str]]:
 
 
 # =========================
-# Main pipeline
+# Main pipeline (save FBANK; tokens optional)
 # =========================
-def process_recording_to_tokens(
+def process_recording_to_features(
     wav_path: str,
     txt_path: str,
     out_dir: str,
-    ast_model: ASTModel,
-    device: torch.device,
-    save_fbank: bool = False,
+    save_fbank: bool = True,
+    save_tokens: bool = False,
+    ast_model: Optional[ASTModel] = None,
+    device: Optional[torch.device] = None,
 ) -> List[dict]:
     """
     For one recording:
-    wav+txt -> cycle slicing -> 8s fix -> fbank -> AST patch projection tokens -> save npy
+    wav+txt -> cycle slicing -> 8s fix -> fbank -> save fbank.npy (primary)
+    optional: also save tokens.npy for DEBUG only (fixed features)
     """
     wav = load_wav_resample_mono(wav_path, SR)
     wav = apply_fade_in_out(wav, int(SR / 16))  # slight fade on whole recording
@@ -299,21 +263,34 @@ def process_recording_to_tokens(
             continue
 
         y = lungsound_label(r["Crackles"], r["Wheezes"])
-
         cycle_8s = fix_to_8s_trunc_or_repeat_fade(cycle, SR)  # (1, 128000)
-        fbank = wav_to_fbank_798x128(cycle_8s)                # (798, 128)
 
-        tokens = fbank_to_patch_tokens(ast_model, fbank, device)  # (num_patches, hidden)
-
-        tok_name = f"{base}_cycle{i:04d}_y{y}_tokens.npy"
-        tok_path = os.path.join(out_dir, tok_name)
-        np.save(tok_path, tokens)
+        fbank = wav_to_fbank_798x128(cycle_8s)                # (798, 128) np.float32
 
         fb_path = ""
         if save_fbank:
             fb_name = f"{base}_cycle{i:04d}_y{y}_fbank.npy"
             fb_path = os.path.join(out_dir, fb_name)
             np.save(fb_path, fbank)
+
+        tok_path = ""
+        tok_shape = ""
+        if save_tokens:
+            if ast_model is None or device is None:
+                raise ValueError("save_tokens=True 需要提供 ast_model 和 device")
+            # tokens only for debugging (no grad, fixed)
+            with torch.no_grad():
+                # (798,128) -> (1,798,128)
+                fb_t = torch.from_numpy(fbank).unsqueeze(0).to(device)  # (1, 798, 128)
+                # Conv2d projection expects (B,1,128,798)
+                x = fb_t.transpose(1, 2).unsqueeze(1)                  # (1,1,128,798)
+                conv = ast_model.embeddings.patch_embeddings.projection
+                y_tok = conv(x).flatten(2).transpose(1, 2)[0]          # (N, hidden)
+                tok = y_tok.cpu().numpy().astype(np.float32)
+            tok_name = f"{base}_cycle{i:04d}_y{y}_tokens.npy"
+            tok_path = os.path.join(out_dir, tok_name)
+            np.save(tok_path, tok)
+            tok_shape = str(tok.shape)
 
         rows.append({
             "recording": base,
@@ -323,10 +300,10 @@ def process_recording_to_tokens(
             "crackles": int(r["Crackles"]),
             "wheezes": int(r["Wheezes"]),
             "label": int(y),
-            "tokens_path": tok_path,
-            "tokens_shape": str(tokens.shape),
-            "fbank_path": fb_path if save_fbank else "",
+            "fbank_path": fb_path,
             "fbank_shape": str(fbank.shape),
+            "tokens_path": tok_path,
+            "tokens_shape": tok_shape,
         })
 
     return rows
@@ -334,44 +311,37 @@ def process_recording_to_tokens(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/data/dingcong/hybrid/audio_and_txt_files",
-                        help="包含 ICBHI .wav + .txt 的目录（同名配对）")
-    parser.add_argument("--out_dir", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
-                        help="输出目录：train/ test/ + index csv")
+    # ✅ data_dir/out_dir 已写死，不再作为参数
     parser.add_argument("--split_file", type=str, default="",
                         help="可选：手动指定 official_split.txt 路径；不填则自动搜索")
+    parser.add_argument("--save_tokens", action="store_true", default=False,
+                        help="（可选）额外保存 tokens.npy，仅用于调试/对照（不用于微调 projection）")
     parser.add_argument("--ast_model", type=str, default="MIT/ast-finetuned-audioset-10-10-0.4593",
-                        help="HuggingFace AST 模型名或本地路径（已下载模型目录）")
-    parser.add_argument("--device", type=str, default="cuda", help="cuda 或 cpu")
-    parser.add_argument("--save_fbank", action="store_true",
-                        help="同时保存 fbank（可选，默认只保存 tokens）")
+                        help="HuggingFace AST 模型名或本地路径（save_tokens 时才需要）")
+    parser.add_argument("--device", type=str, default="cuda", help="cuda 或 cpu（save_tokens 时才需要）")
     parser.add_argument("--local_files_only", action="store_true",
                         help="只从本地缓存加载 HF 模型（服务器不能联网时用）")
     args = parser.parse_args()
 
-    # device
-    if args.device == "cuda" and not torch.cuda.is_available():
-        device = torch.device("cpu")
-        print("[WARN] cuda 不可用，自动切换到 cpu")
-    else:
-        device = torch.device(args.device)
+    data_dir = DATA_DIR
+    out_dir = OUT_DIR
 
     # output
-    os.makedirs(args.out_dir, exist_ok=True)
-    train_out = os.path.join(args.out_dir, "train")
-    test_out = os.path.join(args.out_dir, "test")
+    os.makedirs(out_dir, exist_ok=True)
+    train_out = os.path.join(out_dir, "train")
+    test_out = os.path.join(out_dir, "test")
     os.makedirs(train_out, exist_ok=True)
     os.makedirs(test_out, exist_ok=True)
 
     # official split
-    split_path = args.split_file.strip() if args.split_file.strip() else find_official_split_file(args.data_dir)
+    split_path = args.split_file.strip() if args.split_file.strip() else find_official_split_file(data_dir)
     split_map = load_official_split(split_path)
     print(f"[INFO] official split file: {split_path} (keys={len(split_map)})")
 
     # pairs
-    pairs = find_wav_txt_pairs(args.data_dir)
+    pairs = find_wav_txt_pairs(data_dir)
     if not pairs:
-        raise FileNotFoundError(f"在 {args.data_dir} 没找到 wav/txt 配对文件。")
+        raise FileNotFoundError(f"在 {data_dir} 没找到 wav/txt 配对文件。")
     print(f"[INFO] found wav/txt pairs: {len(pairs)}")
 
     # debug: check intersection quickly
@@ -379,10 +349,19 @@ def main():
     hit = sum([(n in split_map) or (Path(n).stem in split_map) for n in wav_names])
     print(f"[DEBUG] split match hits: {hit}/{len(wav_names)} (should be close to total)")
 
-    # load AST
-    print(f"[INFO] loading AST model: {args.ast_model}")
-    ast = ASTModel.from_pretrained(args.ast_model, local_files_only=args.local_files_only)
-    ast.eval().to(device)
+    # load AST only if saving tokens (debug)
+    ast = None
+    device = None
+    if args.save_tokens:
+        if args.device == "cuda" and not torch.cuda.is_available():
+            device = torch.device("cpu")
+            print("[WARN] cuda 不可用，自动切换到 cpu")
+        else:
+            device = torch.device(args.device)
+
+        print(f"[INFO] loading AST model (for debug tokens): {args.ast_model}")
+        ast = ASTModel.from_pretrained(args.ast_model, local_files_only=args.local_files_only)
+        ast.eval().to(device)
 
     train_rows: List[dict] = []
     test_rows: List[dict] = []
@@ -400,15 +379,16 @@ def main():
             skipped_no_split += 1
             continue
 
-        out_dir = train_out if tag == "train" else test_out
+        out_subdir = train_out if tag == "train" else test_out
 
-        rows = process_recording_to_tokens(
+        rows = process_recording_to_features(
             wav_path=wav_path,
             txt_path=txt_path,
-            out_dir=out_dir,
+            out_dir=out_subdir,
+            save_fbank=True,              # ✅ 始终保存 fbank（训练时在线投影）
+            save_tokens=args.save_tokens, # 可选调试
             ast_model=ast,
             device=device,
-            save_fbank=args.save_fbank,
         )
 
         if tag == "train":
@@ -420,8 +400,8 @@ def main():
     train_df = pd.DataFrame(train_rows)
     test_df = pd.DataFrame(test_rows)
 
-    train_csv = os.path.join(args.out_dir, "train_index.csv")
-    test_csv = os.path.join(args.out_dir, "test_index.csv")
+    train_csv = os.path.join(out_dir, "train_index.csv")
+    test_csv = os.path.join(out_dir, "test_index.csv")
     train_df.to_csv(train_csv, index=False)
     test_df.to_csv(test_csv, index=False)
 
@@ -436,11 +416,13 @@ def main():
     if len(train_df) > 0:
         print("\n[STATS] Train label counts:")
         print(train_df["label"].value_counts().sort_index())
-        print("[STATS] Example tokens shape:", train_df.iloc[0]["tokens_shape"])
+        print("[STATS] Example fbank shape:", train_df.iloc[0]["fbank_shape"])
+        print("[STATS] Example fbank path :", train_df.iloc[0]["fbank_path"])
     if len(test_df) > 0:
         print("\n[STATS] Test label counts:")
         print(test_df["label"].value_counts().sort_index())
-        print("[STATS] Example tokens shape:", test_df.iloc[0]["tokens_shape"])
+        print("[STATS] Example fbank shape:", test_df.iloc[0]["fbank_shape"])
+        print("[STATS] Example fbank path :", test_df.iloc[0]["fbank_path"])
 
 
 if __name__ == "__main__":
