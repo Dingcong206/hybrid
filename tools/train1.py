@@ -147,36 +147,44 @@ def evaluate_binary_argmax(backbone, classifier, loader, device):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--root", type=str, default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
-    parser.add_argument("--save_dir", type=str, default="/data/dingcong/hybrid/checkpoints_icbhi_binary_author_style")
+    # ============ 路径 & 基础设置 ============
+    parser.add_argument("--root", type=str,
+                        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
+    parser.add_argument("--save_dir", type=str,
+                        default="/data/dingcong/hybrid/checkpoints_icbhi_4cls_author_style")
+
+    # ============ 训练超参数（已帮你调好默认） ============
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--accum_steps", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=10)   # 10轮不提升早停
 
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--accum_steps", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-5)
-
-    # 早停：10轮不提升就停（你要求）
-    parser.add_argument("--patience", type=int, default=10)
-
-    # 保留 AMP（你要求继续用）
-    # 注意：你原先写法是 store_true default=True，等价于永远开启。
-    # 这里我仍保留相同行为：默认开启 AMP。
+    # ============ AMP ============
     parser.add_argument("--amp", action="store_true", default=True)
 
-    # SpecAugment
-    parser.add_argument("--specaug", action="store_true")
-    parser.add_argument("--max_mask_t", type=int, default=10)
-    parser.add_argument("--max_mask_f", type=int, default=4)
-    parser.add_argument("--num_masks", type=int, default=2)
+    # ============ 任务形式（关键：已按你要求默认开启） ============
+    parser.add_argument(
+        "--two_cls_eval",
+        action="store_true",
+        default=True,   # ✅ 默认：官方折算二分类 SP/SE/ICBHI
+        help="True=官方 normal vs abnormal 折算；False=严格四分类命中"
+    )
 
-    # class imbalance（可选，和作者 weighted_loss 思想一致）
-    parser.add_argument("--weighted_loss", action="store_true", default=False)
+    # ============ 类别不平衡（可选） ============
+    parser.add_argument(
+        "--weighted_loss",
+        action="store_true",
+        default=False,  # 你可以以后手动开
+        help="是否使用类别加权 CrossEntropy"
+    )
 
-    # 模型结构参数
+    # ============ 模型结构（你的 backbone） ============
     parser.add_argument("--in_dim", type=int, default=768)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--nhead", type=int, default=2)
+
 
     args = parser.parse_args()
 
