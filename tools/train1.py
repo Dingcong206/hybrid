@@ -309,10 +309,15 @@ def main():
     # =========================
     # Final evaluation (load best_model.pt -> eval on test once)
     # =========================
+    # =========================
+    # Final evaluation (load best_model.pt -> eval on test once)
+    # =========================
     best_path = os.path.join(args.save_dir, "best_model.pt")
     if os.path.isfile(best_path):
         print("\n🧪 Final Evaluation on Test (using best_model.pt)\n")
-        ckpt = torch.load(best_path, map_location=device)
+
+        # 🔥 关键修复：显式关闭 weights_only
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
 
         backbone.load_state_dict(ckpt["backbone"], strict=True)
         classifier.load_state_dict(ckpt["classifier"], strict=True)
@@ -322,11 +327,13 @@ def main():
         print(
             f"🔥 FINAL TEST RESULT | "
             f"ICBHI: {final_res['ICBHI']:.4f} | SE: {final_res['SE']:.2f} | SP: {final_res['SP']:.2f} | "
-            f"TP {final_res['TP']} TN {final_res['TN']} FP {final_res['FP']} FN {final_res['FN']}"
+            f"TP {final_res['TP']} TN {final_res['TN']} "
+            f"FP {final_res['FP']} FN {final_res['FN']}"
         )
     else:
         print(f"\n⚠️ best_model.pt not found at: {best_path}\n"
               f"    (可能原因：训练期间从未触发 improved 条件，所以没保存 best。)")
+
 
 if __name__ == "__main__":
     main()
