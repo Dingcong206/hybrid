@@ -125,27 +125,33 @@ class ICBHI_Pooling(nn.Module):
 
 
 # ============================================================
-# 5) Stage：1 Mamba + 1 Attention
+# 5) Stage：✅ 2 BiMamba + 1 Attention
 # ============================================================
-class Stage1M1A(nn.Module):
+class Stage2M1A(nn.Module):
+    """
+    一个 stage 内部结构：
+      BiMamba -> BiMamba -> Attention
+    """
     def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.mamba = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.m1 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.m2 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
         self.attn = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
 
     def forward(self, x, mask=None):
-        x = self.mamba(x)
+        x = self.m1(x)
+        x = self.m2(x)
         x = self.attn(x, mask=mask)
         return x
 
 
 # ============================================================
-# 6) NEW: fbank -> AST patch projection -> tokens
+# 6) fbank -> AST patch projection -> tokens
 # ============================================================
 class ASTPatchProjection(nn.Module):
     """
-    输入：fbank (B, 798, 128)  —— 你现在已经离线保存好的
-    输出：tokens (B, N, 768)  —— AST patch projection 的输出 tokens
+    输入：fbank (B, 798, 128)
+    输出：tokens (B, N, 768)
     """
     def __init__(
         self,
@@ -157,7 +163,6 @@ class ASTPatchProjection(nn.Module):
         from transformers import ASTModel
         ast = ASTModel.from_pretrained(ast_model_name, local_files_only=local_files_only)
 
-        # projection Conv2d
         self.proj = ast.embeddings.patch_embeddings.projection
 
         # 默认冻结整个 AST
@@ -170,29 +175,17 @@ class ASTPatchProjection(nn.Module):
                 p.requires_grad = True
 
     def forward(self, fbank: torch.Tensor) -> torch.Tensor:
-        """
-        fbank: (B,798,128) float32
-        AST projection expects: (B,1,128,798)
-        """
         fbank = fbank.float()
-
-        # (B,798,128) -> (B,128,798) -> (B,1,128,798)
-        x = fbank.transpose(1, 2).unsqueeze(1)
-
-        y = self.proj(x)  # (B,768,F',T')
-        tokens = y.flatten(2).transpose(1, 2)  # (B,N,768)
+        x = fbank.transpose(1, 2).unsqueeze(1)    # (B,1,128,798)
+        y = self.proj(x)                          # (B,768,F',T')
+        tokens = y.flatten(2).transpose(1, 2)     # (B,N,768)
         return tokens
 
 
 # ============================================================
-# 7) 主模型：fbank -> AST proj tokens -> 你的 SSA
+# 7) 主模型：fbank -> AST proj tokens -> SSA
 # ============================================================
 class SSA_Model_FbankToSSA(nn.Module):
-    """
-    输入：fbank (B,798,128)
-    内部：AST patch projection（可微调）-> tokens(B,N,768) -> SSA 主干
-    输出：logits (B,num_classes)
-    """
     def __init__(
         self,
         in_dim=768,
@@ -208,14 +201,12 @@ class SSA_Model_FbankToSSA(nn.Module):
     ):
         super().__init__()
 
-        # === AST projection 前端 ===
         self.ast_proj = ASTPatchProjection(
             ast_model_name=ast_model_name,
             local_files_only=local_files_only,
             unfreeze_projection=unfreeze_projection,
         )
 
-        # === 你的 SSA 主干 ===
         self.input_proj = nn.Sequential(
             _rmsnorm(in_dim),
             nn.Linear(in_dim, d_model),
@@ -234,8 +225,9 @@ class SSA_Model_FbankToSSA(nn.Module):
         )
         self.front_ln = _rmsnorm(d_model)
 
+        # ✅ 这里从 Stage1M1A 换成 Stage2M1A
         self.stages = nn.ModuleList([
-            Stage1M1A(d_model=d_model, nhead=nhead, dropout=dropout)
+            Stage2M1A(d_model=d_model, nhead=nhead, dropout=dropout)
             for _ in range(n_layers)
         ])
 
@@ -250,14 +242,11 @@ class SSA_Model_FbankToSSA(nn.Module):
         )
 
     def forward(self, fbank, mask=None, return_feature=False):
-        """
-        fbank: (B,798,128)
-        """
         # 1) fbank -> AST projection tokens
-        x = self.ast_proj(fbank)  # (B,N,768)
+        x = self.ast_proj(fbank)                  # (B,N,768)
 
         # 2) tokens -> SSA
-        x = self.input_proj(x)  # (B,N,d_model)
+        x = self.input_proj(x)                    # (B,N,d_model)
         Tt = x.shape[1]
         x = x + self.pe[:, :Tt, :].to(x.device)
         x = self.pos_drop(x)
@@ -278,7 +267,7 @@ class SSA_Model_FbankToSSA(nn.Module):
 
 
 # ============================================================
-# 8) Backbone 包装类（保持你原来 build_model 的返回风格）
+# 8) Backbone 包装类
 # ============================================================
 class SSA_Backbone(nn.Module):
     def __init__(self, ssa_model: SSA_Model_FbankToSSA):
@@ -292,7 +281,7 @@ class SSA_Backbone(nn.Module):
 
 
 # ============================================================
-# 9) build_model：返回 backbone（兼容你原来的导入）
+# 9) build_model：返回 backbone
 # ============================================================
 def build_model(
     d_model=512,
@@ -315,7 +304,7 @@ def build_model(
     )
     backbone = SSA_Backbone(ssa)
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->SSA (Mamba+Attn) x {n_layers}")
+    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->[2×BiMamba + 1×Attn]×{n_layers}")
     print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
 
