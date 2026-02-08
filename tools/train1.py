@@ -76,9 +76,6 @@ class TokenNPYBinaryDataset(Dataset):
         x = torch.from_numpy(np.load(row["tokens_path"])).float()  # (T, D)
         y = int(self.y[idx])
 
-        if self.is_train and self.args.specaug:
-            x = apply_spec_augment(x, self.args.max_mask_t, self.args.max_mask_f, self.args.num_masks)
-
         return x, torch.tensor(y, dtype=torch.long)
 
 
