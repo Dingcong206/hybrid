@@ -4,10 +4,11 @@
 import os
 import sys
 import random
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -87,10 +88,6 @@ class ICBHINpyDataset(Dataset):
 # 3) ICBHI 官方指标 + 混淆矩阵（折算后二分类）
 # ============================================================
 def icbhi_from_preds(preds, labels):
-    """
-    preds, labels: list of 0/1/2/3
-    返回: SE, SP, Score, (TN, FP, FN, TP)
-    """
     preds_bin = [0 if p == 0 else 1 for p in preds]
     labels_bin = [0 if l == 0 else 1 for l in labels]
 
@@ -100,7 +97,6 @@ def icbhi_from_preds(preds, labels):
     sp = 100.0 * tn / (tn + fp + 1e-10)
     se = 100.0 * tp / (tp + fn + 1e-10)
     score = (sp + se) / 2.0
-
     return se, sp, score, (tn, fp, fn, tp)
 
 
@@ -116,28 +112,41 @@ def evaluate(model, loader, device):
         all_preds.extend(preds)
         all_labels.extend(labels.numpy().tolist())
 
-    se, sp, score, cm = icbhi_from_preds(all_preds, all_labels)
-    return se, sp, score, cm
+    return icbhi_from_preds(all_preds, all_labels)
 
 
 # ============================================================
-# 4) 冻结 AST（包括 projection）
+# 4) projection 冻结/解冻
 # ============================================================
-def freeze_ast_all(model: nn.Module):
+def set_projection_trainable(model: nn.Module, trainable: bool):
     if hasattr(model, "ast_proj") and hasattr(model.ast_proj, "proj"):
         for p in model.ast_proj.proj.parameters():
-            p.requires_grad = False
+            p.requires_grad = trainable
 
 
 # ============================================================
-# 5) 主训练程序（冻结AST + 输出SE/SP/Score + 只保存最终最优一次）
+# 5) 手动 Cosine LR（让 proj lr = base_lr * PROJ_LR_MULT）
+# ============================================================
+def cosine_lr(epoch: int, total_epochs: int, base_lr: float):
+    # epoch 从 1 开始
+    if total_epochs <= 1:
+        return base_lr
+    t = (epoch - 1) / (total_epochs - 1)
+    return base_lr * 0.5 * (1.0 + np.cos(np.pi * t))
+
+
+# ============================================================
+# 6) 主训练程序（前10轮冻结，后面微调）
 # ============================================================
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     BATCH_SIZE = 16
-    LR = 1e-4
+    LR = 5e-5
     EPOCHS = 50
+
+    WARMUP_EPOCHS = 10           # ✅ 前10轮冻结
+    PROJ_LR_MULT = 0.03          # ✅ 解冻后 projection 用更小 lr
 
     TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
     TEST_CSV  = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
@@ -162,26 +171,15 @@ def main():
     )
     test_dataset = ICBHINpyDataset(TEST_CSV, is_train=False, spec_aug=False)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=True, drop_last=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=4, pin_memory=True)
 
-    print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+    print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
-    # model（冻结 AST 前端）
+    # model：这里要允许 projection 可训练（但我们会手动控制前10轮冻结）
     model = SSA_Model(
         d_model=512,
         n_layers=2,
@@ -189,10 +187,8 @@ def main():
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
-        unfreeze_projection=False,
+        unfreeze_projection=True,   # ✅ 先允许，之后用 set_projection_trainable 控制
     ).to(DEVICE)
-    freeze_ast_all(model)
-    print("[INFO] AST(projection) is FROZEN: True")
 
     # loss weights
     vc = train_dataset.df["label"].value_counts()
@@ -206,11 +202,21 @@ def main():
 
     print("[INFO] train class counts :", train_counts.tolist())
     print("[INFO] train class weights:", weights.tolist())
+    print(f"[INFO] warmup epochs (projection frozen): {WARMUP_EPOCHS}")
+    print(f"[INFO] projection lr mult (after warmup): {PROJ_LR_MULT}")
 
-    # optimizer：只优化 requires_grad=True 的参数
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=LR, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    # optimizer：两个 param group（proj / others）
+    proj_params = list(model.ast_proj.proj.parameters())
+    other_params = [p for n, p in model.named_parameters()
+                    if not n.startswith("ast_proj.proj") and p.requires_grad]
+
+    optimizer = optim.AdamW(
+        [
+            {"params": proj_params,  "lr": 0.0},   # warmup 期间先置 0（后面每轮会更新）
+            {"params": other_params, "lr": LR},
+        ],
+        weight_decay=1e-2
+    )
 
     # sanity check
     xb, _ = next(iter(train_loader))
@@ -225,10 +231,24 @@ def main():
     best_state_dict = None
 
     for epoch in range(1, EPOCHS + 1):
+        # ===== 冻结/解冻 projection =====
+        if epoch <= WARMUP_EPOCHS:
+            set_projection_trainable(model, False)
+            proj_status = "FROZEN"
+        else:
+            set_projection_trainable(model, True)
+            proj_status = "TRAINABLE"
+
+        # ===== 手动设置本轮 lr（cosine）=====
+        base_lr_now = float(cosine_lr(epoch, EPOCHS, LR))
+        optimizer.param_groups[1]["lr"] = base_lr_now                  # others
+        optimizer.param_groups[0]["lr"] = (0.0 if proj_status == "FROZEN"
+                                          else base_lr_now * PROJ_LR_MULT)  # proj
+
         model.train()
         train_loss = 0.0
 
-        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [AST=FROZEN]"):
+        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]"):
             fbanks = fbanks.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
 
@@ -237,23 +257,19 @@ def main():
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
-
             train_loss += loss.item()
 
-        scheduler.step()
-
-        # eval on test
         se, sp, sc, (tn, fp, fn, tp) = evaluate(model, test_loader, DEVICE)
 
-        # 每轮都输出 Score + SE + SP（你要求的）
         print(
             f"Epoch [{epoch:03d}] "
             f"Loss: {train_loss / max(1, len(train_loader)):.4f} | "
-            f"Score: {sc:.1f} | SE: {se:.1f} | SP: {sp:.1f} | AST=FROZEN"
+            f"Score: {sc:.1f} | SE: {se:.1f} | SP: {sp:.1f} | proj={proj_status} | "
+            f"lr={optimizer.param_groups[1]['lr']:.2e} proj_lr={optimizer.param_groups[0]['lr']:.2e}"
         )
         print(f"Confusion Matrix (binary, Normal vs Abnormal): TN={tn}, FP={fp}, FN={fn}, TP={tp}\n")
 
-        # 只更新“内存中的最佳”，不落盘
+        # 只更新“内存最优”，不落盘
         if sc > best_sc + 1e-7:
             best_sc = sc
             best_epoch = epoch
@@ -261,7 +277,7 @@ def main():
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             print(f">>> ⭐ New Best (in-memory) Score={best_sc:.1f} @ epoch {best_epoch} (NOT saved yet)")
 
-    # 训练结束后，只保存一次：最终最优
+    # 训练结束：只保存一次（最终最优）
     if best_state_dict is not None:
         se, sp, sc, tn, fp, fn, tp = best_metrics
         torch.save(
@@ -272,6 +288,9 @@ def main():
                 "best_se": float(se),
                 "best_sp": float(sp),
                 "best_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+                "warmup_epochs": int(WARMUP_EPOCHS),
+                "proj_lr_mult": float(PROJ_LR_MULT),
+                "base_lr": float(LR),
             },
             SAVE_PATH
         )
