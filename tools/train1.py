@@ -1,330 +1,316 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import sys
-import random
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
-# ============================================================
-# 0) 项目路径与导入
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from mymodels.model import SSA_Model
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    Mamba = None
 
 
 # ============================================================
-# 1) SpecAugment（对 fbank: T x F 遮挡）
+# 0) RMSNorm 兼容
 # ============================================================
-def apply_spec_augment(x, max_mask_t=40, max_mask_f=16, num_masks=2):
-    """
-    x: torch.Tensor (T, F)  这里是 fbank: (798,128)
-    """
-    T, F = x.shape
-    x_aug = x.clone()
+def _rmsnorm(dim: int):
+    if hasattr(nn, "RMSNorm"):
+        return nn.RMSNorm(dim)
+    else:
+        return CustomRMSNorm(dim)
 
-    for _ in range(num_masks):
-        t_width = random.randint(0, max_mask_t)
-        t_start = random.randint(0, max(0, T - t_width))
-        if t_width > 0:
-            x_aug[t_start:t_start + t_width, :] = 0
+class CustomRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-        f_width = random.randint(0, max_mask_f)
-        f_start = random.randint(0, max(0, F - f_width))
-        if f_width > 0:
-            x_aug[:, f_start:f_start + f_width] = 0
-
-    return x_aug
+    def forward(self, x):
+        norm_x = x.pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps)
+        return self.weight * x_normed
 
 
 # ============================================================
-# 2) Dataset：读取 (798,128) fbank.npy
+# 1) 位置编码
 # ============================================================
-class ICBHINpyDataset(Dataset):
-    def __init__(self, csv_path, is_train=False,
-                 spec_aug=True, max_mask_t=40, max_mask_f=16, num_masks=2):
-        self.df = pd.read_csv(csv_path).reset_index(drop=True)
-        self.is_train = is_train
-
-        self.spec_aug = spec_aug
-        self.max_mask_t = max_mask_t
-        self.max_mask_f = max_mask_f
-        self.num_masks = num_masks
-
-        labels = self.df["label"].astype(int).values
-        counts = np.bincount(labels, minlength=4)
-        print(f"[Dataset] {'Train' if is_train else 'Test'} | Samples: {len(self.df)} | "
-              f"Counts(0/1/2/3)={counts.tolist()}")
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, index):
-        row = self.df.iloc[index]
-        fbank = np.load(row["fbank_path"]).astype(np.float32)  # (798,128)
-        y = int(row["label"])                                  # 0/1/2/3
-        x = torch.from_numpy(fbank).float()
-
-        if self.is_train and self.spec_aug:
-            x = apply_spec_augment(
-                x,
-                max_mask_t=self.max_mask_t,
-                max_mask_f=self.max_mask_f,
-                num_masks=self.num_masks
-            )
-        return x, torch.tensor(y, dtype=torch.long)
-
-
-# ============================================================
-# 3) ICBHI 官方指标：Sp, Se, Sc
-# ============================================================
-def get_icbhi_scores(preds, labels):
-    hits = [0.0] * 4
-    counts = [0.0] * 4
-
-    for p, l in zip(preds, labels):
-        counts[l] += 1
-        if p == l:
-            hits[l] += 1
-
-    sp = (hits[0] / (counts[0] + 1e-10)) * 100.0
-    se_hits = sum(hits[1:])
-    se_counts = sum(counts[1:])
-    se = (se_hits / (se_counts + 1e-10)) * 100.0
-    sc = (sp + se) / 2.0
-    return sp, se, sc
-
-
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    all_preds, all_labels = [], []
-
-    for fbanks, labels in loader:
-        fbanks = fbanks.to(device, non_blocking=True)
-        logits = model(fbanks)  # (B,4)
-        preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
-        all_preds.extend(preds)
-        all_labels.extend(labels.numpy().tolist())
-
-    sp, se, sc = get_icbhi_scores(all_preds, all_labels)
-    return sp, se, sc
-
-
-# ============================================================
-# 4) 构建 projection 分组 optimizer（proj 小 lr）
-# ============================================================
-def build_optimizer_with_proj_groups(model: nn.Module, base_lr: float, proj_lr_mult: float = 0.1,
-                                     weight_decay: float = 1e-2):
-    """
-    将 AST projection 单独分组，使用更小 LR
-    """
-    # projection 参数
-    proj_params = list(model.ast_proj.proj.parameters())
-
-    # 其他可训练参数
-    other_params = []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        # 排除 projection
-        if n.startswith("ast_proj.proj"):
-            continue
-        other_params.append(p)
-
-    optimizer = optim.AdamW(
-        [
-            {"params": proj_params, "lr": base_lr * proj_lr_mult},
-            {"params": other_params, "lr": base_lr},
-        ],
-        weight_decay=weight_decay
+def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
+    pe = torch.zeros(seq_len, dim, device=device)
+    position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+        * (-torch.log(torch.tensor(10000.0, device=device)) / dim)
     )
-    return optimizer
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
 
 
 # ============================================================
-# 5) 主训练程序（proj warmup + 分组lr + grad检查）
+# 2) BiMambaBlock
 # ============================================================
-def main():
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class BiMambaBlock(nn.Module):
+    def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        if Mamba is None:
+            raise RuntimeError("请安装 mamba-ssm: pip install mamba-ssm causal-conv1d")
 
-    BATCH_SIZE = 8
-    LR = 1e-4
-    EPOCHS = 100
+        self.ln1 = _rmsnorm(d_model)
+        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.drop = nn.Dropout(dropout)
 
-    # ✅ warmup：前 N 个 epoch 冻结 projection
-    WARMUP_EPOCHS = 5
+        self.ln2 = _rmsnorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
 
-    # ✅ projection 的 lr = LR * 0.1
-    PROJ_LR_MULT = 0.1
+    def forward(self, x):
+        h = self.ln1(x)
+        h_f = self.fwd(h)
+        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
+        x = x + self.drop(h_f + h_b)
 
-    TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
-    TEST_CSV  = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
-    SAVE_PATH = "/data/dingcong/hybrid/best_official_score_model.pth"
+        x = x + self.mlp(self.ln2(x))
+        return x
 
-    SPEC_AUG = True
-    MAX_MASK_T = 40
-    MAX_MASK_F = 16
-    NUM_MASKS = 2
 
-    # seed
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if DEVICE.type == "cuda":
-        torch.cuda.manual_seed_all(42)
+# ============================================================
+# 3) AttentionBlock
+# ============================================================
+class AttentionBlock(nn.Module):
+    def __init__(self, d_model, nhead=8, dropout=0.3):
+        super().__init__()
+        self.ln = _rmsnorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.drop = nn.Dropout(dropout)
 
-    # data
-    train_dataset = ICBHINpyDataset(
-        TRAIN_CSV, is_train=True,
-        spec_aug=SPEC_AUG, max_mask_t=MAX_MASK_T, max_mask_f=MAX_MASK_F, num_masks=NUM_MASKS
-    )
-    test_dataset = ICBHINpyDataset(TEST_CSV, is_train=False, spec_aug=False)
+    def forward(self, x, mask=None):
+        x_n = self.ln(x)
+        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
+        return x + self.drop(x_a)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
 
-    print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
-    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+# ============================================================
+# 4) ICBHI Pooling (Attn + Mean)
+# ============================================================
+class ICBHI_Pooling(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.attn_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1)
+        )
 
-    # model
-    model = SSA_Model(
+    def forward(self, x, mask=None):
+        attn_scores = self.attn_net(x)  # (B,T,1)
+        if mask is not None:
+            neg_inf = torch.finfo(attn_scores.dtype).min
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), neg_inf)
+
+        attn_w = torch.softmax(attn_scores, dim=1)
+        feat_weighted = torch.sum(attn_w * x, dim=1)
+
+        if mask is not None:
+            x_valid = x.masked_fill(mask.unsqueeze(-1), 0.0)
+            denom = (~mask).sum(dim=1).clamp(min=1).unsqueeze(-1)
+            feat_mean = x_valid.sum(dim=1) / denom
+        else:
+            feat_mean = x.mean(dim=1)
+
+        return feat_weighted + feat_mean
+
+
+# ============================================================
+# 5) Stage：✅ 2 BiMamba + 1 Attention
+# ============================================================
+class Stage2M1A(nn.Module):
+    """
+    一个 stage 内部结构：
+      BiMamba -> BiMamba -> Attention
+    """
+    def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.m1 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.m2 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.attn = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
+
+    def forward(self, x, mask=None):
+        x = self.m1(x)
+        x = self.m2(x)
+        x = self.attn(x, mask=mask)
+        return x
+
+
+# ============================================================
+# 6) fbank -> AST patch projection -> tokens
+# ============================================================
+class ASTPatchProjection(nn.Module):
+    """
+    输入：fbank (B, 798, 128)
+    输出：tokens (B, N, 768)
+    """
+    def __init__(
+        self,
+        ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
+        local_files_only=False,
+        unfreeze_projection=True,
+    ):
+        super().__init__()
+        from transformers import ASTModel
+        ast = ASTModel.from_pretrained(ast_model_name, local_files_only=local_files_only)
+
+        self.proj = ast.embeddings.patch_embeddings.projection
+
+        # 默认冻结整个 AST
+        for p in ast.parameters():
+            p.requires_grad = False
+
+        # 只解冻 projection
+        if unfreeze_projection:
+            for p in self.proj.parameters():
+                p.requires_grad = True
+
+    def forward(self, fbank: torch.Tensor) -> torch.Tensor:
+        fbank = fbank.float()
+        x = fbank.transpose(1, 2).unsqueeze(1)    # (B,1,128,798)
+        y = self.proj(x)                          # (B,768,F',T')
+        tokens = y.flatten(2).transpose(1, 2)     # (B,N,768)
+        return tokens
+
+
+# ============================================================
+# 7) 主模型：fbank -> AST proj tokens -> SSA
+# ============================================================
+class SSA_Model_FbankToSSA(nn.Module):
+    def __init__(
+        self,
+        in_dim=768,
         d_model=512,
         n_layers=8,
         nhead=8,
-        num_classes=4,
+        dropout=0.3,
+        max_len=1024,
+        num_classes=1,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
-        unfreeze_projection=True,  # ✅ 允许训练 projection（但我们会 warmup 冻结）
-    ).to(DEVICE)
+        unfreeze_projection=True,
+    ):
+        super().__init__()
 
-    # loss weights from train set
-    train_counts = torch.tensor(
-        train_dataset.df["label"].value_counts().sort_index().values,
-        dtype=torch.float32
-    )
-    if train_counts.numel() < 4:
-        tmp = torch.zeros(4, dtype=torch.float32)
-        for k, v in train_dataset.df["label"].value_counts().items():
-            tmp[int(k)] = float(v)
-        train_counts = tmp
-
-    weights = (1.0 / (train_counts + 1e-6))
-    weights = weights / weights.sum() * 4.0
-    criterion = nn.CrossEntropyLoss(weight=weights.to(DEVICE))
-
-    print("[INFO] train class counts :", train_counts.tolist())
-    print("[INFO] train class weights:", weights.tolist())
-    print(f"[INFO] warmup epochs for projection: {WARMUP_EPOCHS}")
-    print(f"[INFO] projection lr mult: {PROJ_LR_MULT}")
-
-    # optimizer (group lr)
-    optimizer = build_optimizer_with_proj_groups(
-        model=model,
-        base_lr=LR,
-        proj_lr_mult=PROJ_LR_MULT,
-        weight_decay=1e-2
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-    # sanity check
-    xb, yb = next(iter(train_loader))
-    xb = xb.to(DEVICE)
-    with torch.no_grad():
-        out = model(xb)
-    print(f"[DEBUG] fbank batch: {xb.shape} -> logits: {out.shape} (expect Bx4)")
-
-    best_sc = -1.0
-    best_epoch = -1
-
-    # train loop
-    for epoch in range(1, EPOCHS + 1):
-        # ===== warmup freeze/unfreeze projection =====
-        if epoch <= WARMUP_EPOCHS:
-            for p in model.ast_proj.proj.parameters():
-                p.requires_grad = False
-            proj_status = "FROZEN"
-        else:
-            for p in model.ast_proj.proj.parameters():
-                p.requires_grad = True
-            proj_status = "TRAINABLE"
-
-        model.train()
-        train_loss = 0.0
-
-        # 只在本 epoch 第一个 batch 打印一次 projection grad
-        printed_proj_grad = False
-
-        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]"):
-            fbanks = fbanks.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(fbanks)
-            loss = criterion(logits, labels)
-            loss.backward()
-
-            # ===== grad check: 确认 projection 有梯度（在解冻后应非 None） =====
-            if (not printed_proj_grad):
-                wgrad = model.ast_proj.proj.weight.grad
-                ginfo = "None" if wgrad is None else f"{wgrad.abs().mean().item():.6e}"
-                print(f"\n[DEBUG] epoch={epoch} proj_status={proj_status} | proj.weight.grad_mean={ginfo}\n")
-                printed_proj_grad = True
-
-            optimizer.step()
-            train_loss += loss.item()
-
-        scheduler.step()
-
-        # eval on test
-        sp, se, sc = evaluate(model, test_loader, DEVICE)
-
-        print(
-            f"Epoch [{epoch:03d}] "
-            f"Loss: {train_loss / max(1, len(train_loader)):.4f} | "
-            f"Sp: {sp:.2f}% | Se: {se:.2f}% | Score: {sc:.2f}% | proj={proj_status}"
+        self.ast_proj = ASTPatchProjection(
+            ast_model_name=ast_model_name,
+            local_files_only=local_files_only,
+            unfreeze_projection=unfreeze_projection,
         )
 
-        # save best
-        if sc > best_sc + 1e-7:
-            best_sc = sc
-            best_epoch = epoch
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "best_sc": best_sc,
-                    "best_epoch": best_epoch,
-                },
-                SAVE_PATH
-            )
-            print(f">>> ⭐ New Best Sc={best_sc:.2f}% @ epoch {best_epoch} | saved to {SAVE_PATH}")
+        self.input_proj = nn.Sequential(
+            _rmsnorm(in_dim),
+            nn.Linear(in_dim, d_model),
+            nn.SiLU()
+        )
+        self.d_model = d_model
+        self.num_classes = num_classes
 
-    print(f"\n[DONE] Best official Score Sc: {best_sc:.2f}% @ epoch {best_epoch}")
-    print(f"[DONE] Best checkpoint: {SAVE_PATH}")
+        pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+        self.pos_drop = nn.Dropout(dropout)
+
+        self.front_conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=1, bias=False),
+            nn.SiLU(),
+        )
+        self.front_ln = _rmsnorm(d_model)
+
+        # ✅ 这里从 Stage1M1A 换成 Stage2M1A
+        self.stages = nn.ModuleList([
+            Stage2M1A(d_model=d_model, nhead=nhead, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.final_norm = _rmsnorm(d_model)
+        self.pool = ICBHI_Pooling(d_model)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes)
+        )
+
+    def forward(self, fbank, mask=None, return_feature=False):
+        # 1) fbank -> AST projection tokens
+        x = self.ast_proj(fbank)                  # (B,N,768)
+
+        # 2) tokens -> SSA
+        x = self.input_proj(x)                    # (B,N,d_model)
+        Tt = x.shape[1]
+        x = x + self.pe[:, :Tt, :].to(x.device)
+        x = self.pos_drop(x)
+
+        y = self.front_conv(x.transpose(1, 2)).transpose(1, 2)
+        x = x + self.front_ln(y)
+
+        for stage in self.stages:
+            x = stage(x, mask=mask)
+
+        x = self.final_norm(x)
+        file_feature = self.pool(x, mask=mask)
+
+        if return_feature:
+            return file_feature, x
+
+        return self.classifier(file_feature)
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# 8) Backbone 包装类
+# ============================================================
+class SSA_Backbone(nn.Module):
+    def __init__(self, ssa_model: SSA_Model_FbankToSSA):
+        super().__init__()
+        self.ssa = ssa_model
+        self.final_feat_dim = ssa_model.d_model
+
+    def forward(self, fbank, mask=None):
+        feat, _ = self.ssa(fbank, mask=mask, return_feature=True)
+        return feat
+
+
+# ============================================================
+# 9) build_model：返回 backbone
+# ============================================================
+def build_model(
+    d_model=512,
+    n_layers=8,
+    nhead=8,
+    num_classes=1,
+    ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
+    local_files_only=False,
+    unfreeze_projection=True,
+):
+    ssa = SSA_Model_FbankToSSA(
+        in_dim=768,
+        d_model=d_model,
+        n_layers=n_layers,
+        nhead=nhead,
+        num_classes=num_classes,
+        ast_model_name=ast_model_name,
+        local_files_only=local_files_only,
+        unfreeze_projection=unfreeze_projection,
+    )
+    backbone = SSA_Backbone(ssa)
+    params = sum(p.numel() for p in backbone.parameters())
+    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->[2×BiMamba + 1×Attn]×{n_layers}")
+    print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
+    return backbone
+
+
+# ============================================================
+# ✅ 兼容别名
+# ============================================================
+SSA_Model = SSA_Model_FbankToSSA
+build_backbone = build_model
