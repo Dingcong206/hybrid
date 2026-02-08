@@ -172,7 +172,7 @@ def main():
     parser.add_argument(
         "--weighted_loss",
         action="store_true",
-        default=False,  # 你可以以后手动开
+        default=Ture,  # 你可以以后手动开
         help="是否使用类别加权 CrossEntropy"
     )
 
