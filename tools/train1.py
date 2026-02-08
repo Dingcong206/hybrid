@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from mymodels.model import SSA_Model
 
+
 # ============================================================
 # 1) SpecAugment（对 fbank: T x F 遮挡）
 # ============================================================
@@ -42,6 +43,7 @@ def apply_spec_augment(x, max_mask_t=40, max_mask_f=16, num_masks=2):
             x_aug[:, f_start:f_start + f_width] = 0
 
     return x_aug
+
 
 # ============================================================
 # 2) Dataset：读取 (798,128) fbank.npy
@@ -80,6 +82,7 @@ class ICBHINpyDataset(Dataset):
             )
         return x, torch.tensor(y, dtype=torch.long)
 
+
 # ============================================================
 # 3) ICBHI 官方指标 + 混淆矩阵（折算后二分类）
 # ============================================================
@@ -88,7 +91,6 @@ def icbhi_from_preds(preds, labels):
     preds, labels: list of 0/1/2/3
     返回: SE, SP, Score, (TN, FP, FN, TP)
     """
-    # 先折算成二分类：0 -> 0, 1/2/3 -> 1
     preds_bin = [0 if p == 0 else 1 for p in preds]
     labels_bin = [0 if l == 0 else 1 for l in labels]
 
@@ -100,6 +102,7 @@ def icbhi_from_preds(preds, labels):
     score = (sp + se) / 2.0
 
     return se, sp, score, (tn, fp, fn, tp)
+
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -116,43 +119,25 @@ def evaluate(model, loader, device):
     se, sp, score, cm = icbhi_from_preds(all_preds, all_labels)
     return se, sp, score, cm
 
-# ============================================================
-# 4) 构建 projection 分组 optimizer（proj 小 lr）
-# ============================================================
-def build_optimizer_with_proj_groups(model: nn.Module, base_lr: float, proj_lr_mult: float = 0.1,
-                                     weight_decay: float = 1e-2):
-    proj_params = list(model.ast_proj.proj.parameters())
-
-    other_params = []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if n.startswith("ast_proj.proj"):
-            continue
-        other_params.append(p)
-
-    optimizer = optim.AdamW(
-        [
-            {"params": proj_params, "lr": base_lr * proj_lr_mult},
-            {"params": other_params, "lr": base_lr},
-        ],
-        weight_decay=weight_decay
-    )
-    return optimizer
 
 # ============================================================
-# 5) 主训练程序（proj warmup + 分组lr + grad检查 + CM打印）
+# 4) 冻结 AST（包括 projection）
+# ============================================================
+def freeze_ast_all(model: nn.Module):
+    if hasattr(model, "ast_proj") and hasattr(model.ast_proj, "proj"):
+        for p in model.ast_proj.proj.parameters():
+            p.requires_grad = False
+
+
+# ============================================================
+# 5) 主训练程序（冻结AST + 输出SE/SP/Score + 只保存最终最优一次）
 # ============================================================
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE =16
+    BATCH_SIZE = 16
     LR = 1e-4
     EPOCHS = 50
-
-    # warmup：前 N 个 epoch 冻结 projection
-    WARMUP_EPOCHS = 5
-    PROJ_LR_MULT = 0.1
 
     TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
     TEST_CSV  = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
@@ -196,7 +181,7 @@ def main():
     print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
 
-    # model
+    # model（冻结 AST 前端）
     model = SSA_Model(
         d_model=512,
         n_layers=2,
@@ -204,19 +189,16 @@ def main():
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
-        unfreeze_projection=True,
+        unfreeze_projection=False,
     ).to(DEVICE)
+    freeze_ast_all(model)
+    print("[INFO] AST(projection) is FROZEN: True")
 
     # loss weights
-    train_counts = torch.tensor(
-        train_dataset.df["label"].value_counts().sort_index().values,
-        dtype=torch.float32
-    )
-    if train_counts.numel() < 4:
-        tmp = torch.zeros(4, dtype=torch.float32)
-        for k, v in train_dataset.df["label"].value_counts().items():
-            tmp[int(k)] = float(v)
-        train_counts = tmp
+    vc = train_dataset.df["label"].value_counts()
+    train_counts = torch.zeros(4, dtype=torch.float32)
+    for k, v in vc.items():
+        train_counts[int(k)] = float(v)
 
     weights = (1.0 / (train_counts + 1e-6))
     weights = weights / weights.sum() * 4.0
@@ -224,20 +206,14 @@ def main():
 
     print("[INFO] train class counts :", train_counts.tolist())
     print("[INFO] train class weights:", weights.tolist())
-    print(f"[INFO] warmup epochs for projection: {WARMUP_EPOCHS}")
-    print(f"[INFO] projection lr mult: {PROJ_LR_MULT}")
 
-    # optimizer (group lr)
-    optimizer = build_optimizer_with_proj_groups(
-        model=model,
-        base_lr=LR,
-        proj_lr_mult=PROJ_LR_MULT,
-        weight_decay=1e-2
-    )
+    # optimizer：只优化 requires_grad=True 的参数
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=LR, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # sanity check
-    xb, yb = next(iter(train_loader))
+    xb, _ = next(iter(train_loader))
     xb = xb.to(DEVICE)
     with torch.no_grad():
         out = model(xb)
@@ -245,23 +221,14 @@ def main():
 
     best_sc = -1.0
     best_epoch = -1
+    best_metrics = None
+    best_state_dict = None
 
     for epoch in range(1, EPOCHS + 1):
-        # ===== warmup freeze/unfreeze projection =====
-        if epoch <= WARMUP_EPOCHS:
-            for p in model.ast_proj.proj.parameters():
-                p.requires_grad = False
-            proj_status = "FROZEN"
-        else:
-            for p in model.ast_proj.proj.parameters():
-                p.requires_grad = True
-            proj_status = "TRAINABLE"
-
         model.train()
         train_loss = 0.0
-        printed_proj_grad = False
 
-        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]"):
+        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [AST=FROZEN]"):
             fbanks = fbanks.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
 
@@ -269,15 +236,8 @@ def main():
             logits = model(fbanks)
             loss = criterion(logits, labels)
             loss.backward()
-
-            # grad check
-            if not printed_proj_grad:
-                wgrad = model.ast_proj.proj.weight.grad
-                ginfo = "None" if wgrad is None else f"{wgrad.abs().mean().item():.6e}"
-                print(f"\n[DEBUG] epoch={epoch} proj_status={proj_status} | proj.weight.grad_mean={ginfo}\n")
-                printed_proj_grad = True
-
             optimizer.step()
+
             train_loss += loss.item()
 
         scheduler.step()
@@ -285,29 +245,41 @@ def main():
         # eval on test
         se, sp, sc, (tn, fp, fn, tp) = evaluate(model, test_loader, DEVICE)
 
+        # 每轮都输出 Score + SE + SP（你要求的）
         print(
             f"Epoch [{epoch:03d}] "
             f"Loss: {train_loss / max(1, len(train_loader)):.4f} | "
-            f"SE: {se:.2f}% | SP: {sp:.2f}% | Score: {sc:.2f}% | proj={proj_status}"
+            f"Score: {sc:.1f} | SE: {se:.1f} | SP: {sp:.1f} | AST=FROZEN"
         )
         print(f"Confusion Matrix (binary, Normal vs Abnormal): TN={tn}, FP={fp}, FN={fn}, TP={tp}\n")
 
-        # save best
+        # 只更新“内存中的最佳”，不落盘
         if sc > best_sc + 1e-7:
             best_sc = sc
             best_epoch = epoch
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "best_sc": best_sc,
-                    "best_epoch": best_epoch,
-                },
-                SAVE_PATH
-            )
-            print(f">>> ⭐ New Best Sc={best_sc:.2f}% @ epoch {best_epoch} | saved to {SAVE_PATH}")
+            best_metrics = (se, sp, sc, tn, fp, fn, tp)
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            print(f">>> ⭐ New Best (in-memory) Score={best_sc:.1f} @ epoch {best_epoch} (NOT saved yet)")
 
-    print(f"\n[DONE] Best official Score Sc: {best_sc:.2f}% @ epoch {best_epoch}")
-    print(f"[DONE] Best checkpoint: {SAVE_PATH}")
+    # 训练结束后，只保存一次：最终最优
+    if best_state_dict is not None:
+        se, sp, sc, tn, fp, fn, tp = best_metrics
+        torch.save(
+            {
+                "model": best_state_dict,
+                "best_sc": float(best_sc),
+                "best_epoch": int(best_epoch),
+                "best_se": float(se),
+                "best_sp": float(sp),
+                "best_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+            },
+            SAVE_PATH
+        )
+        print(f"\n[DONE] Saved ONLY ONCE: best checkpoint -> {SAVE_PATH}")
+        print(f"[DONE] Best @ epoch {best_epoch}: Score={sc:.1f} | SE={se:.1f} | SP={sp:.1f} | TN={tn} FP={fp} FN={fn} TP={tp}")
+    else:
+        print("\n[WARN] best_state_dict is None (unexpected). No checkpoint saved.")
+
 
 if __name__ == "__main__":
     main()
