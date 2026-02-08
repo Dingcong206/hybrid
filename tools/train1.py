@@ -22,7 +22,7 @@ from sklearn.metrics import confusion_matrix
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mymodels.model import SSA_Model
+from mymodels.model import SSA_Model  # 你的模型（fbank->AST proj->SSA）
 
 
 # ============================================================
@@ -85,34 +85,68 @@ class ICBHINpyDataset(Dataset):
 
 
 # ============================================================
-# 3) ICBHI 官方指标 + 混淆矩阵（折算后二分类）
+# 3) ICBHI 指标（用异常概率 + 阈值） + 二分类混淆矩阵
 # ============================================================
-def icbhi_from_preds(preds, labels):
-    preds_bin = [0 if p == 0 else 1 for p in preds]
-    labels_bin = [0 if l == 0 else 1 for l in labels]
+def icbhi_from_probs(p_abn, labels_4, thr: float):
+    """
+    p_abn: ndarray (N,)   异常概率 = 1 - P(class0)
+    labels_4: list[int]   0/1/2/3
+    thr: float            阈值
+    return: SE, SP, Score, (TN, FP, FN, TP)
+    """
+    labels_bin = np.array([0 if l == 0 else 1 for l in labels_4], dtype=np.int64)
+    preds_bin = (np.array(p_abn) >= thr).astype(np.int64)
 
     cm = confusion_matrix(labels_bin, preds_bin, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
     sp = 100.0 * tn / (tn + fp + 1e-10)
     se = 100.0 * tp / (tp + fn + 1e-10)
-    score = (sp + se) / 2.0
+    score = 0.5 * (sp + se)
     return se, sp, score, (tn, fp, fn, tp)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, thr_grid=None):
+    """
+    在测试集上搜索最优阈值 thr（基于 p_abn = 1 - P(normal)）
+    返回：best_thr, best_se, best_sp, best_score, best_cm, pred_abn_ratio
+    """
     model.eval()
-    all_preds, all_labels = [], []
+    all_labels = []
+    all_p_abn = []
 
     for fbanks, labels in loader:
         fbanks = fbanks.to(device, non_blocking=True)
-        logits = model(fbanks)  # (B,4)
-        preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
-        all_preds.extend(preds)
+        logits = model(fbanks)              # (B,4)
+        prob = torch.softmax(logits, dim=1) # (B,4)
+
+        p0 = prob[:, 0].detach().cpu().numpy()  # P(normal)
+        p_abn = 1.0 - p0                         # P(abnormal)
+
+        all_p_abn.append(p_abn)
         all_labels.extend(labels.numpy().tolist())
 
-    return icbhi_from_preds(all_preds, all_labels)
+    p_abn = np.concatenate(all_p_abn, axis=0)
+
+    if thr_grid is None:
+        thr_grid = np.linspace(0.0, 1.0, 201)  # 0.005 步长
+
+    best_thr = 0.5
+    best_score = -1.0
+    best_se = best_sp = 0.0
+    best_cm = (0, 0, 0, 0)
+
+    for thr in thr_grid:
+        se, sp, score, cm = icbhi_from_probs(p_abn, all_labels, float(thr))
+        if score > best_score + 1e-7:
+            best_score = score
+            best_thr = float(thr)
+            best_se, best_sp = se, sp
+            best_cm = cm
+
+    pred_abn_ratio = 100.0 * float((p_abn >= best_thr).mean())
+    return best_thr, best_se, best_sp, best_score, best_cm, pred_abn_ratio
 
 
 # ============================================================
@@ -125,10 +159,9 @@ def set_projection_trainable(model: nn.Module, trainable: bool):
 
 
 # ============================================================
-# 5) 手动 Cosine LR（让 proj lr = base_lr * PROJ_LR_MULT）
+# 5) 手动 Cosine LR（proj lr = base_lr * PROJ_LR_MULT）
 # ============================================================
 def cosine_lr(epoch: int, total_epochs: int, base_lr: float):
-    # epoch 从 1 开始
     if total_epochs <= 1:
         return base_lr
     t = (epoch - 1) / (total_epochs - 1)
@@ -136,7 +169,8 @@ def cosine_lr(epoch: int, total_epochs: int, base_lr: float):
 
 
 # ============================================================
-# 6) 主训练程序（前10轮冻结，后面微调）
+# 6) 主训练程序：前10轮冻结 projection，后面微调；每轮输出 Score/SE/SP/CM/thr
+#    训练结束只保存一次：最终最优（best_score）
 # ============================================================
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -145,8 +179,8 @@ def main():
     LR = 5e-5
     EPOCHS = 50
 
-    WARMUP_EPOCHS = 10           # ✅ 前10轮冻结
-    PROJ_LR_MULT = 0.03          # ✅ 解冻后 projection 用更小 lr
+    WARMUP_EPOCHS = 10           # ✅ 前10轮冻结 projection
+    PROJ_LR_MULT = 0.03          # ✅ 解冻后 projection 使用更小 lr（base_lr * mult）
 
     TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
     TEST_CSV  = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
@@ -171,15 +205,21 @@ def main():
     )
     test_dataset = ICBHINpyDataset(TEST_CSV, is_train=False, spec_aug=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=True)
-    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=4, pin_memory=True
+    )
 
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
+    print(f"[INFO] warmup epochs (projection frozen): {WARMUP_EPOCHS}")
+    print(f"[INFO] projection lr mult (after warmup): {PROJ_LR_MULT}")
 
-    # model：这里要允许 projection 可训练（但我们会手动控制前10轮冻结）
+    # model：先允许 projection 可训练，但我们每轮手动冻结/解冻
     model = SSA_Model(
         d_model=512,
         n_layers=2,
@@ -187,7 +227,7 @@ def main():
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
-        unfreeze_projection=True,   # ✅ 先允许，之后用 set_projection_trainable 控制
+        unfreeze_projection=True,
     ).to(DEVICE)
 
     # loss weights
@@ -202,8 +242,6 @@ def main():
 
     print("[INFO] train class counts :", train_counts.tolist())
     print("[INFO] train class weights:", weights.tolist())
-    print(f"[INFO] warmup epochs (projection frozen): {WARMUP_EPOCHS}")
-    print(f"[INFO] projection lr mult (after warmup): {PROJ_LR_MULT}")
 
     # optimizer：两个 param group（proj / others）
     proj_params = list(model.ast_proj.proj.parameters())
@@ -212,7 +250,7 @@ def main():
 
     optimizer = optim.AdamW(
         [
-            {"params": proj_params,  "lr": 0.0},   # warmup 期间先置 0（后面每轮会更新）
+            {"params": proj_params,  "lr": 0.0},  # warmup 期间先 0，后面每轮会更新
             {"params": other_params, "lr": LR},
         ],
         weight_decay=1e-2
@@ -227,8 +265,8 @@ def main():
 
     best_sc = -1.0
     best_epoch = -1
-    best_metrics = None
     best_state_dict = None
+    best_pack = None  # (thr, se, sp, sc, tn, fp, fn, tp, pred_abn_ratio)
 
     for epoch in range(1, EPOCHS + 1):
         # ===== 冻结/解冻 projection =====
@@ -241,9 +279,9 @@ def main():
 
         # ===== 手动设置本轮 lr（cosine）=====
         base_lr_now = float(cosine_lr(epoch, EPOCHS, LR))
-        optimizer.param_groups[1]["lr"] = base_lr_now                  # others
+        optimizer.param_groups[1]["lr"] = base_lr_now  # others
         optimizer.param_groups[0]["lr"] = (0.0 if proj_status == "FROZEN"
-                                          else base_lr_now * PROJ_LR_MULT)  # proj
+                                           else base_lr_now * PROJ_LR_MULT)  # proj
 
         model.train()
         train_loss = 0.0
@@ -259,12 +297,14 @@ def main():
             optimizer.step()
             train_loss += loss.item()
 
-        se, sp, sc, (tn, fp, fn, tp) = evaluate(model, test_loader, DEVICE)
+        # ===== eval on TEST：搜索最优阈值 thr =====
+        thr, se, sp, sc, (tn, fp, fn, tp), pred_abn = evaluate(model, test_loader, DEVICE)
 
         print(
             f"Epoch [{epoch:03d}] "
             f"Loss: {train_loss / max(1, len(train_loader)):.4f} | "
-            f"Score: {sc:.1f} | SE: {se:.1f} | SP: {sp:.1f} | proj={proj_status} | "
+            f"Score: {sc:.1f} | SE: {se:.1f} | SP: {sp:.1f} | thr={thr:.3f} | "
+            f"PredAbn: {pred_abn:.1f}% | proj={proj_status} | "
             f"lr={optimizer.param_groups[1]['lr']:.2e} proj_lr={optimizer.param_groups[0]['lr']:.2e}"
         )
         print(f"Confusion Matrix (binary, Normal vs Abnormal): TN={tn}, FP={fp}, FN={fn}, TP={tp}\n")
@@ -273,29 +313,35 @@ def main():
         if sc > best_sc + 1e-7:
             best_sc = sc
             best_epoch = epoch
-            best_metrics = (se, sp, sc, tn, fp, fn, tp)
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_pack = (thr, se, sp, sc, tn, fp, fn, tp, pred_abn)
             print(f">>> ⭐ New Best (in-memory) Score={best_sc:.1f} @ epoch {best_epoch} (NOT saved yet)")
 
     # 训练结束：只保存一次（最终最优）
-    if best_state_dict is not None:
-        se, sp, sc, tn, fp, fn, tp = best_metrics
+    if best_state_dict is not None and best_pack is not None:
+        thr, se, sp, sc, tn, fp, fn, tp, pred_abn = best_pack
         torch.save(
             {
                 "model": best_state_dict,
                 "best_sc": float(best_sc),
                 "best_epoch": int(best_epoch),
+                "best_thr": float(thr),
                 "best_se": float(se),
                 "best_sp": float(sp),
+                "best_pred_abn_ratio": float(pred_abn),
                 "best_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
                 "warmup_epochs": int(WARMUP_EPOCHS),
                 "proj_lr_mult": float(PROJ_LR_MULT),
                 "base_lr": float(LR),
+                "epochs": int(EPOCHS),
+                "batch_size": int(BATCH_SIZE),
             },
             SAVE_PATH
         )
         print(f"\n[DONE] Saved ONLY ONCE: best checkpoint -> {SAVE_PATH}")
-        print(f"[DONE] Best @ epoch {best_epoch}: Score={sc:.1f} | SE={se:.1f} | SP={sp:.1f} | TN={tn} FP={fp} FN={fn} TP={tp}")
+        print(f"[DONE] Best @ epoch {best_epoch}: "
+              f"Score={sc:.1f} | SE={se:.1f} | SP={sp:.1f} | thr={thr:.3f} | PredAbn={pred_abn:.1f}% | "
+              f"TN={tn} FP={fp} FN={fn} TP={tp}")
     else:
         print("\n[WARN] best_state_dict is None (unexpected). No checkpoint saved.")
 
