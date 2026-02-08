@@ -285,7 +285,7 @@ class SSA_Backbone(nn.Module):
 # ============================================================
 def build_model(
     d_model=512,
-    n_layers=8,
+    n_layers=4,
     nhead=8,
     num_classes=1,
     ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
