@@ -72,7 +72,6 @@ class BiMambaBlock(nn.Module):
         h_f = self.fwd(h)
         h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h_f + h_b)
-
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -125,23 +124,31 @@ class ICBHI_Pooling(nn.Module):
 
 
 # ============================================================
-# 5) Stage：✅ 2 BiMamba + 1 Attention
+# 5) Stage：✅ 3 BiMamba + 1 Attention + 3 BiMamba
 # ============================================================
-class Stage2M1A(nn.Module):
+class Stage3M1A3M(nn.Module):
     """
     一个 stage 内部结构：
-      BiMamba -> BiMamba -> Attention
+      BiMamba -> BiMamba -> BiMamba -> Attention -> BiMamba -> BiMamba -> BiMamba
     """
     def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.m1 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.m2 = BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.pre = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(3)
+        ])
         self.attn = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
+        self.post = nn.ModuleList([
+            BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(3)
+        ])
 
     def forward(self, x, mask=None):
-        x = self.m1(x)
-        x = self.m2(x)
+        for blk in self.pre:
+            x = blk(x)
         x = self.attn(x, mask=mask)
+        for blk in self.post:
+            x = blk(x)
         return x
 
 
@@ -225,9 +232,9 @@ class SSA_Model_FbankToSSA(nn.Module):
         )
         self.front_ln = _rmsnorm(d_model)
 
-        # ✅ 这里从 Stage1M1A 换成 Stage2M1A
+        # ✅ 核心：换成 3M + A + 3M
         self.stages = nn.ModuleList([
-            Stage2M1A(d_model=d_model, nhead=nhead, dropout=dropout)
+            Stage3M1A3M(d_model=d_model, nhead=nhead, dropout=dropout)
             for _ in range(n_layers)
         ])
 
@@ -242,11 +249,9 @@ class SSA_Model_FbankToSSA(nn.Module):
         )
 
     def forward(self, fbank, mask=None, return_feature=False):
-        # 1) fbank -> AST projection tokens
         x = self.ast_proj(fbank)                  # (B,N,768)
-
-        # 2) tokens -> SSA
         x = self.input_proj(x)                    # (B,N,d_model)
+
         Tt = x.shape[1]
         x = x + self.pe[:, :Tt, :].to(x.device)
         x = self.pos_drop(x)
@@ -304,7 +309,7 @@ def build_model(
     )
     backbone = SSA_Backbone(ssa)
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->[2×BiMamba + 1×Attn]×{n_layers}")
+    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->[3×BiMamba + Attn + 3×BiMamba]×{n_layers}")
     print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
 
