@@ -146,7 +146,7 @@ def build_optimizer_with_proj_groups(model: nn.Module, base_lr: float, proj_lr_m
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 32
+    BATCH_SIZE =16
     LR = 1e-4
     EPOCHS = 50
 
@@ -199,7 +199,7 @@ def main():
     # model
     model = SSA_Model(
         d_model=512,
-        n_layers=4,
+        n_layers=2,
         nhead=8,
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
