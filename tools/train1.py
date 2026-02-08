@@ -1,343 +1,140 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-import sys
-import time
-import math
-import random
-import argparse
-from pathlib import Path
-from typing import Dict, Tuple, List
-
-import numpy as np
-import pandas as pd
-
 import torch
 import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import confusion_matrix
-
-# ============================================================
-# 0) 路径与模型导入
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-from mymodels import build_model
+from tqdm import tqdm
 
 
 # ============================================================
-# 1) SpecAugment（针对 T x D 的 T 和 D 维度遮挡）
+# 1. Dataset 类：读取你预处理生成的 npy 和 csv
 # ============================================================
-def apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2):
-    """
-    x: torch.Tensor (T, D)
-    """
-    T, D = x.shape
-    x_aug = x.clone()
-    for _ in range(num_masks):
-        # time mask
-        t_width = random.randint(0, max_mask_t)
-        t_start = random.randint(0, max(0, T - t_width))
-        if t_width > 0:
-            x_aug[t_start:t_start + t_width, :] = 0
-
-        # freq mask
-        f_width = random.randint(0, max_mask_f)
-        f_start = random.randint(0, max(0, D - f_width))
-        if f_width > 0:
-            x_aug[:, f_start:f_start + f_width] = 0
-    return x_aug
-
-
-# ============================================================
-# 2) Dataset：二分类逻辑 (0=Normal, 1=Abnormal)
-# ============================================================
-class TokenNPYBinaryDataset(Dataset):
-    def __init__(self, csv_path: str, is_train: bool = False, args=None):
-        self.df = pd.read_csv(csv_path).reset_index(drop=True)
-        self.is_train = is_train
-        self.args = args
-
-        # 原四分类 label (0/1/2/3)
-        self.y4 = self.df["label"].astype(int).values
-        # 二分类转换：Label > 0 统统视为 1 (Abnormal)
-        self.y = (self.y4 > 0).astype(np.int64)
-
-        self.class_counts = np.bincount(self.y, minlength=2)
-        print(f"[Dataset] {'Train' if is_train else 'Test'} | Samples: {len(self.df)} | "
-              f"Counts(Normal/Abnormal): {self.class_counts.tolist()}")
+class ICBHINpyDataset(Dataset):
+    def __init__(self, csv_path):
+        self.df = pd.read_csv(csv_path)
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        x = torch.from_numpy(np.load(row["tokens_path"])).float()  # (T, D)
-        y = int(self.y[idx])
+    def __getitem__(self, index):
+        row = self.df.iloc[index]
+        # 加载预处理好的 (798, 128) fbank
+        fbank = np.load(row['fbank_path'])
+        label = int(row['label'])
 
-        return x, torch.tensor(y, dtype=torch.long)
-
-
-def collate_pad(batch):
-    xs, ys = zip(*batch)
-    lens = [x.shape[0] for x in xs]
-    D = xs[0].shape[1]
-    T_max = max(lens)
-    B = len(xs)
-
-    x_pad = torch.zeros(B, T_max, D, dtype=torch.float32)
-    mask = torch.ones(B, T_max, dtype=torch.bool)  # True=padding, False=valid
-
-    for i, x in enumerate(xs):
-        T = x.shape[0]
-        x_pad[i, :T] = x
-        mask[i, :T] = False
-
-    return x_pad, mask, torch.stack(ys).view(-1)
+        # AST模型通常期望形状为 [798, 128]
+        # 如果你用的是 CNN 模型 (ResNet)，请使用:
+        # fbank = torch.from_numpy(fbank).transpose(0, 1).unsqueeze(0)
+        fbank = torch.from_numpy(fbank).float()
+        return fbank, label
 
 
 # ============================================================
-# 3) 评价指标：ICBHI Score（固定决策：argmax，不扫阈值）
+# 2. 核心评估函数：官方 Sp, Se, Sc 逻辑
 # ============================================================
-def icbhi_score_from_cm(tn, fp, fn, tp):
-    eps = 1e-10
-    sp = 100.0 * (tn / (tn + fp + eps))
-    se = 100.0 * (tp / (tp + fn + eps))
-    return sp, se, (sp + se) / 2.0
+def get_icbhi_scores(preds, labels):
+    # 0:Normal, 1:Crackle, 2:Wheeze, 3:Both
+    hits = [0.0] * 4
+    counts = [0.0] * 4
+    for p, l in zip(preds, labels):
+        counts[l] += 1
+        if p == l:
+            hits[l] += 1
 
-
-@torch.no_grad()
-def evaluate_binary_argmax(backbone, classifier, loader, device):
-    """
-    与作者思路对齐：
-    - 不扫阈值
-    - 二分类用 2-logit softmax + argmax 固定决策
-    """
-    backbone.eval()
-    classifier.eval()
-
-    preds, trues = [], []
-    for x, mask, y in loader:
-        x, mask, y = x.to(device), mask.to(device), y.to(device)
-
-        feat = backbone(x, mask=mask)
-        logits = classifier(feat)              # (B,2)
-        pred = torch.argmax(logits, dim=1)     # (B,)
-
-        preds.append(pred.cpu())
-        trues.append(y.cpu())
-
-    pred = torch.cat(preds).numpy().astype(np.int64)
-    t = torch.cat(trues).numpy().astype(np.int64)
-
-    cm = confusion_matrix(t, pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-
-    sp, se, score = icbhi_score_from_cm(tn, fp, fn, tp)
-    return {"ICBHI": score, "SP": sp, "SE": se, "TP": tp, "TN": tn, "FP": fp, "FN": fn}
+    # Specificity (正常类的召回率)
+    sp = (hits[0] / (counts[0] + 1e-10)) * 100
+    # Sensitivity (异常类 1,2,3 的总召回率)
+    se_hits = sum(hits[1:])
+    se_counts = sum(counts[1:])
+    se = (se_hits / (se_counts + 1e-10)) * 100
+    # 最终官方得分
+    sc = (sp + se) / 2.0
+    return sp, se, sc
 
 
 # ============================================================
-# 4) 主训练程序（对齐作者范式 + early stop）
+# 3. 训练主程序
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser()
+    # --- 配置参数 ---
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    BATCH_SIZE = 32
+    LR = 1e-4
+    EPOCHS = 100
 
-    # ============ 路径 & 基础设置 ============
-    parser.add_argument("--root", type=str,
-                        default="/data/dingcong/hybrid/icbhi_official_ast_patch_tokens")
-    parser.add_argument("--save_dir", type=str,
-                        default="/data/dingcong/hybrid/checkpoints_icbhi_4cls_author_style")
+    TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
+    TEST_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
+    SAVE_PATH = "best_official_score_model.pth"
 
-    # ============ 训练超参数（已帮你调好默认） ============
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--accum_steps", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=10)   # 10轮不提升早停
+    # --- 数据加载 ---
+    train_dataset = ICBHINpyDataset(TRAIN_CSV)
+    test_dataset = ICBHINpyDataset(TEST_CSV)
 
-    # ============ AMP ============
-    parser.add_argument("--amp", action="store_true", default=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # ============ 任务形式（关键：已按你要求默认开启） ============
-    parser.add_argument(
-        "--two_cls_eval",
-        action="store_true",
-        default=True,   # ✅ 默认：官方折算二分类 SP/SE/ICBHI
-        help="True=官方 normal vs abnormal 折算；False=严格四分类命中"
-    )
+    # --- 模型初始化 ---
+    # 这里请替换为你自己的模型定义，例如 AST 或 ResNet
+    # 示例: model = YourModel(num_classes=4).to(DEVICE)
+    # model = ASTModel.from_pretrained(...)
+    # model.to(DEVICE)
+    print(f"[INFO] 训练集样本数: {len(train_dataset)}, 测试集样本数: {len(test_dataset)}")
 
-    # ============ 类别不平衡（可选） ============
-    parser.add_argument(
-        "--weighted_loss",
-        action="store_true",
-        default=tuple,  # 你可以以后手动开
-        help="是否使用类别加权 CrossEntropy"
-    )
+    # --- 关键：类别加权损失函数 ---
+    # 根据你提供的统计结果：0(2063), 1(1215), 2(501), 3(363)
+    # 使用倒数加权来平衡不均衡的数据集
+    counts = torch.tensor([2063, 1215, 501, 363], dtype=torch.float)
+    weights = (1.0 / counts) / (1.0 / counts).sum()
+    criterion = nn.CrossEntropyLoss(weight=weights.to(DEVICE))
 
-    # ============ 模型结构（你的 backbone） ============
-    parser.add_argument("--in_dim", type=int, default=768)
-    parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--n_layers", type=int, default=2)
-    parser.add_argument("--nhead", type=int, default=2)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
+    best_sc = 0.0
 
-    args = parser.parse_args()
+    # --- 训练循环 ---
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0.0
+        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}"):
+            fbanks, labels = fbanks.to(DEVICE), labels.to(DEVICE)
 
-    # seed
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+            optimizer.zero_grad()
+            outputs = model(fbanks)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.save_dir, exist_ok=True)
+            train_loss += loss.item()
 
-    # ===== Data =====
-    train_ds = TokenNPYBinaryDataset(os.path.join(args.root, "train_index.csv"), is_train=True, args=args)
-    test_ds  = TokenNPYBinaryDataset(os.path.join(args.root, "test_index.csv"),  is_train=False, args=args)
+        scheduler.step()
 
-    dl_train = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          collate_fn=collate_pad, drop_last=True)
-    dl_test  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                          collate_fn=collate_pad)
+        # --- 测试集评估 ---
+        model.eval()
+        all_preds = []
+        all_labels = []
+        with torch.no_grad():
+            for fbanks, labels in test_loader:
+                fbanks = fbanks.to(DEVICE)
+                outputs = model(fbanks)
+                preds = torch.argmax(outputs, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.numpy())
 
-    # ===== Model =====
-    backbone = build_model(
-        in_dim=args.in_dim,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        nhead=args.nhead
-    ).to(device)
-
-    # 方案1：2类输出 + CrossEntropy（对齐作者 argmax）
-    classifier = nn.Linear(backbone.final_feat_dim, 2).to(device)
-
-    # ===== Loss =====
-    if args.weighted_loss:
-        n0, n1 = train_ds.class_counts
-        # 频次反比，类似作者 weighted_loss
-        w0 = (n0 + n1) / (2.0 * max(n0, 1))
-        w1 = (n0 + n1) / (2.0 * max(n1, 1))
-        class_w = torch.tensor([w0, w1], device=device, dtype=torch.float32)
-        loss_fn = nn.CrossEntropyLoss(weight=class_w)
-        print(f"[INFO] weighted_loss ON | class_weight = {class_w.detach().cpu().tolist()}")
-    else:
-        loss_fn = nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.AdamW(
-        list(backbone.parameters()) + list(classifier.parameters()),
-        lr=args.lr,
-        weight_decay=1e-2
-    )
-
-    # scheduler：你原来是 cosine on steps，这里保留同风格
-    total_steps = max(1, args.epochs * (len(dl_train) // max(1, args.accum_steps)))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-
-    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
-
-    # ===== Early stop tracking =====
-    best_score = -1.0
-    best_epoch = -1
-    bad_count = 0
-
-    print("\n🚀 Start Training (Author-aligned): Train -> Evaluate on Official Test each epoch (no thr-scan)\n")
-
-    for epoch in range(1, args.epochs + 1):
-        backbone.train()
-        classifier.train()
-
-        optimizer.zero_grad()
-        train_loss_sum = 0.0
-        step_count = 0
-
-        for i, (x, mask, y) in enumerate(dl_train):
-            x, mask, y = x.to(device), mask.to(device), y.to(device)  # y long
-
-            with torch.autocast(device_type="cuda", enabled=args.amp):
-                feat = backbone(x, mask=mask)
-                logits = classifier(feat)                 # (B,2)
-                loss = loss_fn(logits, y) / args.accum_steps
-
-            scaler.scale(loss).backward()
-            train_loss_sum += loss.item() * args.accum_steps
-
-            if (i + 1) % args.accum_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                scheduler.step()
-                step_count += 1
-
-        # ===== Evaluate on official test (author style) =====
-        res = evaluate_binary_argmax(backbone, classifier, dl_test, device)
-        score = res["ICBHI"]
-
-        # 对齐作者：score提升且se>5才认为有效（防止全判normal等极端情况）
-        improved = (score > best_score + 1e-7) and (res["SE"] > 5.0)
-
-        if improved:
-            best_score = score
-            best_epoch = epoch
-            bad_count = 0
-
-            torch.save(
-                {
-                    "backbone": backbone.state_dict(),
-                    "classifier": classifier.state_dict(),
-                    "best_epoch": best_epoch,
-                    "best_score": best_score,
-                },
-                os.path.join(args.save_dir, "best_model.pt")
-            )
-            status = "⭐"
-        else:
-            bad_count += 1
-            status = " "
-
-        avg_train_loss = train_loss_sum / max(1, len(dl_train))
-        print(
-            f"{status} Epoch {epoch:03d} | Loss: {avg_train_loss:.4f} | "
-            f"Test ICBHI: {score:.4f} (SE: {res['SE']:.2f}, SP: {res['SP']:.2f}) | "
-            f"TP {res['TP']} TN {res['TN']} FP {res['FP']} FN {res['FN']} | "
-            f"bad_count={bad_count}/{args.patience}"
-        )
-
-        if bad_count >= args.patience:
-            print(f"\n⛔ Early stop at epoch {epoch}. Best Score: {best_score:.4f} @ epoch {best_epoch}")
-            break
-
-    print(f"\n✅ Done. Best Score: {best_score:.4f} @ epoch {best_epoch}")
-    print(f"📌 Best checkpoint saved to: {os.path.join(args.save_dir, 'best_model.pt')}\n")
-
-    # =========================
-    # Final evaluation (load best_model.pt -> eval on test once)
-    # =========================
-    # =========================
-    # Final evaluation (load best_model.pt -> eval on test once)
-    # =========================
-    best_path = os.path.join(args.save_dir, "best_model.pt")
-    if os.path.isfile(best_path):
-        print("\n🧪 Final Evaluation on Test (using best_model.pt)\n")
-
-        # 🔥 关键修复：显式关闭 weights_only
-        ckpt = torch.load(best_path, map_location=device, weights_only=False)
-
-        backbone.load_state_dict(ckpt["backbone"], strict=True)
-        classifier.load_state_dict(ckpt["classifier"], strict=True)
-
-        final_res = evaluate_binary_argmax(backbone, classifier, dl_test, device)
+        sp, se, sc = get_icbhi_scores(all_preds, all_labels)
 
         print(
-            f"🔥 FINAL TEST RESULT | "
-            f"ICBHI: {final_res['ICBHI']:.4f} | SE: {final_res['SE']:.2f} | SP: {final_res['SP']:.2f} | "
-            f"TP {final_res['TP']} TN {final_res['TN']} "
-            f"FP {final_res['FP']} FN {final_res['FN']}"
-        )
-    else:
-        print(f"\n⚠️ best_model.pt not found at: {best_path}\n"
-              f"    (可能原因：训练期间从未触发 improved 条件，所以没保存 best。)")
+            f"Epoch [{epoch + 1}] Loss: {train_loss / len(train_loader):.4f} | Sp: {sp:.2f}% | Se: {se:.2f}% | Score: {sc:.2f}%")
+
+        # --- 核心：按官方 Score 保存模型 ---
+        if sc > best_sc:
+            best_sc = sc
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f">>> 发现更高分: {sc:.2f}%, 模型已保存至 {SAVE_PATH}")
+
+    print(f"\n[DONE] 训练完成，最佳官方分 Sc: {best_sc:.2f}%")
 
 
 if __name__ == "__main__":

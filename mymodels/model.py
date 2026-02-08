@@ -1,16 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 
 try:
     from mamba_ssm import Mamba
 except ImportError:
     Mamba = None
 
-# =========================
-# 0) 基础组件：RMSNorm 兼容性
-# =========================
+
+# ============================================================
+# 0) RMSNorm 兼容
+# ============================================================
 def _rmsnorm(dim: int):
     if hasattr(nn, "RMSNorm"):
         return nn.RMSNorm(dim)
@@ -22,14 +22,16 @@ class CustomRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+
     def forward(self, x):
         norm_x = x.pow(2).mean(-1, keepdim=True)
         x_normed = x * torch.rsqrt(norm_x + self.eps)
         return self.weight * x_normed
 
-# =========================
+
+# ============================================================
 # 1) 位置编码
-# =========================
+# ============================================================
 def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
     pe = torch.zeros(seq_len, dim, device=device)
     position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
@@ -41,14 +43,15 @@ def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
 
-# =========================
-# 2) BiMambaBlock (1层双向扫描)
-# =========================
+
+# ============================================================
+# 2) BiMambaBlock
+# ============================================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
         super().__init__()
         if Mamba is None:
-            raise RuntimeError("请安装 mamba-ssm")
+            raise RuntimeError("请安装 mamba-ssm: pip install mamba-ssm causal-conv1d")
 
         self.ln1 = _rmsnorm(d_model)
         self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -65,18 +68,18 @@ class BiMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        # 时序扫描分支
         h = self.ln1(x)
         h_f = self.fwd(h)
         h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
         x = x + self.drop(h_f + h_b)
-        # 局部表征分支
+
         x = x + self.mlp(self.ln2(x))
         return x
 
-# =========================
+
+# ============================================================
 # 3) AttentionBlock
-# =========================
+# ============================================================
 class AttentionBlock(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3):
         super().__init__()
@@ -89,9 +92,10 @@ class AttentionBlock(nn.Module):
         x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
         return x + self.drop(x_a)
 
-# =========================
+
+# ============================================================
 # 4) ICBHI Pooling (Attn + Mean)
-# =========================
+# ============================================================
 class ICBHI_Pooling(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -102,7 +106,7 @@ class ICBHI_Pooling(nn.Module):
         )
 
     def forward(self, x, mask=None):
-        attn_scores = self.attn_net(x)
+        attn_scores = self.attn_net(x)  # (B,T,1)
         if mask is not None:
             neg_inf = torch.finfo(attn_scores.dtype).min
             attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), neg_inf)
@@ -119,9 +123,10 @@ class ICBHI_Pooling(nn.Module):
 
         return feat_weighted + feat_mean
 
-# =========================
+
+# ============================================================
 # 5) Stage：1 Mamba + 1 Attention
-# =========================
+# ============================================================
 class Stage1M1A(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -133,34 +138,102 @@ class Stage1M1A(nn.Module):
         x = self.attn(x, mask=mask)
         return x
 
-# =========================
-# 6) 主模型 SSA-Net (1:1 交替版)
-# =========================
-class SSA_Model_HeARTokens(nn.Module):
-    def __init__(self, in_dim=768, d_model=512, n_layers=8, nhead=8, dropout=0.3, max_len=1024, num_classes=1):
+
+# ============================================================
+# 6) NEW: fbank -> AST patch projection -> tokens
+# ============================================================
+class ASTPatchProjection(nn.Module):
+    """
+    输入：fbank (B, 798, 128)  —— 你现在已经离线保存好的
+    输出：tokens (B, N, 768)  —— AST patch projection 的输出 tokens
+    """
+    def __init__(
+        self,
+        ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
+        local_files_only=False,
+        unfreeze_projection=True,
+    ):
         super().__init__()
-        # 输入映射
+        from transformers import ASTModel
+        ast = ASTModel.from_pretrained(ast_model_name, local_files_only=local_files_only)
+
+        # projection Conv2d
+        self.proj = ast.embeddings.patch_embeddings.projection
+
+        # 默认冻结整个 AST
+        for p in ast.parameters():
+            p.requires_grad = False
+
+        # 只解冻 projection
+        if unfreeze_projection:
+            for p in self.proj.parameters():
+                p.requires_grad = True
+
+    def forward(self, fbank: torch.Tensor) -> torch.Tensor:
+        """
+        fbank: (B,798,128) float32
+        AST projection expects: (B,1,128,798)
+        """
+        fbank = fbank.float()
+
+        # (B,798,128) -> (B,128,798) -> (B,1,128,798)
+        x = fbank.transpose(1, 2).unsqueeze(1)
+
+        y = self.proj(x)  # (B,768,F',T')
+        tokens = y.flatten(2).transpose(1, 2)  # (B,N,768)
+        return tokens
+
+
+# ============================================================
+# 7) 主模型：fbank -> AST proj tokens -> 你的 SSA
+# ============================================================
+class SSA_Model_FbankToSSA(nn.Module):
+    """
+    输入：fbank (B,798,128)
+    内部：AST patch projection（可微调）-> tokens(B,N,768) -> SSA 主干
+    输出：logits (B,num_classes)
+    """
+    def __init__(
+        self,
+        in_dim=768,
+        d_model=512,
+        n_layers=8,
+        nhead=8,
+        dropout=0.3,
+        max_len=1024,
+        num_classes=1,
+        ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
+        local_files_only=False,
+        unfreeze_projection=True,
+    ):
+        super().__init__()
+
+        # === AST projection 前端 ===
+        self.ast_proj = ASTPatchProjection(
+            ast_model_name=ast_model_name,
+            local_files_only=local_files_only,
+            unfreeze_projection=unfreeze_projection,
+        )
+
+        # === 你的 SSA 主干 ===
         self.input_proj = nn.Sequential(
             _rmsnorm(in_dim),
             nn.Linear(in_dim, d_model),
             nn.SiLU()
         )
         self.d_model = d_model
-
         self.num_classes = num_classes
-        # 位置编码
+
         pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         self.pos_drop = nn.Dropout(dropout)
 
-        # 初始卷积增强
         self.front_conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=1, bias=False),
             nn.SiLU(),
         )
         self.front_ln = _rmsnorm(d_model)
 
-        # 核心 Stages: 1 Mamba + 1 Attention 交替
         self.stages = nn.ModuleList([
             Stage1M1A(d_model=d_model, nhead=nhead, dropout=dropout)
             for _ in range(n_layers)
@@ -169,7 +242,6 @@ class SSA_Model_HeARTokens(nn.Module):
         self.final_norm = _rmsnorm(d_model)
         self.pool = ICBHI_Pooling(d_model)
 
-        # 分类头 (二分类默认输出 1 维进行 sigmoid)
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
@@ -177,18 +249,22 @@ class SSA_Model_HeARTokens(nn.Module):
             nn.Linear(d_model // 2, num_classes)
         )
 
-    def forward(self, x, mask=None, return_feature=False):
-        # B x T x In_Dim -> B x T x D_model
-        x = self.input_proj(x)
-        T = x.shape[1]
-        x = x + self.pe[:, :T, :].to(x.device)
+    def forward(self, fbank, mask=None, return_feature=False):
+        """
+        fbank: (B,798,128)
+        """
+        # 1) fbank -> AST projection tokens
+        x = self.ast_proj(fbank)  # (B,N,768)
+
+        # 2) tokens -> SSA
+        x = self.input_proj(x)  # (B,N,d_model)
+        Tt = x.shape[1]
+        x = x + self.pe[:, :Tt, :].to(x.device)
         x = self.pos_drop(x)
 
-        # 卷积提取局部纹理
         y = self.front_conv(x.transpose(1, 2)).transpose(1, 2)
         x = x + self.front_ln(y)
 
-        # 8层交替迭代
         for stage in self.stages:
             x = stage(x, mask=mask)
 
@@ -200,28 +276,52 @@ class SSA_Model_HeARTokens(nn.Module):
 
         return self.classifier(file_feature)
 
-# =========================
-# 7) Backbone 包装类
-# =========================
+
+# ============================================================
+# 8) Backbone 包装类（保持你原来 build_model 的返回风格）
+# ============================================================
 class SSA_Backbone(nn.Module):
-    def __init__(self, ssa_model: SSA_Model_HeARTokens):
+    def __init__(self, ssa_model: SSA_Model_FbankToSSA):
         super().__init__()
         self.ssa = ssa_model
         self.final_feat_dim = ssa_model.d_model
 
-    def forward(self, x, mask=None):
-        feat, _ = self.ssa(x, mask=mask, return_feature=True)
+    def forward(self, fbank, mask=None):
+        feat, _ = self.ssa(fbank, mask=mask, return_feature=True)
         return feat
 
-def build_model(in_dim=768, d_model=512, n_layers=4, nhead=8, num_classes=1):
-    ssa = SSA_Model_HeARTokens(in_dim=in_dim, d_model=d_model, n_layers=n_layers, nhead=nhead, num_classes=num_classes)
+
+# ============================================================
+# 9) build_model：返回 backbone（兼容你原来的导入）
+# ============================================================
+def build_model(
+    d_model=512,
+    n_layers=8,
+    nhead=8,
+    num_classes=1,
+    ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
+    local_files_only=False,
+    unfreeze_projection=True,
+):
+    ssa = SSA_Model_FbankToSSA(
+        in_dim=768,
+        d_model=d_model,
+        n_layers=n_layers,
+        nhead=nhead,
+        num_classes=num_classes,
+        ast_model_name=ast_model_name,
+        local_files_only=local_files_only,
+        unfreeze_projection=unfreeze_projection,
+    )
     backbone = SSA_Backbone(ssa)
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"Structure: RMSNorm + 1:1 Mamba-Attn Stage x {n_layers}")
+    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->SSA (Mamba+Attn) x {n_layers}")
     print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
+
+
 # ============================================================
-# ✅ 模仿旧版：添加别名，确保兼容 __init__.py 的导入
+# ✅ 兼容别名
 # ============================================================
-SSA_Model = SSA_Model_HeARTokens  # 让旧代码能找到 SSA_Model
-build_backbone = build_model      # 如果旧版用到了这个名字
+SSA_Model = SSA_Model_FbankToSSA
+build_backbone = build_model
