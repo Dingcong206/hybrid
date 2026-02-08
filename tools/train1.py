@@ -8,23 +8,23 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+
+# ============================================================
+# 0) 项目路径与导入
+# ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mymodels import build_model
-
-# ============================================================
-# 0) 导入你的模型（model.py 里已提供 SSA_Model）
-# ============================================================
 from mymodels.model import SSA_Model
 
 
 # ============================================================
-# 1) 可选：SpecAugment（对 fbank: T x F 遮挡）
+# 1) SpecAugment（对 fbank: T x F 遮挡）
 # ============================================================
 def apply_spec_augment(x, max_mask_t=40, max_mask_f=16, num_masks=2):
     """
@@ -34,13 +34,11 @@ def apply_spec_augment(x, max_mask_t=40, max_mask_f=16, num_masks=2):
     x_aug = x.clone()
 
     for _ in range(num_masks):
-        # time mask
         t_width = random.randint(0, max_mask_t)
         t_start = random.randint(0, max(0, T - t_width))
         if t_width > 0:
             x_aug[t_start:t_start + t_width, :] = 0
 
-        # freq mask
         f_width = random.randint(0, max_mask_f)
         f_start = random.randint(0, max(0, F - f_width))
         if f_width > 0:
@@ -50,7 +48,7 @@ def apply_spec_augment(x, max_mask_t=40, max_mask_f=16, num_masks=2):
 
 
 # ============================================================
-# 2) Dataset：读取你预处理好的 (798,128) fbank.npy
+# 2) Dataset：读取 (798,128) fbank.npy
 # ============================================================
 class ICBHINpyDataset(Dataset):
     def __init__(self, csv_path, is_train=False,
@@ -63,7 +61,6 @@ class ICBHINpyDataset(Dataset):
         self.max_mask_f = max_mask_f
         self.num_masks = num_masks
 
-        # 打印 class counts（四分类）
         labels = self.df["label"].astype(int).values
         counts = np.bincount(labels, minlength=4)
         print(f"[Dataset] {'Train' if is_train else 'Test'} | Samples: {len(self.df)} | "
@@ -74,13 +71,10 @@ class ICBHINpyDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.df.iloc[index]
-
         fbank = np.load(row["fbank_path"]).astype(np.float32)  # (798,128)
         y = int(row["label"])                                  # 0/1/2/3
+        x = torch.from_numpy(fbank).float()
 
-        x = torch.from_numpy(fbank).float()                    # (798,128)
-
-        # ✅ 训练时才做 specaug
         if self.is_train and self.spec_aug:
             x = apply_spec_augment(
                 x,
@@ -88,15 +82,13 @@ class ICBHINpyDataset(Dataset):
                 max_mask_f=self.max_mask_f,
                 num_masks=self.num_masks
             )
-
         return x, torch.tensor(y, dtype=torch.long)
 
 
 # ============================================================
-# 3) 官方评估：Sp, Se, Sc（四分类预测，按官方异常合并算 SE）
+# 3) ICBHI 官方指标：Sp, Se, Sc
 # ============================================================
 def get_icbhi_scores(preds, labels):
-    # 0:Normal, 1:Crackle, 2:Wheeze, 3:Both
     hits = [0.0] * 4
     counts = [0.0] * 4
 
@@ -105,15 +97,10 @@ def get_icbhi_scores(preds, labels):
         if p == l:
             hits[l] += 1
 
-    # Specificity: 正常类(0)召回率
     sp = (hits[0] / (counts[0] + 1e-10)) * 100.0
-
-    # Sensitivity: 异常类(1,2,3)总体召回率
     se_hits = sum(hits[1:])
     se_counts = sum(counts[1:])
     se = (se_hits / (se_counts + 1e-10)) * 100.0
-
-    # Score
     sc = (sp + se) / 2.0
     return sp, se, sc
 
@@ -124,10 +111,9 @@ def evaluate(model, loader, device):
     all_preds, all_labels = [], []
 
     for fbanks, labels in loader:
-        fbanks = fbanks.to(device, non_blocking=True)  # (B,798,128)
-        logits = model(fbanks)                         # (B,4)
+        fbanks = fbanks.to(device, non_blocking=True)
+        logits = model(fbanks)  # (B,4)
         preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
-
         all_preds.extend(preds)
         all_labels.extend(labels.numpy().tolist())
 
@@ -136,42 +122,74 @@ def evaluate(model, loader, device):
 
 
 # ============================================================
-# 4) 训练主程序
+# 4) 构建 projection 分组 optimizer（proj 小 lr）
+# ============================================================
+def build_optimizer_with_proj_groups(model: nn.Module, base_lr: float, proj_lr_mult: float = 0.1,
+                                     weight_decay: float = 1e-2):
+    """
+    将 AST projection 单独分组，使用更小 LR
+    """
+    # projection 参数
+    proj_params = list(model.ast_proj.proj.parameters())
+
+    # 其他可训练参数
+    other_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # 排除 projection
+        if n.startswith("ast_proj.proj"):
+            continue
+        other_params.append(p)
+
+    optimizer = optim.AdamW(
+        [
+            {"params": proj_params, "lr": base_lr * proj_lr_mult},
+            {"params": other_params, "lr": base_lr},
+        ],
+        weight_decay=weight_decay
+    )
+    return optimizer
+
+
+# ============================================================
+# 5) 主训练程序（proj warmup + 分组lr + grad检查）
 # ============================================================
 def main():
-    # ---------- 配置 ----------
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 8           # ✅ 你模型比较大，建议从 8 或更小开始
+    BATCH_SIZE = 8
     LR = 1e-4
     EPOCHS = 100
+
+    # ✅ warmup：前 N 个 epoch 冻结 projection
+    WARMUP_EPOCHS = 5
+
+    # ✅ projection 的 lr = LR * 0.1
+    PROJ_LR_MULT = 0.1
 
     TRAIN_CSV = "/data/dingcong/hybrid/icbhi_official_fbank/train_index.csv"
     TEST_CSV  = "/data/dingcong/hybrid/icbhi_official_fbank/test_index.csv"
     SAVE_PATH = "/data/dingcong/hybrid/best_official_score_model.pth"
 
-    # specaug
     SPEC_AUG = True
     MAX_MASK_T = 40
     MAX_MASK_F = 16
     NUM_MASKS = 2
 
-    # ---------- 固定随机种子 ----------
+    # seed
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
     if DEVICE.type == "cuda":
         torch.cuda.manual_seed_all(42)
 
-    # ---------- 数据 ----------
+    # data
     train_dataset = ICBHINpyDataset(
         TRAIN_CSV, is_train=True,
         spec_aug=SPEC_AUG, max_mask_t=MAX_MASK_T, max_mask_f=MAX_MASK_F, num_masks=NUM_MASKS
     )
-    test_dataset = ICBHINpyDataset(
-        TEST_CSV, is_train=False,
-        spec_aug=False
-    )
+    test_dataset = ICBHINpyDataset(TEST_CSV, is_train=False, spec_aug=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -192,8 +210,7 @@ def main():
     print(f"[INFO] Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
 
-    # ---------- 模型 ----------
-    # ✅ 关键：num_classes=4，模型直接输出4类logits
+    # model
     model = SSA_Model(
         d_model=512,
         n_layers=8,
@@ -201,15 +218,14 @@ def main():
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
-        unfreeze_projection=True,
+        unfreeze_projection=True,  # ✅ 允许训练 projection（但我们会 warmup 冻结）
     ).to(DEVICE)
 
-    # ---------- loss（用 train csv 自动统计更稳） ----------
+    # loss weights from train set
     train_counts = torch.tensor(
         train_dataset.df["label"].value_counts().sort_index().values,
         dtype=torch.float32
     )
-    # 防止某类缺失导致 shape 不对
     if train_counts.numel() < 4:
         tmp = torch.zeros(4, dtype=torch.float32)
         for k, v in train_dataset.df["label"].value_counts().items():
@@ -217,55 +233,82 @@ def main():
         train_counts = tmp
 
     weights = (1.0 / (train_counts + 1e-6))
-    weights = weights / weights.sum() * 4.0  # 均值≈1 更稳定
+    weights = weights / weights.sum() * 4.0
     criterion = nn.CrossEntropyLoss(weight=weights.to(DEVICE))
 
     print("[INFO] train class counts :", train_counts.tolist())
     print("[INFO] train class weights:", weights.tolist())
+    print(f"[INFO] warmup epochs for projection: {WARMUP_EPOCHS}")
+    print(f"[INFO] projection lr mult: {PROJ_LR_MULT}")
 
-    # ---------- optimizer/scheduler ----------
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    # optimizer (group lr)
+    optimizer = build_optimizer_with_proj_groups(
+        model=model,
+        base_lr=LR,
+        proj_lr_mult=PROJ_LR_MULT,
+        weight_decay=1e-2
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_sc = -1.0
-    best_epoch = -1
-
-    # （可选）快速 sanity check
+    # sanity check
     xb, yb = next(iter(train_loader))
     xb = xb.to(DEVICE)
     with torch.no_grad():
         out = model(xb)
     print(f"[DEBUG] fbank batch: {xb.shape} -> logits: {out.shape} (expect Bx4)")
 
-    # ---------- 训练循环 ----------
+    best_sc = -1.0
+    best_epoch = -1
+
+    # train loop
     for epoch in range(1, EPOCHS + 1):
+        # ===== warmup freeze/unfreeze projection =====
+        if epoch <= WARMUP_EPOCHS:
+            for p in model.ast_proj.proj.parameters():
+                p.requires_grad = False
+            proj_status = "FROZEN"
+        else:
+            for p in model.ast_proj.proj.parameters():
+                p.requires_grad = True
+            proj_status = "TRAINABLE"
+
         model.train()
         train_loss = 0.0
 
-        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}"):
-            fbanks = fbanks.to(DEVICE, non_blocking=True)  # (B,798,128)
-            labels = labels.to(DEVICE, non_blocking=True)  # (B,)
+        # 只在本 epoch 第一个 batch 打印一次 projection grad
+        printed_proj_grad = False
+
+        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]"):
+            fbanks = fbanks.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(fbanks)                         # (B,4)
+            logits = model(fbanks)
             loss = criterion(logits, labels)
             loss.backward()
-            optimizer.step()
 
+            # ===== grad check: 确认 projection 有梯度（在解冻后应非 None） =====
+            if (not printed_proj_grad):
+                wgrad = model.ast_proj.proj.weight.grad
+                ginfo = "None" if wgrad is None else f"{wgrad.abs().mean().item():.6e}"
+                print(f"\n[DEBUG] epoch={epoch} proj_status={proj_status} | proj.weight.grad_mean={ginfo}\n")
+                printed_proj_grad = True
+
+            optimizer.step()
             train_loss += loss.item()
 
         scheduler.step()
 
-        # ---------- 测试 ----------
+        # eval on test
         sp, se, sc = evaluate(model, test_loader, DEVICE)
 
         print(
             f"Epoch [{epoch:03d}] "
             f"Loss: {train_loss / max(1, len(train_loader)):.4f} | "
-            f"Sp: {sp:.2f}% | Se: {se:.2f}% | Score: {sc:.2f}%"
+            f"Sp: {sp:.2f}% | Se: {se:.2f}% | Score: {sc:.2f}% | proj={proj_status}"
         )
 
-        # ---------- 保存最优 ----------
+        # save best
         if sc > best_sc + 1e-7:
             best_sc = sc
             best_epoch = epoch
