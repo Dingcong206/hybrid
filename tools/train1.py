@@ -175,7 +175,9 @@ def cosine_lr(epoch: int, total_epochs: int, base_lr: float):
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4  # ✅ 实际喂给 GPU 的大小，设小防止 OOM
+    ACCUMULATION_STEPS = 4  # ✅ 累加步数。有效 Batch Size = 4 * 4 = 16
+    # -------------------
     LR = 5e-5
     EPOCHS = 50
 
@@ -209,6 +211,7 @@ def main():
         train_dataset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True
     )
+
     test_loader = DataLoader(
         test_dataset, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=4, pin_memory=True
@@ -286,16 +289,24 @@ def main():
         model.train()
         train_loss = 0.0
 
-        for fbanks, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]"):
+        for i, (fbanks, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [proj={proj_status}]")):
             fbanks = fbanks.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+            # 1. 前向传播
             logits = model(fbanks)
-            loss = criterion(logits, labels)
+            # 2. 计算损失并除以累加步数（取平均值）
+            loss = criterion(logits, labels) / ACCUMULATION_STEPS
+
+            # 3. 反向传播（梯度会持续累加在 param.grad 中）
             loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+
+            # 4. 当达到累加步数时，才更新参数
+            if (i + 1) % ACCUMULATION_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            train_loss += loss.item() * ACCUMULATION_STEPS  # 还原回用于显示的 loss
 
         # ===== eval on TEST：搜索最优阈值 thr =====
         thr, se, sp, sc, (tn, fp, fn, tp), pred_abn = evaluate(model, test_loader, DEVICE)
