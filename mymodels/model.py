@@ -126,29 +126,36 @@ class ICBHI_Pooling(nn.Module):
 # ============================================================
 # 5) Stage：✅ 3 BiMamba + 1 Attention + 3 BiMamba
 # ============================================================
-class Stage3M1A3M(nn.Module):
+# ============================================================
+# 5) Stage：✅ 4 BiMamba + 1 Attention + 2 BiMamba + 1 Attention
+# ============================================================
+class Stage4M1A2M1A(nn.Module):
     """
     一个 stage 内部结构：
-      BiMamba -> BiMamba -> BiMamba -> Attention -> BiMamba -> BiMamba -> BiMamba
+      4×BiMamba -> Attention -> 2×BiMamba -> Attention
     """
     def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.pre = nn.ModuleList([
+        self.m1 = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(3)
+            for _ in range(4)
         ])
-        self.attn = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
-        self.post = nn.ModuleList([
+        self.attn1 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
+
+        self.m2 = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(3)
+            for _ in range(2)
         ])
+        self.attn2 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
 
     def forward(self, x, mask=None):
-        for blk in self.pre:
+        for blk in self.m1:
             x = blk(x)
-        x = self.attn(x, mask=mask)
-        for blk in self.post:
+        x = self.attn1(x, mask=mask)
+
+        for blk in self.m2:
             x = blk(x)
+        x = self.attn2(x, mask=mask)
         return x
 
 
@@ -197,11 +204,11 @@ class SSA_Model_FbankToSSA(nn.Module):
         self,
         in_dim=768,
         d_model=512,
-        n_layers=2,
+        n_layers=6,
         nhead=8,
-        dropout=0.3,
+        dropout=0.2,
         max_len=1024,
-        num_classes=1,
+        num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
         unfreeze_projection=True,
@@ -234,7 +241,7 @@ class SSA_Model_FbankToSSA(nn.Module):
 
         # ✅ 核心：换成 3M + A + 3M
         self.stages = nn.ModuleList([
-            Stage3M1A3M(d_model=d_model, nhead=nhead, dropout=dropout)
+            Stage4M1A2M1A(d_model=d_model, nhead=nhead, dropout=dropout)
             for _ in range(n_layers)
         ])
 
@@ -292,7 +299,7 @@ def build_model(
     d_model=512,
     n_layers=2,
     nhead=8,
-    num_classes=1,
+    num_classes=4,
     ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
     local_files_only=False,
     unfreeze_projection=True,
@@ -309,7 +316,7 @@ def build_model(
     )
     backbone = SSA_Backbone(ssa)
     params = sum(p.numel() for p in backbone.parameters())
-    print(f"Structure: fbank->AST(proj trainable={unfreeze_projection})->[3×BiMamba + Attn + 3×BiMamba]×{n_layers}")
+
     print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
     return backbone
 
