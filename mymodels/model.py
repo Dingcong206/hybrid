@@ -203,7 +203,7 @@ class SSA_Model_FbankToSSA(nn.Module):
     def __init__(
         self,
         in_dim=768,
-        d_model=512,
+        d_model=256,
         n_layers=6,
         nhead=8,
         dropout=0.2,
@@ -296,7 +296,7 @@ class SSA_Backbone(nn.Module):
 # 9) build_model：返回 backbone
 # ============================================================
 def build_model(
-    d_model=512,
+    d_model=256,
     n_layers=2,
     nhead=8,
     num_classes=4,
