@@ -175,8 +175,8 @@ def cosine_lr(epoch: int, total_epochs: int, base_lr: float):
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 4  # ✅ 实际喂给 GPU 的大小，设小防止 OOM
-    ACCUMULATION_STEPS = 4  # ✅ 累加步数。有效 Batch Size = 4 * 4 = 16
+    BATCH_SIZE = 2  # ✅ 实际喂给 GPU 的大小，设小防止 OOM
+    ACCUMULATION_STEPS = 8  # ✅ 累加步数。有效 Batch Size = 4 * 4 = 16
     # -------------------
     LR = 5e-5
     EPOCHS = 50
