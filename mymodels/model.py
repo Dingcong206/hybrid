@@ -251,4 +251,39 @@ class SSA_HybridTokensModel(nn.Module):
 
         logits = self.classifier(feat)  # (B,num_classes)
         return logits
+
+
+def build_model(
+    in_dim=768,
+    d_model=384,
+    n_layers=4,
+    nhead=6,
+    dropout=0.2,
+    max_len=1024,
+    num_classes=4,
+    d_state=16,
+    d_conv=4,
+    expand=2,
+    use_front_conv=True,
+):
+    model = SSA_HybridTokensModel(
+        in_dim=in_dim,
+        d_model=d_model,
+        n_layers=n_layers,
+        nhead=nhead,
+        dropout=dropout,
+        max_len=max_len,
+        num_classes=num_classes,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        use_front_conv=use_front_conv,
+    )
+    return model
+
+
+# ============================================================
+# ✅ 兼容旧导入名
+# ============================================================
 SSA_Model = SSA_HybridTokensModel
+build_backbone = build_model
