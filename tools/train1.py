@@ -225,8 +225,8 @@ def main():
     # model：先允许 projection 可训练，但我们每轮手动冻结/解冻
     model = SSA_Model(
         d_model=256,
-        n_layers=6,
-        nhead=8,
+        n_layers=2,
+        nhead=6,
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,
