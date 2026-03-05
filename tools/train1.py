@@ -226,7 +226,7 @@ def main():
     model = SSA_Model(
         d_model=256,
         n_layers=2,
-        nhead=6,
+        nhead=8,
         num_classes=4,
         ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
         local_files_only=False,

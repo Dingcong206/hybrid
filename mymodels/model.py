@@ -80,7 +80,7 @@ class BiMambaBlock(nn.Module):
 # 3) AttentionBlock
 # ============================================================
 class AttentionBlock(nn.Module):
-    def __init__(self, d_model, nhead=6, dropout=0.3):  # ✅ heads=6
+    def __init__(self, d_model, nhead=8, dropout=0.3):  # ✅ heads=6
         super().__init__()
         self.ln = _rmsnorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
@@ -131,7 +131,7 @@ class Stage4M1A2M1A(nn.Module):
     一个 stage 内部结构：
       4×BiMamba -> Attention -> 2×BiMamba -> Attention
     """
-    def __init__(self, d_model, nhead=6, dropout=0.3, d_state=16, d_conv=4, expand=2):  # ✅ heads=6
+    def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):  # ✅ heads=6
         super().__init__()
         self.m1 = nn.ModuleList([
             BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -201,9 +201,9 @@ class SSA_Model_FbankToSSA(nn.Module):
     def __init__(
         self,
         in_dim=768,
-        d_model=256,          # ✅ D=384
-        n_layers=2,           # ✅ N=4
-        nhead=6,              # ✅ heads=6
+        d_model=256,
+        n_layers=2,
+        nhead=8,
         dropout=0.2,
         max_len=1024,
         num_classes=4,
@@ -305,7 +305,7 @@ class SSA_Backbone(nn.Module):
 def build_model(
     d_model=256,
     n_layers=2,
-    nhead=6,
+    nhead=8,
     num_classes=4,
     ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
     local_files_only=False,
