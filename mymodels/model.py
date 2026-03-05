@@ -202,7 +202,7 @@ class SSA_Model_FbankToSSA(nn.Module):
         self,
         in_dim=768,
         d_model=384,          # ✅ D=384
-        n_layers=4,           # ✅ N=4
+        n_layers=2,           # ✅ N=4
         nhead=6,              # ✅ heads=6
         dropout=0.2,
         max_len=1024,
@@ -304,7 +304,7 @@ class SSA_Backbone(nn.Module):
 # ============================================================
 def build_model(
     d_model=384,     # ✅ D=384
-    n_layers=4,      # ✅ N=4
+    n_layers=2,      # ✅ N=4
     nhead=6,         # ✅ heads=6
     num_classes=4,
     ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
