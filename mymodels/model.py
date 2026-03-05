@@ -251,3 +251,4 @@ class SSA_HybridTokensModel(nn.Module):
 
         logits = self.classifier(feat)  # (B,num_classes)
         return logits
+SSA_Model = SSA_HybridTokensModel
