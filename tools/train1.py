@@ -258,6 +258,7 @@ def main():
         ],
         weight_decay=1e-2
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
 
     # sanity check
     xb, _ = next(iter(train_loader))
@@ -294,16 +295,16 @@ def main():
             labels = labels.to(DEVICE, non_blocking=True)
 
             # 1. 前向传播
-            logits = model(fbanks)
-            # 2. 计算损失并除以累加步数（取平均值）
-            loss = criterion(logits, labels) / ACCUMULATION_STEPS
+            with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+                logits = model(fbanks)
+                loss = criterion(logits, labels) / ACCUMULATION_STEPS
 
             # 3. 反向传播（梯度会持续累加在 param.grad 中）
-            loss.backward()
+            scaler.scale(loss).backward()
 
-            # 4. 当达到累加步数时，才更新参数
             if (i + 1) % ACCUMULATION_STEPS == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
             train_loss += loss.item() * ACCUMULATION_STEPS  # 还原回用于显示的 loss
