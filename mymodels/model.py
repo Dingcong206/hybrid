@@ -1,343 +1,316 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 try:
     from mamba_ssm import Mamba
-except ImportError:
+    HAS_MAMBA = True
+except Exception:
     Mamba = None
+    HAS_MAMBA = False
 
 
-# ============================================================
-# 0) RMSNorm 兼容
-# ============================================================
-def _rmsnorm(dim: int):
-    if hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(dim)
-    else:
-        return CustomRMSNorm(dim)
-
-class CustomRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim=None, dropout=0.1):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        norm_x = x.pow(2).mean(-1, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
-        return self.weight * x_normed
+        if hidden_dim is None:
+            hidden_dim = dim * 4
 
-
-# ============================================================
-# 1) 位置编码
-# ============================================================
-def sinusoidal_positional_encoding(seq_len: int, dim: int, device="cpu"):
-    pe = torch.zeros(seq_len, dim, device=device)
-    position = torch.arange(0, seq_len, device=device, dtype=torch.float32).unsqueeze(1)
-    div_term = torch.exp(
-        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        * (-torch.log(torch.tensor(10000.0, device=device)) / dim)
-    )
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-
-# ============================================================
-# 2) BiMambaBlock
-# ============================================================
-class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, dropout=0.2, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        if Mamba is None:
-            raise RuntimeError("请安装 mamba-ssm: pip install mamba-ssm causal-conv1d")
-
-        self.ln1 = _rmsnorm(d_model)
-        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.drop = nn.Dropout(dropout)
-
-        self.ln2 = _rmsnorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.SiLU(),
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
-        h = self.ln1(x)
-        h_f = self.fwd(h)
-        h_b = torch.flip(self.bwd(torch.flip(h, [1])), [1])
-        x = x + self.drop(h_f + h_b)
-        x = x + self.mlp(self.ln2(x))
-        return x
+        return self.net(x)
 
 
-# ============================================================
-# 3) AttentionBlock
-# ============================================================
-class AttentionBlock(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.3):  # ✅ heads=6
-        super().__init__()
-        self.ln = _rmsnorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
-        x_n = self.ln(x)
-        x_a, _ = self.attn(x_n, x_n, x_n, key_padding_mask=mask)
-        return x + self.drop(x_a)
-
-
-# ============================================================
-# 4) ICBHI Pooling (Attn + Mean)
-# ============================================================
-class ICBHI_Pooling(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.attn_net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.Tanh(),
-            nn.Linear(d_model // 2, 1)
-        )
-
-    def forward(self, x, mask=None):
-        attn_scores = self.attn_net(x)  # (B,T,1)
-        if mask is not None:
-            neg_inf = torch.finfo(attn_scores.dtype).min
-            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), neg_inf)
-
-        attn_w = torch.softmax(attn_scores, dim=1)
-        feat_weighted = torch.sum(attn_w * x, dim=1)
-
-        if mask is not None:
-            x_valid = x.masked_fill(mask.unsqueeze(-1), 0.0)
-            denom = (~mask).sum(dim=1).clamp(min=1).unsqueeze(-1)
-            feat_mean = x_valid.sum(dim=1) / denom
-        else:
-            feat_mean = x.mean(dim=1)
-
-        return feat_weighted + feat_mean
-
-
-# ============================================================
-# 5) Stage：✅ 4 BiMamba + 1 Attention + 2 BiMamba + 1 Attention
-# ============================================================
-class Stage4M1A2M1A(nn.Module):
+class TimeMambaBlock(nn.Module):
     """
-    一个 stage 内部结构：
-      4×BiMamba -> Attention -> 2×BiMamba -> Attention
+    Time-Mamba 模块
+
+    输入:
+        x: [B * Fp, Tp, D]
+
+    含义:
+        对每一个频率 patch，沿时间轴建模。
     """
-    def __init__(self, d_model, nhead=8, dropout=0.3, d_state=16, d_conv=4, expand=2):  # ✅ heads=6
-        super().__init__()
-        self.m1 = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(4)
-        ])
-        self.attn1 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
 
-        self.m2 = nn.ModuleList([
-            BiMambaBlock(d_model, dropout=dropout, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(2)
-        ])
-        self.attn2 = AttentionBlock(d_model, nhead=nhead, dropout=dropout)
-
-    def forward(self, x, mask=None):
-        for blk in self.m1:
-            x = blk(x)
-        x = self.attn1(x, mask=mask)
-
-        for blk in self.m2:
-            x = blk(x)
-        x = self.attn2(x, mask=mask)
-        return x
-
-
-# ============================================================
-# 6) fbank -> AST patch projection -> tokens
-# ============================================================
-class ASTPatchProjection(nn.Module):
-    """
-    输入：fbank (B, 798, 128)
-    输出：tokens (B, N, 768)
-    """
     def __init__(
         self,
-        ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
-        local_files_only=False,
-        unfreeze_projection=True,
-    ):
-        super().__init__()
-        from transformers import ASTModel
-        ast = ASTModel.from_pretrained(ast_model_name, local_files_only=local_files_only)
-
-        self.proj = ast.embeddings.patch_embeddings.projection
-
-        # 默认冻结整个 AST
-        for p in ast.parameters():
-            p.requires_grad = False
-
-        # 只解冻 projection
-        if unfreeze_projection:
-            for p in self.proj.parameters():
-                p.requires_grad = True
-
-    def forward(self, fbank: torch.Tensor) -> torch.Tensor:
-        fbank = fbank.float()
-        x = fbank.transpose(1, 2).unsqueeze(1)    # (B,1,128,798)
-        y = self.proj(x)                          # (B,768,F',T')
-        tokens = y.flatten(2).transpose(1, 2)     # (B,N,768)
-        return tokens
-
-
-# ============================================================
-# 7) 主模型：fbank -> AST proj tokens -> SSA
-#    ✅ 只改：d_model=384, n_layers=4, nhead=6（结构/层数/维度）
-# ============================================================
-class SSA_Model_FbankToSSA(nn.Module):
-    def __init__(
-        self,
-        in_dim=768,
-        d_model=256,
-        n_layers=2,
-        nhead=8,
-        dropout=0.2,
-        max_len=1024,
-        num_classes=4,
-        ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
-        local_files_only=False,
-        unfreeze_projection=True,
-        d_state=16, d_conv=4, expand=2,           # ✅ 只为保证 Stage 内也用同一组超参（不改其它逻辑）
+        dim=768,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        dropout=0.1
     ):
         super().__init__()
 
-        self.ast_proj = ASTPatchProjection(
-            ast_model_name=ast_model_name,
-            local_files_only=local_files_only,
-            unfreeze_projection=unfreeze_projection,
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
-        self.input_proj = nn.Sequential(
-            _rmsnorm(in_dim),
-            nn.Linear(in_dim, d_model),
-            nn.SiLU()
-        )
-        self.d_model = d_model
-        self.num_classes = num_classes
-
-        pe = sinusoidal_positional_encoding(max_len, d_model, device="cpu")
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-        self.pos_drop = nn.Dropout(dropout)
-
-        self.front_conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=1, bias=False),
-            nn.SiLU(),
-        )
-        self.front_ln = _rmsnorm(d_model)
-
-        # ✅ 结构不变，只是 stage 内部已经是 4M + A + 2M + A
-        self.stages = nn.ModuleList([
-            Stage4M1A2M1A(
-                d_model=d_model,
-                nhead=nhead,
-                dropout=dropout,
+        if HAS_MAMBA:
+            self.mamba = Mamba(
+                d_model=dim,
                 d_state=d_state,
                 d_conv=d_conv,
-                expand=expand,
+                expand=expand
             )
-            for _ in range(n_layers)
-        ])
+            self.use_mamba = True
+        else:
+            # 如果 mamba_ssm 没装，先用 GRU 占位，保证代码结构能跑通
+            self.mamba = nn.GRU(
+                input_size=dim,
+                hidden_size=dim // 2,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+            self.use_mamba = False
 
-        self.final_norm = _rmsnorm(d_model)
-        self.pool = ICBHI_Pooling(d_model)
+        self.dropout = nn.Dropout(dropout)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_classes)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim=dim, dropout=dropout)
+
+    def forward(self, x):
+        """
+        x: [B * Fp, Tp, D]
+        """
+
+        residual = x
+        x_norm = self.norm1(x)
+
+        if self.use_mamba:
+            x_out = self.mamba(x_norm)
+        else:
+            x_out, _ = self.mamba(x_norm)
+
+        x = residual + self.dropout(x_out)
+
+        residual = x
+        x = residual + self.ffn(self.norm2(x))
+
+        return x
+
+
+class FrequencyAttentionBlock(nn.Module):
+    """
+    Frequency-Attention 模块
+
+    输入:
+        x: [B * Tp, Fp, D]
+
+    含义:
+        对每一个时间 patch，沿频率轴建模。
+    """
+
+    def __init__(
+        self,
+        dim=768,
+        num_heads=8,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
         )
 
-    def forward(self, fbank, mask=None, return_feature=False):
-        x = self.ast_proj(fbank)                  # (B,N,768)
-        x = self.input_proj(x)                    # (B,N,d_model)
+        self.dropout = nn.Dropout(dropout)
 
-        Tt = x.shape[1]
-        x = x + self.pe[:, :Tt, :].to(x.device)
-        x = self.pos_drop(x)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim=dim, dropout=dropout)
 
-        y = self.front_conv(x.transpose(1, 2)).transpose(1, 2)
-        x = x + self.front_ln(y)
+    def forward(self, x):
+        """
+        x: [B * Tp, Fp, D]
+        """
 
-        for stage in self.stages:
-            x = stage(x, mask=mask)
+        residual = x
+        x_norm = self.norm1(x)
 
-        x = self.final_norm(x)
-        file_feature = self.pool(x, mask=mask)
+        attn_out, _ = self.attn(
+            x_norm,
+            x_norm,
+            x_norm,
+            need_weights=False
+        )
 
-        if return_feature:
-            return file_feature, x
+        x = residual + self.dropout(attn_out)
 
-        return self.classifier(file_feature)
+        residual = x
+        x = residual + self.ffn(self.norm2(x))
+
+        return x
 
 
-# ============================================================
-# 8) Backbone 包装类
-# ============================================================
-class SSA_Backbone(nn.Module):
-    def __init__(self, ssa_model: SSA_Model_FbankToSSA):
+class TimeFrequencyEncoder(nn.Module):
+    """
+    Time-Mamba + Frequency-Attention 特征提取模型
+
+    输入:
+        x: [B, N, D]
+
+    例如:
+        x: [B, 948, 768]
+
+    其中:
+        948 = 12 * 79
+        Fp = 12
+        Tp = 79
+
+    输出:
+        feature: [B, D]
+    """
+
+    def __init__(
+        self,
+        token_dim=768,
+        freq_patches=12,
+        time_patches=79,
+        time_depth=2,
+        freq_depth=2,
+        num_heads=8,
+        dropout=0.1
+    ):
         super().__init__()
-        self.ssa = ssa_model
-        self.final_feat_dim = ssa_model.d_model
 
-    def forward(self, fbank, mask=None):
-        feat, _ = self.ssa(fbank, mask=mask, return_feature=True)
-        return feat
+        self.token_dim = token_dim
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
+        self.num_tokens = freq_patches * time_patches
 
+        self.input_norm = nn.LayerNorm(token_dim)
 
-# ============================================================
-# 9) build_model：返回 backbone
-#    ✅ 只改默认参数：d_model=384, n_layers=4, nhead=6
-# ============================================================
-def build_model(
-    d_model=256,
-    n_layers=2,
-    nhead=8,
-    num_classes=4,
-    ast_model_name="MIT/ast-finetuned-audioset-10-10-0.4593",
-    local_files_only=False,
-    unfreeze_projection=True,
-    dropout=0.2,
-    max_len=1024,
-    d_state=16, d_conv=4, expand=2,
-):
-    ssa = SSA_Model_FbankToSSA(
-        in_dim=768,
-        d_model=d_model,
-        n_layers=n_layers,
-        nhead=nhead,
-        dropout=dropout,
-        max_len=max_len,
-        num_classes=num_classes,
-        ast_model_name=ast_model_name,
-        local_files_only=local_files_only,
-        unfreeze_projection=unfreeze_projection,
-        d_state=d_state,
-        d_conv=d_conv,
-        expand=expand,
-    )
-    backbone = SSA_Backbone(ssa)
-    params = sum(p.numel() for p in backbone.parameters())
+        self.time_blocks = nn.ModuleList([
+            TimeMambaBlock(
+                dim=token_dim,
+                dropout=dropout
+            )
+            for _ in range(time_depth)
+        ])
 
-    print(f"Total Params: {params:,} | Feature Dim: {backbone.final_feat_dim}")
-    return backbone
+        self.freq_blocks = nn.ModuleList([
+            FrequencyAttentionBlock(
+                dim=token_dim,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            for _ in range(freq_depth)
+        ])
 
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(token_dim * 2),
+            nn.Linear(token_dim * 2, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
 
-# ============================================================
-# ✅ 兼容别名（保持不变）
-# ============================================================
-SSA_Model = SSA_Model_FbankToSSA
-build_backbone = build_model
+        self.output_norm = nn.LayerNorm(token_dim)
+
+    def forward(self, x):
+        """
+        x: [B, N, D]
+
+        return:
+            feature: [B, D]
+        """
+
+        B, N, D = x.shape
+
+        if N != self.num_tokens:
+            raise ValueError(
+                f"Token 数量不匹配: 输入 N={N}, "
+                f"但模型需要 {self.freq_patches} * {self.time_patches} = {self.num_tokens}"
+            )
+
+        if D != self.token_dim:
+            raise ValueError(
+                f"Token 维度不匹配: 输入 D={D}, 但模型 token_dim={self.token_dim}"
+            )
+
+        x = self.input_norm(x)
+
+        # [B, N, D] -> [B, Fp, Tp, D]
+        x = x.reshape(
+            B,
+            self.freq_patches,
+            self.time_patches,
+            self.token_dim
+        )
+
+        # =====================================================
+        # 1. Time-Mamba 分支
+        # =====================================================
+        time_x = x
+
+        for block in self.time_blocks:
+            # [B, Fp, Tp, D] -> [B * Fp, Tp, D]
+            time_seq = time_x.reshape(
+                B * self.freq_patches,
+                self.time_patches,
+                self.token_dim
+            )
+
+            time_seq = block(time_seq)
+
+            # [B * Fp, Tp, D] -> [B, Fp, Tp, D]
+            time_x = time_seq.reshape(
+                B,
+                self.freq_patches,
+                self.time_patches,
+                self.token_dim
+            )
+
+        # =====================================================
+        # 2. Frequency-Attention 分支
+        # =====================================================
+        freq_x = x
+
+        for block in self.freq_blocks:
+            # [B, Fp, Tp, D] -> [B, Tp, Fp, D]
+            freq_seq = freq_x.permute(0, 2, 1, 3).contiguous()
+
+            # [B, Tp, Fp, D] -> [B * Tp, Fp, D]
+            freq_seq = freq_seq.reshape(
+                B * self.time_patches,
+                self.freq_patches,
+                self.token_dim
+            )
+
+            freq_seq = block(freq_seq)
+
+            # [B * Tp, Fp, D] -> [B, Tp, Fp, D]
+            freq_seq = freq_seq.reshape(
+                B,
+                self.time_patches,
+                self.freq_patches,
+                self.token_dim
+            )
+
+            # [B, Tp, Fp, D] -> [B, Fp, Tp, D]
+            freq_x = freq_seq.permute(0, 2, 1, 3).contiguous()
+
+        # =====================================================
+        # 3. 池化得到两个分支的全局特征
+        # =====================================================
+        time_feature = time_x.mean(dim=(1, 2))   # [B, D]
+        freq_feature = freq_x.mean(dim=(1, 2))   # [B, D]
+
+        # =====================================================
+        # 4. 融合时频特征
+        # =====================================================
+        feature = torch.cat([time_feature, freq_feature], dim=-1)  # [B, 2D]
+        feature = self.fusion(feature)                             # [B, D]
+        feature = self.output_norm(feature)
+
+        return feature
