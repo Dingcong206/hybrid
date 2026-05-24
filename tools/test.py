@@ -6,6 +6,17 @@ import sys
 import random
 from pathlib import Path
 
+# ============================================================
+# 0. 项目路径
+# 当前文件必须放在:
+# /data/dingcong/hybrid/train_tokens.py
+# ============================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+print("[DEBUG] PROJECT_ROOT:", PROJECT_ROOT)
+print("[DEBUG] sys.path[0]:", sys.path[0])
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -14,13 +25,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score
-
-
-# ============================================================
-# 0. 项目路径
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset.dataloader import build_dataloader
 from mymodels.model import TimeFrequencyEncoder
