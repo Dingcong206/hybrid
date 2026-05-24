@@ -1,23 +1,28 @@
+import sys
+import os
 import torch
-from pathlib import Path
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.full_model import TimeFrequencyLogisticModel
 
 
-def find_all_results(search_path="/data/dingcong/hybrid"):
-    print(f"{'文件夹名称':<40} | {'最佳 ICBHI':<10} | {'Epoch'}")
-    print("-" * 65)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 递归搜索目录下所有的 .pt 文件
-    for pt_file in Path(search_path).rglob("*.pt"):
-        try:
-            ckpt = torch.load(pt_file, map_location='cpu')
-            if 'best_icbhi' in ckpt:
-                folder_name = pt_file.parent.name
-                icbhi = ckpt['best_icbhi']
-                epoch = ckpt['epoch']
-                print(f"{folder_name:<40} | {icbhi:<10.4f} | {epoch}")
-        except:
-            continue
+model = TimeFrequencyLogisticModel(
+    token_dim=768,
+    freq_patches=12,
+    time_patches=79,
+    time_depth=2,
+    freq_depth=2,
+    num_heads=8,
+    dropout=0.1,
+    num_classes=4
+).to(device)
 
+x = torch.randn(2, 948, 768).to(device)
 
-if __name__ == "__main__":
-    find_all_results()
+logits = model(x)
+
+print("input shape:", x.shape)
+print("logits shape:", logits.shape)
