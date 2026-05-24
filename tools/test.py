@@ -221,7 +221,7 @@ def main():
     SAVE_PATH = "/data/dingcong/hybrid/best_time_frequency_logistic_model.pth"
 
     # 先用 1 跑通，确认没问题后改成 50
-    EPOCHS = 1
+    EPOCHS = 50
 
     BATCH_SIZE = 2
     ACCUMULATION_STEPS = 8
