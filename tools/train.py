@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Soft hierarchical joint training for ICBHI.
+
+Shared backbone:
+    AST tokens
+        -> Time-Mamba
+        -> Frequency-Attention
+        -> shared feature
+
+Two heads:
+    Binary head:
+        Normal / Abnormal
+
+    Abnormal head:
+        Crackle / Wheeze / Both
+
+Final four-class probabilities:
+    P(Normal)  = P(Normal)
+
+    P(Crackle) = P(Abnormal) * P(Crackle | Abnormal)
+    P(Wheeze)  = P(Abnormal) * P(Wheeze  | Abnormal)
+    P(Both)    = P(Abnormal) * P(Both    | Abnormal)
+
+There is no hard binary threshold during final four-class prediction.
+"""
+
 import random
 import sys
 import time
@@ -11,6 +37,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sklearn.metrics import (
     accuracy_score,
@@ -26,40 +53,55 @@ from torch.utils.data import (
 
 
 # ============================================================
-# 1. 配置
+# 1. Configuration
 # ============================================================
 CONFIG = {
+    # --------------------------------------------------------
+    # Data
+    # --------------------------------------------------------
     "ROOT": (
         "/data/dingcong/hybrid/"
         "icbhi_official_ast_patch_tokens"
     ),
 
-    # 使用之前表现更好的二分类模型
+    # --------------------------------------------------------
+    # Save directory
+    # --------------------------------------------------------
+    "SAVE_DIR": (
+        "/data/dingcong/hybrid/"
+        "checkpoints_soft_hierarchical"
+    ),
+
+    # --------------------------------------------------------
+    # Warm start from the previous binary model
+    # --------------------------------------------------------
+    "INIT_FROM_BINARY": True,
+
     "BINARY_CKPT": (
         "/data/dingcong/hybrid/"
         "checkpoints_two_stage_cascade/"
         "best_binary.pth"
     ),
 
-    "SAVE_DIR": (
-        "/data/dingcong/hybrid/"
-        "checkpoints_two_stage_multilabel"
-    ),
-
     # --------------------------------------------------------
-    # 通用训练参数
+    # General training
     # --------------------------------------------------------
     "BATCH_SIZE": 4,
     "ACCUM_STEPS": 4,
     "NUM_WORKERS": 1,
+
+    "EPOCHS": 40,
+    "PATIENCE": 12,
 
     "SEED": 42,
     "DEVICE": "cuda",
     "AMP": True,
     "REQUIRE_MAMBA": True,
 
+    "WEIGHT_DECAY": 1e-2,
+
     # --------------------------------------------------------
-    # Backbone 参数
+    # Backbone
     # --------------------------------------------------------
     "INPUT_DIM": 768,
     "D_MODEL": 256,
@@ -74,45 +116,47 @@ CONFIG = {
     "DROPOUT": 0.15,
 
     # --------------------------------------------------------
-    # Stage 2 多标签分类头
+    # Classification heads
     # --------------------------------------------------------
-    "HEAD_HIDDEN_DIM": 128,
     "HEAD_DROPOUT": 0.20,
 
     # --------------------------------------------------------
-    # Stage 2 训练参数
+    # Learning rates
     # --------------------------------------------------------
-    "STAGE2_EPOCHS": 40,
-    "STAGE2_PATIENCE": 12,
+    "BACKBONE_LR": 5e-6,
+    "BINARY_HEAD_LR": 1e-5,
+    "ABNORMAL_HEAD_LR": 2e-5,
 
-    # 前两个 Epoch 只训练分类头
-    "STAGE2_HEAD_ONLY_EPOCHS": 2,
-
-    "STAGE2_BACKBONE_LR": 2e-6,
-    "STAGE2_HEAD_LR": 2e-5,
-
-    "WEIGHT_DECAY": 1e-2,
-
-    # pos_weight 自动根据训练集计算，
-    # 为避免权重过大或过小，对其进行截断
-    "POS_WEIGHT_MIN": 0.50,
-    "POS_WEIGHT_MAX": 2.00,
+    "MIN_LR": 5e-7,
 
     # --------------------------------------------------------
-    # Crackle/Wheeze 阈值搜索
+    # Joint loss coefficients
+    #
+    # total_loss =
+    #     FOUR_LOSS_WEIGHT * four_loss
+    #   + BINARY_LOSS_WEIGHT * binary_loss
+    #   + ABNORMAL_LOSS_WEIGHT * abnormal_loss
     # --------------------------------------------------------
-    "CRACKLE_THRESHOLD_MIN": 0.20,
-    "CRACKLE_THRESHOLD_MAX": 0.80,
+    "FOUR_LOSS_WEIGHT": 1.0,
+    "BINARY_LOSS_WEIGHT": 0.30,
+    "ABNORMAL_LOSS_WEIGHT": 0.50,
 
-    "WHEEZE_THRESHOLD_MIN": 0.20,
-    "WHEEZE_THRESHOLD_MAX": 0.80,
+    # --------------------------------------------------------
+    # Mild abnormal class weights
+    #
+    # weight = 1 / count^power
+    # --------------------------------------------------------
+    "ABNORMAL_WEIGHT_POWER": 0.5,
 
-    "PATHOLOGY_THRESHOLD_STEP": 0.02,
+    # --------------------------------------------------------
+    # Gradient clipping
+    # --------------------------------------------------------
+    "GRAD_CLIP": 2.0,
 }
 
 
 # ============================================================
-# 2. 导入项目模型
+# 2. Import model
 # ============================================================
 PROJECT_ROOT = Path(
     __file__
@@ -131,7 +175,7 @@ from mymodels.model import (
 
 
 # ============================================================
-# 3. 随机种子
+# 3. Random seed
 # ============================================================
 def set_seed(
     seed,
@@ -156,43 +200,28 @@ def set_seed(
         seed
     )
 
-    torch.backends.cudnn.deterministic = (
-        True
-    )
-
-    torch.backends.cudnn.benchmark = (
-        False
-    )
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     if torch.cuda.is_available():
-
-        torch.backends.cuda.matmul.allow_tf32 = (
-            True
-        )
-
-        torch.backends.cudnn.allow_tf32 = (
-            True
-        )
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     try:
-
         torch.set_float32_matmul_precision(
             "high"
         )
-
     except AttributeError:
-
         pass
 
 
 # ============================================================
-# 4. AMP Scaler
+# 4. AMP scaler
 # ============================================================
 def make_scaler(
     enabled,
 ):
     try:
-
         return torch.amp.GradScaler(
             "cuda",
             enabled=enabled,
@@ -202,55 +231,216 @@ def make_scaler(
         AttributeError,
         TypeError,
     ):
-
         return torch.cuda.amp.GradScaler(
             enabled=enabled
         )
 
 
 # ============================================================
-# 5. 创建 Backbone
+# 5. Safe checkpoint loading
+# ============================================================
+def safe_torch_load(
+    path,
+    device,
+):
+    try:
+        return torch.load(
+            path,
+            map_location=device,
+            weights_only=False,
+        )
+
+    except TypeError:
+        return torch.load(
+            path,
+            map_location=device,
+        )
+
+
+# ============================================================
+# 6. Backbone
 # ============================================================
 def make_backbone(
     cfg,
 ):
     return TimeFrequencyEncoder(
-        input_dim=(
+        input_dim=int(
             cfg["INPUT_DIM"]
         ),
 
-        d_model=(
+        d_model=int(
             cfg["D_MODEL"]
         ),
 
-        freq_patches=(
+        freq_patches=int(
             cfg["FREQ_PATCHES"]
         ),
 
-        time_patches=(
+        time_patches=int(
             cfg["TIME_PATCHES"]
         ),
 
-        time_depth=(
+        time_depth=int(
             cfg["TIME_DEPTH"]
         ),
 
-        freq_depth=(
+        freq_depth=int(
             cfg["FREQ_DEPTH"]
         ),
 
-        num_heads=(
+        num_heads=int(
             cfg["NHEAD"]
         ),
 
-        dropout=(
+        dropout=float(
             cfg["DROPOUT"]
         ),
     )
 
 
 # ============================================================
-# 6. Dataset
+# 7. Soft hierarchical model
+# ============================================================
+class SoftHierarchicalClassifier(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        cfg,
+    ):
+        super().__init__()
+
+        self.backbone = make_backbone(
+            cfg
+        )
+
+        # Must remain compatible with the previous binary checkpoint.
+        self.binary_head = nn.Sequential(
+            nn.Dropout(
+                float(
+                    cfg["HEAD_DROPOUT"]
+                )
+            ),
+
+            nn.Linear(
+                int(
+                    cfg["D_MODEL"]
+                ),
+                2,
+            ),
+        )
+
+        self.abnormal_head = nn.Sequential(
+            nn.Dropout(
+                float(
+                    cfg["HEAD_DROPOUT"]
+                )
+            ),
+
+            nn.Linear(
+                int(
+                    cfg["D_MODEL"]
+                ),
+                3,
+            ),
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        feature = self.backbone(
+            x
+        )
+
+        binary_logits = self.binary_head(
+            feature
+        )
+
+        abnormal_logits = self.abnormal_head(
+            feature
+        )
+
+        four_log_probabilities = (
+            build_hierarchical_log_probabilities(
+                binary_logits,
+                abnormal_logits,
+            )
+        )
+
+        return {
+            "feature": feature,
+
+            "binary_logits": (
+                binary_logits
+            ),
+
+            "abnormal_logits": (
+                abnormal_logits
+            ),
+
+            "four_log_probs": (
+                four_log_probabilities
+            ),
+        }
+
+
+# ============================================================
+# 8. Hierarchical probability combination
+#
+# log P(Normal)
+#
+# log P(Abnormal subtype)
+#     = log P(Abnormal)
+#       + log P(subtype | Abnormal)
+# ============================================================
+def build_hierarchical_log_probabilities(
+    binary_logits,
+    abnormal_logits,
+):
+    binary_log_probs = F.log_softmax(
+        binary_logits,
+        dim=1,
+    )
+
+    abnormal_log_probs = F.log_softmax(
+        abnormal_logits,
+        dim=1,
+    )
+
+    normal_log_probability = (
+        binary_log_probs[
+            :,
+            0:1,
+        ]
+    )
+
+    abnormal_gate_log_probability = (
+        binary_log_probs[
+            :,
+            1:2,
+        ]
+    )
+
+    conditional_abnormal_log_probabilities = (
+        abnormal_gate_log_probability
+        + abnormal_log_probs
+    )
+
+    four_log_probabilities = torch.cat(
+        [
+            normal_log_probability,
+            conditional_abnormal_log_probabilities,
+        ],
+        dim=1,
+    )
+
+    return four_log_probabilities
+
+
+# ============================================================
+# 9. Dataset
 # ============================================================
 class TokenDataset(
     Dataset
@@ -260,7 +450,6 @@ class TokenDataset(
         self,
         csv_path,
         cfg,
-        abnormal_only=False,
     ):
         super().__init__()
 
@@ -287,7 +476,6 @@ class TokenDataset(
         )
 
         if missing_columns:
-
             raise ValueError(
                 f"{csv_path} 缺少列："
                 f"{sorted(missing_columns)}；"
@@ -300,30 +488,11 @@ class TokenDataset(
             .astype(int)
         )
 
-        # Stage 2 只训练真实异常样本
-        if abnormal_only:
-
-            self.df = (
-                self.df[
-                    self.df["label"] > 0
-                ]
-                .reset_index(
-                    drop=True
-                )
-            )
-
         self.labels = (
             self.df["label"]
             .to_numpy(
                 dtype=np.int64
             )
-        )
-
-        self.expected_shape = (
-            cfg["FREQ_PATCHES"]
-            * cfg["TIME_PATCHES"],
-
-            cfg["INPUT_DIM"],
         )
 
         invalid_labels = np.unique(
@@ -341,38 +510,35 @@ class TokenDataset(
         if len(
             invalid_labels
         ) > 0:
-
             raise ValueError(
                 "标签必须为 0、1、2、3；"
                 f"发现："
                 f"{invalid_labels.tolist()}"
             )
 
-        if (
-            abnormal_only
-            and np.any(
-                self.labels == 0
+        self.expected_shape = (
+            int(
+                cfg["FREQ_PATCHES"]
             )
-        ):
+            *
+            int(
+                cfg["TIME_PATCHES"]
+            ),
 
-            raise RuntimeError(
-                "abnormal_only=True "
-                "时仍包含 Normal 样本。"
-            )
+            int(
+                cfg["INPUT_DIM"]
+            ),
+        )
 
-        self.class_counts = (
-            np.bincount(
-                self.labels,
-                minlength=4,
-            )
+        self.class_counts = np.bincount(
+            self.labels,
+            minlength=4,
         )
 
         print(
             f"[Dataset] "
             f"samples={len(self.df)} | "
-            f"abnormal_only={abnormal_only} | "
-            f"counts="
-            f"{self.class_counts.tolist()} | "
+            f"counts={self.class_counts.tolist()} | "
             f"{csv_path}"
         )
 
@@ -383,7 +549,7 @@ class TokenDataset(
             self.df
         )
 
-    def _resolve_path(
+    def resolve_token_path(
         self,
         raw_path,
     ):
@@ -392,7 +558,6 @@ class TokenDataset(
         )
 
         if token_path.exists():
-
             return token_path
 
         relative_path = (
@@ -401,7 +566,6 @@ class TokenDataset(
         )
 
         if relative_path.exists():
-
             return relative_path
 
         raise FileNotFoundError(
@@ -418,7 +582,7 @@ class TokenDataset(
         ]
 
         token_path = (
-            self._resolve_path(
+            self.resolve_token_path(
                 str(
                     row[
                         "tokens_path"
@@ -437,7 +601,6 @@ class TokenDataset(
             )
             != self.expected_shape
         ):
-
             raise ValueError(
                 f"Token shape error："
                 f"{token_path}\n"
@@ -462,7 +625,7 @@ class TokenDataset(
 
 
 # ============================================================
-# 7. Collate
+# 10. Collate
 # ============================================================
 def collate_fixed(
     batch,
@@ -485,7 +648,7 @@ def collate_fixed(
 
 
 # ============================================================
-# 8. DataLoader
+# 11. DataLoader
 # ============================================================
 def make_loader(
     dataset,
@@ -523,290 +686,67 @@ def make_loader(
 
 
 # ============================================================
-# 9. 多标签异常分类头
-#
-# 输出：
-#   logits[:, 0] = Crackle 是否存在
-#   logits[:, 1] = Wheeze 是否存在
+# 12. Abnormal class weights
 # ============================================================
-class MultilabelAbnormalHead(
-    nn.Module
+def build_abnormal_class_weights(
+    class_counts,
+    power,
 ):
+    abnormal_counts = (
+        class_counts[
+            1:4
+        ]
+        .astype(
+            np.float64
+        )
+    )
 
-    def __init__(
-        self,
-        cfg,
-    ):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.LayerNorm(
-                cfg["D_MODEL"]
+    weights = (
+        1.0
+        /
+        np.power(
+            np.maximum(
+                abnormal_counts,
+                1.0,
             ),
-
-            nn.Linear(
-                cfg["D_MODEL"],
-                cfg["HEAD_HIDDEN_DIM"],
-            ),
-
-            nn.GELU(),
-
-            nn.Dropout(
-                cfg["HEAD_DROPOUT"]
-            ),
-
-            nn.Linear(
-                cfg["HEAD_HIDDEN_DIM"],
-                2,
+            float(
+                power
             ),
         )
-
-    def forward(
-        self,
-        x,
-    ):
-        return self.net(
-            x
-        )
-
-
-# ============================================================
-# 10. 标签转换
-#
-# 1 Crackle -> [1, 0]
-# 2 Wheeze  -> [0, 1]
-# 3 Both    -> [1, 1]
-# ============================================================
-def make_multilabel_target(
-    y,
-):
-    target = torch.zeros(
-        y.size(0),
-        2,
-
-        dtype=torch.float32,
-
-        device=y.device,
     )
 
-    # Crackle 或 Both
-    target[:, 0] = (
-        (
-            y == 1
-        )
-        |
-        (
-            y == 3
-        )
-    ).float()
-
-    # Wheeze 或 Both
-    target[:, 1] = (
-        (
-            y == 2
-        )
-        |
-        (
-            y == 3
-        )
-    ).float()
-
-    return target
-
-
-# ============================================================
-# 11. 计算 BCE pos_weight
-# ============================================================
-def build_pos_weight(
-    labels,
-    cfg,
-):
-    labels = np.asarray(
-        labels,
-        dtype=np.int64,
-    )
-
-    # Crackle 存在：
-    # 正样本 = class 1 + class 3
-    # 负样本 = class 2
-    crackle_positive = np.sum(
-        (
-            labels == 1
-        )
-        |
-        (
-            labels == 3
-        )
-    )
-
-    crackle_negative = np.sum(
-        labels == 2
-    )
-
-    # Wheeze 存在：
-    # 正样本 = class 2 + class 3
-    # 负样本 = class 1
-    wheeze_positive = np.sum(
-        (
-            labels == 2
-        )
-        |
-        (
-            labels == 3
-        )
-    )
-
-    wheeze_negative = np.sum(
-        labels == 1
-    )
-
-    raw_weights = np.asarray(
-        [
-            crackle_negative
-            / max(
-                crackle_positive,
-                1,
-            ),
-
-            wheeze_negative
-            / max(
-                wheeze_positive,
-                1,
-            ),
-        ],
-
-        dtype=np.float32,
-    )
-
-    clipped_weights = np.clip(
-        raw_weights,
-
-        float(
-            cfg[
-                "POS_WEIGHT_MIN"
-            ]
-        ),
-
-        float(
-            cfg[
-                "POS_WEIGHT_MAX"
-            ]
-        ),
+    weights = (
+        weights
+        /
+        weights.mean()
     )
 
     print(
-        "[Stage 2] Crackle positive/negative:",
-        crackle_positive,
-        crackle_negative,
+        "[Loss] abnormal counts:",
+        abnormal_counts.tolist(),
     )
 
     print(
-        "[Stage 2] Wheeze positive/negative:",
-        wheeze_positive,
-        wheeze_negative,
-    )
-
-    print(
-        "[Stage 2] raw pos_weight:",
-        raw_weights.tolist(),
-    )
-
-    print(
-        "[Stage 2] clipped pos_weight:",
-        clipped_weights.tolist(),
+        "[Loss] abnormal weights:",
+        np.round(
+            weights,
+            6,
+        ).tolist(),
     )
 
     return torch.tensor(
-        clipped_weights,
+        weights,
         dtype=torch.float32,
     )
 
 
 # ============================================================
-# 12. 将多标签概率映射为 1/2/3 类
-# ============================================================
-def pathology_probabilities_to_class(
-    probabilities,
-    crackle_threshold,
-    wheeze_threshold,
-):
-    crackle_probability = (
-        probabilities[:, 0]
-    )
-
-    wheeze_probability = (
-        probabilities[:, 1]
-    )
-
-    has_crackle = (
-        crackle_probability
-        >= crackle_threshold
-    )
-
-    has_wheeze = (
-        wheeze_probability
-        >= wheeze_threshold
-    )
-
-    prediction = np.zeros(
-        len(
-            probabilities
-        ),
-
-        dtype=np.int64,
-    )
-
-    # 只有 Crackle
-    prediction[
-        has_crackle
-        & ~has_wheeze
-    ] = 1
-
-    # 只有 Wheeze
-    prediction[
-        ~has_crackle
-        & has_wheeze
-    ] = 2
-
-    # 同时存在
-    prediction[
-        has_crackle
-        & has_wheeze
-    ] = 3
-
-    # 两个概率都低于阈值时，
-    # 强制选择概率更高的类别，
-    # 避免 Stage 1 已判为异常却输出 Normal
-    neither_mask = (
-        ~has_crackle
-        & ~has_wheeze
-    )
-
-    prediction[
-        neither_mask
-        & (
-            crackle_probability
-            >= wheeze_probability
-        )
-    ] = 1
-
-    prediction[
-        neither_mask
-        & (
-            wheeze_probability
-            > crackle_probability
-        )
-    ] = 2
-
-    return prediction
-
-
-# ============================================================
-# 13. 二分类指标
+# 13. Binary metrics
 # ============================================================
 def calculate_binary_metrics(
     y_true_four,
     y_pred_binary,
+    prefix,
 ):
     y_true_binary = (
         y_true_four > 0
@@ -838,7 +778,7 @@ def calculate_binary_metrics(
         cm[1].sum()
     )
 
-    binary_sp = (
+    sp = (
         100.0
         * float(
             cm[0, 0]
@@ -849,7 +789,7 @@ def calculate_binary_metrics(
         )
     )
 
-    binary_se = (
+    se = (
         100.0
         * float(
             cm[1, 1]
@@ -860,32 +800,31 @@ def calculate_binary_metrics(
         )
     )
 
-    binary_score = (
-        binary_sp
-        + binary_se
+    score = (
+        sp + se
     ) / 2.0
 
     return {
-        "BINARY_SP": float(
-            binary_sp
+        f"{prefix}_SP": float(
+            sp
         ),
 
-        "BINARY_SE": float(
-            binary_se
+        f"{prefix}_SE": float(
+            se
         ),
 
-        "BINARY_SCORE": float(
-            binary_score
+        f"{prefix}_SCORE": float(
+            score
         ),
 
-        "BINARY_CM": cm,
+        f"{prefix}_CM": cm,
     }
 
 
 # ============================================================
-# 14. 严格四分类指标
+# 14. Strict four-class metrics
 # ============================================================
-def calculate_four_metrics(
+def calculate_four_class_metrics(
     y_true,
     y_pred,
 ):
@@ -919,7 +858,7 @@ def calculate_four_metrics(
         )
     )
 
-    abnormal_correct = float(
+    correct_abnormal = float(
         cm[1, 1]
         + cm[2, 2]
         + cm[3, 3]
@@ -927,7 +866,7 @@ def calculate_four_metrics(
 
     four_se = (
         100.0
-        * abnormal_correct
+        * correct_abnormal
         / max(
             abnormal_total,
             1.0,
@@ -950,9 +889,7 @@ def calculate_four_metrics(
     macro_f1 = f1_score(
         y_true,
         y_pred,
-
         average="macro",
-
         zero_division=0,
     )
 
@@ -972,11 +909,9 @@ def calculate_four_metrics(
         zero_division=0,
     )
 
-    predicted_counts = (
-        np.bincount(
-            y_pred,
-            minlength=4,
-        )
+    predicted_counts = np.bincount(
+        y_pred,
+        minlength=4,
     )
 
     return {
@@ -996,13 +931,11 @@ def calculate_four_metrics(
             accuracy
         ),
 
-        "F1": float(
+        "MACRO_F1": float(
             macro_f1
         ),
 
-        "RECALL": (
-            class_recall
-        ),
+        "RECALL": class_recall,
 
         "PRED_COUNTS": (
             predicted_counts
@@ -1013,154 +946,155 @@ def calculate_four_metrics(
 
 
 # ============================================================
-# 15. 异常三分类指标
+# 15. Joint loss
 # ============================================================
-def calculate_abnormal_metrics(
-    y_true,
-    y_pred,
+def calculate_joint_loss(
+    outputs,
+    labels,
+    abnormal_class_weights,
+    cfg,
 ):
+    binary_logits = outputs[
+        "binary_logits"
+    ]
+
+    abnormal_logits = outputs[
+        "abnormal_logits"
+    ]
+
+    four_log_probs = outputs[
+        "four_log_probs"
+    ]
+
+    binary_target = (
+        labels > 0
+    ).long()
+
     abnormal_mask = (
-        y_true > 0
+        labels > 0
     )
 
-    abnormal_true = y_true[
-        abnormal_mask
-    ]
+    # --------------------------------------------------------
+    # Main four-class hierarchical loss
+    # --------------------------------------------------------
+    four_loss = F.nll_loss(
+        four_log_probs,
+        labels,
+    )
 
-    abnormal_pred = y_pred[
-        abnormal_mask
-    ]
+    # --------------------------------------------------------
+    # Auxiliary binary loss
+    # --------------------------------------------------------
+    binary_loss = F.cross_entropy(
+        binary_logits,
+        binary_target,
+    )
 
-    abnormal_accuracy = (
-        accuracy_score(
-            abnormal_true,
-            abnormal_pred,
+    # --------------------------------------------------------
+    # Auxiliary abnormal subtype loss
+    # --------------------------------------------------------
+    if abnormal_mask.any():
+        abnormal_target = (
+            labels[
+                abnormal_mask
+            ]
+            - 1
         )
-        * 100.0
-    )
 
-    abnormal_f1 = f1_score(
-        abnormal_true,
-        abnormal_pred,
+        abnormal_loss = F.cross_entropy(
+            abnormal_logits[
+                abnormal_mask
+            ],
 
-        labels=[
-            1,
-            2,
-            3,
-        ],
+            abnormal_target,
 
-        average="macro",
+            weight=(
+                abnormal_class_weights
+            ),
+        )
 
-        zero_division=0,
-    )
+    else:
+        abnormal_loss = torch.zeros(
+            (),
+            dtype=four_loss.dtype,
+            device=four_loss.device,
+        )
 
-    abnormal_recall = recall_score(
-        abnormal_true,
-        abnormal_pred,
+    total_loss = (
+        float(
+            cfg[
+                "FOUR_LOSS_WEIGHT"
+            ]
+        )
+        * four_loss
 
-        labels=[
-            1,
-            2,
-            3,
-        ],
+        +
 
-        average=None,
+        float(
+            cfg[
+                "BINARY_LOSS_WEIGHT"
+            ]
+        )
+        * binary_loss
 
-        zero_division=0,
-    )
+        +
 
-    abnormal_cm = confusion_matrix(
-        abnormal_true,
-        abnormal_pred,
-
-        labels=[
-            1,
-            2,
-            3,
-        ],
+        float(
+            cfg[
+                "ABNORMAL_LOSS_WEIGHT"
+            ]
+        )
+        * abnormal_loss
     )
 
     return {
-        "ABNORMAL_ACC": float(
-            abnormal_accuracy
-        ),
-
-        "ABNORMAL_F1": float(
-            abnormal_f1
-        ),
-
-        "ABNORMAL_RECALL": (
-            abnormal_recall
-        ),
-
-        "ABNORMAL_CM": (
-            abnormal_cm
-        ),
+        "total": total_loss,
+        "four": four_loss,
+        "binary": binary_loss,
+        "abnormal": abnormal_loss,
     }
 
 
 # ============================================================
-# 16. Stage 2 训练一个 Epoch
+# 16. Train one epoch
 # ============================================================
-def train_stage2_epoch(
+def train_one_epoch(
     loader,
-    abnormal_backbone,
-    abnormal_head,
+    model,
     optimizer,
     device,
     scaler,
     use_amp,
+    abnormal_class_weights,
     cfg,
-    freeze_backbone,
-    pos_weight,
 ):
-    if freeze_backbone:
-
-        abnormal_backbone.eval()
-
-    else:
-
-        abnormal_backbone.train()
-
-    abnormal_head.train()
-
-    criterion = nn.BCEWithLogitsLoss(
-        pos_weight=pos_weight.to(
-            device
-        )
-    )
-
-    trainable_parameters = [
-        parameter
-        for parameter
-        in (
-            list(
-                abnormal_backbone
-                .parameters()
-            )
-            +
-            list(
-                abnormal_head
-                .parameters()
-            )
-        )
-        if parameter.requires_grad
-    ]
+    model.train()
 
     optimizer.zero_grad(
         set_to_none=True
     )
 
-    total_loss = 0.0
-    optimizer_steps = 0
+    accumulation_steps = int(
+        cfg["ACCUM_STEPS"]
+    )
 
     number_of_batches = len(
         loader
     )
 
-    accumulation_steps = int(
-        cfg["ACCUM_STEPS"]
-    )
+    total_loss_sum = 0.0
+    four_loss_sum = 0.0
+    binary_loss_sum = 0.0
+    abnormal_loss_sum = 0.0
+
+    optimizer_steps = 0
+
+    trainable_parameters = [
+        parameter
+        for parameter
+        in model.parameters()
+        if parameter.requires_grad
+    ]
 
     for batch_index, (
         x,
@@ -1168,7 +1102,6 @@ def train_stage2_epoch(
     ) in enumerate(
         loader
     ):
-
         x = x.to(
             device,
             non_blocking=True,
@@ -1179,53 +1112,50 @@ def train_stage2_epoch(
             non_blocking=True,
         )
 
-        target = make_multilabel_target(
-            y
-        )
-
         with torch.autocast(
             device_type=device.type,
             enabled=use_amp,
         ):
-
-            if freeze_backbone:
-
-                with torch.no_grad():
-
-                    feature = (
-                        abnormal_backbone(
-                            x
-                        )
-                    )
-
-            else:
-
-                feature = (
-                    abnormal_backbone(
-                        x
-                    )
-                )
-
-            logits = abnormal_head(
-                feature
+            outputs = model(
+                x
             )
 
-            raw_loss = criterion(
-                logits,
-                target,
+            losses = calculate_joint_loss(
+                outputs,
+                y,
+                abnormal_class_weights,
+                cfg,
             )
 
-            loss = (
-                raw_loss
+            scaled_loss = (
+                losses["total"]
                 / accumulation_steps
             )
 
         scaler.scale(
-            loss
+            scaled_loss
         ).backward()
 
-        total_loss += float(
-            raw_loss
+        total_loss_sum += float(
+            losses["total"]
+            .detach()
+            .item()
+        )
+
+        four_loss_sum += float(
+            losses["four"]
+            .detach()
+            .item()
+        )
+
+        binary_loss_sum += float(
+            losses["binary"]
+            .detach()
+            .item()
+        )
+
+        abnormal_loss_sum += float(
+            losses["abnormal"]
             .detach()
             .item()
         )
@@ -1246,14 +1176,18 @@ def train_stage2_epoch(
         )
 
         if should_step:
-
             scaler.unscale_(
                 optimizer
             )
 
             torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
-                max_norm=2.0,
+
+                max_norm=float(
+                    cfg[
+                        "GRAD_CLIP"
+                    ]
+                ),
             )
 
             old_scale = (
@@ -1271,502 +1205,360 @@ def train_stage2_epoch(
             )
 
             if new_scale >= old_scale:
-
                 optimizer_steps += 1
 
             optimizer.zero_grad(
                 set_to_none=True
             )
 
-    mean_loss = (
-        total_loss
-        / max(
-            number_of_batches,
-            1,
-        )
+    divisor = max(
+        number_of_batches,
+        1,
     )
 
-    return (
-        mean_loss,
-        optimizer_steps,
-    )
+    return {
+        "TOTAL_LOSS": (
+            total_loss_sum
+            / divisor
+        ),
+
+        "FOUR_LOSS": (
+            four_loss_sum
+            / divisor
+        ),
+
+        "BINARY_LOSS": (
+            binary_loss_sum
+            / divisor
+        ),
+
+        "ABNORMAL_LOSS": (
+            abnormal_loss_sum
+            / divisor
+        ),
+
+        "OPTIMIZER_STEPS": (
+            optimizer_steps
+        ),
+    }
 
 
 # ============================================================
-# 17. 收集级联模型输出
+# 17. Evaluation
 # ============================================================
 @torch.no_grad()
-def collect_cascade_outputs(
+def evaluate(
     loader,
-    binary_backbone,
-    binary_head,
-    binary_threshold,
-    abnormal_backbone,
-    abnormal_head,
+    model,
     device,
+    abnormal_class_weights,
+    cfg,
 ):
-    binary_backbone.eval()
-    binary_head.eval()
-
-    abnormal_backbone.eval()
-    abnormal_head.eval()
+    model.eval()
 
     all_true = []
-    all_binary_prediction = []
-    all_pathology_probability = []
+    all_four_pred = []
+    all_gate_binary_pred = []
+
+    total_loss_sum = 0.0
+    four_loss_sum = 0.0
+    binary_loss_sum = 0.0
+    abnormal_loss_sum = 0.0
+
+    number_of_batches = len(
+        loader
+    )
 
     for x, y in loader:
-
         x = x.to(
             device,
             non_blocking=True,
         )
 
-        # ----------------------------------------------------
-        # Stage 1
-        # ----------------------------------------------------
-        binary_feature = (
-            binary_backbone(
-                x
-            )
+        y = y.to(
+            device,
+            non_blocking=True,
         )
 
-        binary_logits = (
-            binary_head(
-                binary_feature
-            )
+        outputs = model(
+            x
         )
 
-        abnormal_probability = (
-            torch.softmax(
-                binary_logits,
-                dim=1,
-            )[:, 1]
+        losses = calculate_joint_loss(
+            outputs,
+            y,
+            abnormal_class_weights,
+            cfg,
         )
 
-        binary_prediction = (
-            abnormal_probability
-            >= binary_threshold
+        four_prediction = torch.argmax(
+            outputs[
+                "four_log_probs"
+            ],
+            dim=1,
         )
 
-        # 为一个 Batch 中所有样本建立两个病理概率
-        pathology_probability = torch.zeros(
-            x.size(0),
-            2,
-
-            dtype=torch.float32,
-
-            device=device,
+        gate_binary_prediction = torch.argmax(
+            outputs[
+                "binary_logits"
+            ],
+            dim=1,
         )
-
-        # ----------------------------------------------------
-        # Stage 2
-        # ----------------------------------------------------
-        if binary_prediction.any():
-
-            abnormal_input = x[
-                binary_prediction
-            ]
-
-            abnormal_feature = (
-                abnormal_backbone(
-                    abnormal_input
-                )
-            )
-
-            abnormal_logits = (
-                abnormal_head(
-                    abnormal_feature
-                )
-            )
-
-            pathology_probability[
-                binary_prediction
-            ] = torch.sigmoid(
-                abnormal_logits
-            )
 
         all_true.append(
-            y.numpy()
+            y.detach().cpu()
         )
 
-        all_binary_prediction.append(
-            binary_prediction
-            .long()
+        all_four_pred.append(
+            four_prediction
             .detach()
             .cpu()
-            .numpy()
         )
 
-        all_pathology_probability.append(
-            pathology_probability
+        all_gate_binary_pred.append(
+            gate_binary_prediction
             .detach()
             .cpu()
-            .numpy()
         )
 
-    y_true = np.concatenate(
+        total_loss_sum += float(
+            losses["total"].item()
+        )
+
+        four_loss_sum += float(
+            losses["four"].item()
+        )
+
+        binary_loss_sum += float(
+            losses["binary"].item()
+        )
+
+        abnormal_loss_sum += float(
+            losses["abnormal"].item()
+        )
+
+    y_true = torch.cat(
         all_true
-    )
-
-    y_pred_binary = np.concatenate(
-        all_binary_prediction
-    )
-
-    pathology_probability = np.concatenate(
-        all_pathology_probability
-    )
-
-    return (
-        y_true,
-        y_pred_binary,
-        pathology_probability,
-    )
-
-
-# ============================================================
-# 18. 构建最终四分类结果
-# ============================================================
-def build_final_prediction(
-    y_pred_binary,
-    pathology_probability,
-    crackle_threshold,
-    wheeze_threshold,
-):
-    final_prediction = np.zeros(
-        len(
-            y_pred_binary
-        ),
-
-        dtype=np.int64,
-    )
-
-    abnormal_mask = (
-        y_pred_binary == 1
-    )
-
-    if np.any(
-        abnormal_mask
-    ):
-
-        final_prediction[
-            abnormal_mask
-        ] = pathology_probabilities_to_class(
-            pathology_probability[
-                abnormal_mask
-            ],
-
-            crackle_threshold,
-
-            wheeze_threshold,
-        )
-
-    return final_prediction
-
-
-# ============================================================
-# 19. 搜索 Crackle/Wheeze 阈值
-# ============================================================
-def search_pathology_thresholds(
-    y_true,
-    y_pred_binary,
-    pathology_probability,
-    cfg,
-):
-    crackle_thresholds = np.arange(
-        float(
-            cfg[
-                "CRACKLE_THRESHOLD_MIN"
-            ]
-        ),
-
-        float(
-            cfg[
-                "CRACKLE_THRESHOLD_MAX"
-            ]
-        )
-        +
-        float(
-            cfg[
-                "PATHOLOGY_THRESHOLD_STEP"
-            ]
-        )
-        / 2.0,
-
-        float(
-            cfg[
-                "PATHOLOGY_THRESHOLD_STEP"
-            ]
-        ),
-    )
-
-    wheeze_thresholds = np.arange(
-        float(
-            cfg[
-                "WHEEZE_THRESHOLD_MIN"
-            ]
-        ),
-
-        float(
-            cfg[
-                "WHEEZE_THRESHOLD_MAX"
-            ]
-        )
-        +
-        float(
-            cfg[
-                "PATHOLOGY_THRESHOLD_STEP"
-            ]
-        )
-        / 2.0,
-
-        float(
-            cfg[
-                "PATHOLOGY_THRESHOLD_STEP"
-            ]
-        ),
-    )
-
-    fixed_binary_metrics = (
-        calculate_binary_metrics(
-            y_true,
-            y_pred_binary,
-        )
-    )
-
-    best_metrics = None
-
-    for crackle_threshold in crackle_thresholds:
-
-        for wheeze_threshold in wheeze_thresholds:
-
-            final_prediction = (
-                build_final_prediction(
-                    y_pred_binary,
-
-                    pathology_probability,
-
-                    float(
-                        crackle_threshold
-                    ),
-
-                    float(
-                        wheeze_threshold
-                    ),
-                )
-            )
-
-            current_metrics = {
-                **fixed_binary_metrics,
-
-                **calculate_four_metrics(
-                    y_true,
-                    final_prediction,
-                ),
-
-                **calculate_abnormal_metrics(
-                    y_true,
-                    final_prediction,
-                ),
-
-                "CRACKLE_THRESHOLD": float(
-                    crackle_threshold
-                ),
-
-                "WHEEZE_THRESHOLD": float(
-                    wheeze_threshold
-                ),
-            }
-
-            if best_metrics is None:
-
-                improved = True
-
-            else:
-
-                current_score = float(
-                    current_metrics[
-                        "FOUR_SCORE"
-                    ]
-                )
-
-                best_score = float(
-                    best_metrics[
-                        "FOUR_SCORE"
-                    ]
-                )
-
-                improved = (
-                    current_score
-                    > best_score
-                    + 1e-12
-                )
-
-                # Four Score 相同，
-                # 优先选择异常 Macro-F1 更高的阈值
-                if (
-                    not improved
-                    and abs(
-                        current_score
-                        - best_score
-                    )
-                    <= 1e-12
-                    and
-                    current_metrics[
-                        "ABNORMAL_F1"
-                    ]
-                    >
-                    best_metrics[
-                        "ABNORMAL_F1"
-                    ]
-                ):
-
-                    improved = True
-
-            if improved:
-
-                best_metrics = (
-                    current_metrics
-                )
-
-    if best_metrics is None:
-
-        raise RuntimeError(
-            "Crackle/Wheeze "
-            "阈值搜索失败。"
-        )
-
-    return best_metrics
-
-
-# ============================================================
-# 20. 使用阈值搜索评价
-# ============================================================
-@torch.no_grad()
-def evaluate_with_threshold_search(
-    loader,
-    binary_backbone,
-    binary_head,
-    binary_threshold,
-    abnormal_backbone,
-    abnormal_head,
-    device,
-    cfg,
-):
-    (
-        y_true,
-        y_pred_binary,
-        pathology_probability,
-    ) = collect_cascade_outputs(
-        loader,
-
-        binary_backbone,
-        binary_head,
-
-        binary_threshold,
-
-        abnormal_backbone,
-        abnormal_head,
-
-        device,
-    )
-
-    return search_pathology_thresholds(
-        y_true,
-
-        y_pred_binary,
-
-        pathology_probability,
-
-        cfg,
-    )
-
-
-# ============================================================
-# 21. 使用固定阈值评价
-# ============================================================
-@torch.no_grad()
-def evaluate_with_fixed_thresholds(
-    loader,
-    binary_backbone,
-    binary_head,
-    binary_threshold,
-    abnormal_backbone,
-    abnormal_head,
-    device,
-    crackle_threshold,
-    wheeze_threshold,
-):
-    (
-        y_true,
-        y_pred_binary,
-        pathology_probability,
-    ) = collect_cascade_outputs(
-        loader,
-
-        binary_backbone,
-        binary_head,
-
-        binary_threshold,
-
-        abnormal_backbone,
-        abnormal_head,
-
-        device,
-    )
-
-    final_prediction = (
-        build_final_prediction(
-            y_pred_binary,
-
-            pathology_probability,
-
-            crackle_threshold,
-
-            wheeze_threshold,
-        )
+    ).numpy()
+
+    y_pred_four = torch.cat(
+        all_four_pred
+    ).numpy()
+
+    y_pred_gate_binary = torch.cat(
+        all_gate_binary_pred
+    ).numpy()
+
+    # Binary prediction derived from final four-class prediction.
+    y_pred_final_binary = (
+        y_pred_four > 0
+    ).astype(
+        np.int64
     )
 
     metrics = {}
 
     metrics.update(
+        calculate_four_class_metrics(
+            y_true,
+            y_pred_four,
+        )
+    )
+
+    metrics.update(
         calculate_binary_metrics(
             y_true,
-            y_pred_binary,
+            y_pred_final_binary,
+            prefix="FINAL_BINARY",
         )
     )
 
     metrics.update(
-        calculate_four_metrics(
+        calculate_binary_metrics(
             y_true,
-            final_prediction,
+            y_pred_gate_binary,
+            prefix="GATE_BINARY",
         )
+    )
+
+    divisor = max(
+        number_of_batches,
+        1,
     )
 
     metrics.update(
-        calculate_abnormal_metrics(
-            y_true,
-            final_prediction,
-        )
-    )
+        {
+            "TOTAL_LOSS": (
+                total_loss_sum
+                / divisor
+            ),
 
-    metrics[
-        "CRACKLE_THRESHOLD"
-    ] = float(
-        crackle_threshold
-    )
+            "FOUR_LOSS": (
+                four_loss_sum
+                / divisor
+            ),
 
-    metrics[
-        "WHEEZE_THRESHOLD"
-    ] = float(
-        wheeze_threshold
+            "BINARY_LOSS": (
+                binary_loss_sum
+                / divisor
+            ),
+
+            "ABNORMAL_LOSS": (
+                abnormal_loss_sum
+                / divisor
+            ),
+        }
     )
 
     return metrics
 
 
 # ============================================================
-# 22. 指标转换
+# 18. Shape test
+# ============================================================
+@torch.no_grad()
+def run_shape_test(
+    loader,
+    model,
+    device,
+    cfg,
+):
+    model.eval()
+
+    x, _ = next(
+        iter(
+            loader
+        )
+    )
+
+    x = x[
+        :1
+    ].to(
+        device
+    )
+
+    outputs = model(
+        x
+    )
+
+    print(
+        "[Shape] input:",
+        tuple(
+            x.shape
+        ),
+    )
+
+    print(
+        "[Shape] feature:",
+        tuple(
+            outputs[
+                "feature"
+            ].shape
+        ),
+    )
+
+    print(
+        "[Shape] binary logits:",
+        tuple(
+            outputs[
+                "binary_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "[Shape] abnormal logits:",
+        tuple(
+            outputs[
+                "abnormal_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "[Shape] four log probs:",
+        tuple(
+            outputs[
+                "four_log_probs"
+            ].shape
+        ),
+    )
+
+    if tuple(
+        outputs[
+            "feature"
+        ].shape
+    ) != (
+        1,
+        int(
+            cfg["D_MODEL"]
+        ),
+    ):
+        raise RuntimeError(
+            "Backbone output shape error."
+        )
+
+    if tuple(
+        outputs[
+            "binary_logits"
+        ].shape
+    ) != (
+        1,
+        2,
+    ):
+        raise RuntimeError(
+            "Binary head shape error."
+        )
+
+    if tuple(
+        outputs[
+            "abnormal_logits"
+        ].shape
+    ) != (
+        1,
+        3,
+    ):
+        raise RuntimeError(
+            "Abnormal head shape error."
+        )
+
+    if tuple(
+        outputs[
+            "four_log_probs"
+        ].shape
+    ) != (
+        1,
+        4,
+    ):
+        raise RuntimeError(
+            "Four-class probability shape error."
+        )
+
+    probability_sum = (
+        outputs[
+            "four_log_probs"
+        ]
+        .exp()
+        .sum(
+            dim=1
+        )
+    )
+
+    print(
+        "[Shape] probability sum:",
+        probability_sum
+        .detach()
+        .cpu()
+        .tolist(),
+    )
+
+    print(
+        "[Shape] Passed."
+    )
+
+
+# ============================================================
+# 19. Serializable metrics
 # ============================================================
 def serializable_metrics(
     metrics,
@@ -1776,18 +1568,15 @@ def serializable_metrics(
     for key, value in (
         metrics.items()
     ):
-
         if isinstance(
             value,
             np.ndarray,
         ):
-
             result[key] = (
                 value.tolist()
             )
 
         else:
-
             result[key] = (
                 value
             )
@@ -1796,17 +1585,16 @@ def serializable_metrics(
 
 
 # ============================================================
-# 23. 保存模型
+# 20. Save checkpoint
 # ============================================================
 def save_checkpoint(
     path,
     epoch,
-    abnormal_backbone,
-    abnormal_head,
+    model,
     optimizer,
     scheduler,
     metrics,
-    pos_weight,
+    abnormal_class_weights,
     cfg,
 ):
     torch.save(
@@ -1815,13 +1603,22 @@ def save_checkpoint(
                 epoch
             ),
 
-            "abnormal_backbone_state": (
-                abnormal_backbone
+            "model_state": (
+                model.state_dict()
+            ),
+
+            "backbone_state": (
+                model.backbone
+                .state_dict()
+            ),
+
+            "binary_head_state": (
+                model.binary_head
                 .state_dict()
             ),
 
             "abnormal_head_state": (
-                abnormal_head
+                model.abnormal_head
                 .state_dict()
             ),
 
@@ -1839,26 +1636,32 @@ def save_checkpoint(
                 ]
             ),
 
-            "binary_score": float(
+            "four_sp": float(
                 metrics[
-                    "BINARY_SCORE"
+                    "FOUR_SP"
                 ]
             ),
 
-            "crackle_threshold": float(
+            "four_se": float(
                 metrics[
-                    "CRACKLE_THRESHOLD"
+                    "FOUR_SE"
                 ]
             ),
 
-            "wheeze_threshold": float(
+            "final_binary_score": float(
                 metrics[
-                    "WHEEZE_THRESHOLD"
+                    "FINAL_BINARY_SCORE"
                 ]
             ),
 
-            "pos_weight": (
-                pos_weight
+            "gate_binary_score": float(
+                metrics[
+                    "GATE_BINARY_SCORE"
+                ]
+            ),
+
+            "abnormal_class_weights": (
+                abnormal_class_weights
                 .detach()
                 .cpu()
                 .tolist()
@@ -1880,11 +1683,10 @@ def save_checkpoint(
 
 
 # ============================================================
-# 24. 打印最终结果
+# 21. Print final results
 # ============================================================
-def print_final(
+def print_final_results(
     metrics,
-    binary_threshold,
 ):
     print()
 
@@ -1893,46 +1695,12 @@ def print_final(
     )
 
     print(
-        "[FINAL MULTILABEL CASCADE TEST]"
+        "[FINAL SOFT HIERARCHICAL TEST]"
     )
 
     print(
         "=" * 80
     )
-
-    print(
-        f"Binary threshold: "
-        f"{binary_threshold:.4f}"
-    )
-
-    print(
-        f"Crackle threshold: "
-        f"{metrics['CRACKLE_THRESHOLD']:.4f}"
-    )
-
-    print(
-        f"Wheeze threshold: "
-        f"{metrics['WHEEZE_THRESHOLD']:.4f}"
-    )
-
-    print()
-
-    print(
-        f"Binary Score: "
-        f"{metrics['BINARY_SCORE']:.4f}"
-    )
-
-    print(
-        f"Binary SP: "
-        f"{metrics['BINARY_SP']:.4f}"
-    )
-
-    print(
-        f"Binary SE: "
-        f"{metrics['BINARY_SE']:.4f}"
-    )
-
-    print()
 
     print(
         f"4-Class Score: "
@@ -1956,39 +1724,55 @@ def print_final(
 
     print(
         f"Macro-F1: "
-        f"{metrics['F1']:.4f}"
+        f"{metrics['MACRO_F1']:.4f}"
     )
 
     print()
 
     print(
-        f"Abnormal Accuracy: "
-        f"{metrics['ABNORMAL_ACC']:.4f}"
+        "Final-prediction Binary Metrics"
     )
 
     print(
-        f"Abnormal Macro-F1: "
-        f"{metrics['ABNORMAL_F1']:.4f}"
+        f"Binary Score: "
+        f"{metrics['FINAL_BINARY_SCORE']:.4f}"
     )
 
     print(
-        "Abnormal Recall"
-        "[Crackle,Wheeze,Both]:",
+        f"Binary SP: "
+        f"{metrics['FINAL_BINARY_SP']:.4f}"
+    )
 
-        np.round(
-            metrics[
-                "ABNORMAL_RECALL"
-            ],
-            4,
-        ).tolist(),
+    print(
+        f"Binary SE: "
+        f"{metrics['FINAL_BINARY_SE']:.4f}"
     )
 
     print()
 
     print(
-        "Recall"
-        "[Normal,Crackle,Wheeze,Both]:",
+        "Binary-gate Metrics"
+    )
 
+    print(
+        f"Gate Score: "
+        f"{metrics['GATE_BINARY_SCORE']:.4f}"
+    )
+
+    print(
+        f"Gate SP: "
+        f"{metrics['GATE_BINARY_SP']:.4f}"
+    )
+
+    print(
+        f"Gate SE: "
+        f"{metrics['GATE_BINARY_SE']:.4f}"
+    )
+
+    print()
+
+    print(
+        "Recall[Normal,Crackle,Wheeze,Both]:",
         np.round(
             metrics[
                 "RECALL"
@@ -1999,34 +1783,9 @@ def print_final(
 
     print(
         "PredCount:",
-
         metrics[
             "PRED_COUNTS"
         ].tolist(),
-    )
-
-    print()
-
-    print(
-        "Binary confusion matrix:"
-    )
-
-    print(
-        metrics[
-            "BINARY_CM"
-        ]
-    )
-
-    print()
-
-    print(
-        "Abnormal confusion matrix:"
-    )
-
-    print(
-        metrics[
-            "ABNORMAL_CM"
-        ]
     )
 
     print()
@@ -2041,9 +1800,33 @@ def print_final(
         ]
     )
 
+    print()
+
+    print(
+        "Final binary confusion matrix:"
+    )
+
+    print(
+        metrics[
+            "FINAL_BINARY_CM"
+        ]
+    )
+
+    print()
+
+    print(
+        "Binary gate confusion matrix:"
+    )
+
+    print(
+        metrics[
+            "GATE_BINARY_CM"
+        ]
+    )
+
 
 # ============================================================
-# 25. 主函数
+# 22. Main
 # ============================================================
 def main():
 
@@ -2058,8 +1841,7 @@ def main():
     device = torch.device(
         "cuda"
         if (
-            cfg["DEVICE"]
-            == "cuda"
+            cfg["DEVICE"] == "cuda"
             and torch.cuda.is_available()
         )
         else "cpu"
@@ -2071,10 +1853,8 @@ def main():
     )
 
     if device.type == "cuda":
-
         print(
             "[INFO] GPU:",
-
             torch.cuda.get_device_name(
                 torch.cuda.current_device()
             ),
@@ -2086,17 +1866,18 @@ def main():
     )
 
     if (
-        cfg["REQUIRE_MAMBA"]
+        bool(
+            cfg["REQUIRE_MAMBA"]
+        )
         and not HAS_MAMBA
     ):
-
         raise RuntimeError(
             "mamba_ssm 导入失败。"
         )
 
-    # --------------------------------------------------------
-    # 数据文件
-    # --------------------------------------------------------
+    # ========================================================
+    # Paths
+    # ========================================================
     root = Path(
         cfg["ROOT"]
     )
@@ -2117,102 +1898,91 @@ def main():
     )
 
     if not train_csv.exists():
-
         raise FileNotFoundError(
             train_csv
         )
 
     if not test_csv.exists():
-
         raise FileNotFoundError(
             test_csv
         )
 
     if val_csv.exists():
-
         selection_csv = (
             val_csv
         )
 
         print(
-            "[INFO] 使用验证集：",
+            "[INFO] Validation file:",
             selection_csv,
         )
 
     else:
-
         selection_csv = (
             test_csv
         )
 
         print(
-            "[WARNING] 没有 val_index.csv，"
-            "暂时使用 test_index.csv "
-            "选择 Epoch 和阈值。"
+            "[WARNING] val_index.csv 不存在。"
         )
 
-    # --------------------------------------------------------
-    # 二分类 checkpoint
-    # --------------------------------------------------------
-    binary_checkpoint_path = Path(
-        cfg[
-            "BINARY_CKPT"
-        ]
-    )
-
-    if not binary_checkpoint_path.exists():
-
-        raise FileNotFoundError(
-            f"找不到二分类 checkpoint："
-            f"{binary_checkpoint_path}"
+        print(
+            "[WARNING] 当前暂时使用 test_index.csv "
+            "进行 checkpoint 选择。"
         )
 
-    # --------------------------------------------------------
-    # 保存目录
-    # --------------------------------------------------------
-    save_directory = Path(
+        print(
+            "[WARNING] 正式实验应建立独立验证集，"
+            "否则会产生测试集泄漏。"
+        )
+
+    save_dir = Path(
         cfg["SAVE_DIR"]
     )
 
-    save_directory.mkdir(
+    save_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     best_checkpoint_path = (
-        save_directory
-        / "best_multilabel_abnormal.pth"
+        save_dir
+        / "best_soft_hierarchical.pth"
     )
 
     last_checkpoint_path = (
-        save_directory
-        / "last_multilabel_abnormal.pth"
+        save_dir
+        / "last_soft_hierarchical.pth"
     )
 
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
+    # ========================================================
+    # Datasets
+    # ========================================================
+    train_dataset = TokenDataset(
+        train_csv,
+        cfg,
+    )
+
     selection_dataset = TokenDataset(
         selection_csv,
         cfg,
-        abnormal_only=False,
     )
 
     test_dataset = TokenDataset(
         test_csv,
         cfg,
-        abnormal_only=False,
     )
 
-    abnormal_train_dataset = TokenDataset(
-        train_csv,
+    # ========================================================
+    # DataLoaders
+    # ========================================================
+    train_loader = make_loader(
+        train_dataset,
         cfg,
-        abnormal_only=True,
+        device,
+        shuffle=True,
     )
 
-    # --------------------------------------------------------
-    # DataLoader
-    # --------------------------------------------------------
     selection_loader = make_loader(
         selection_dataset,
         cfg,
@@ -2227,161 +1997,135 @@ def main():
         shuffle=False,
     )
 
-    # 不使用 WeightedRandomSampler
-    abnormal_train_loader = make_loader(
-        abnormal_train_dataset,
-        cfg,
+    # ========================================================
+    # Model
+    # ========================================================
+    model = SoftHierarchicalClassifier(
+        cfg
+    ).to(
+        device
+    )
+
+    # ========================================================
+    # Optional warm start from previous binary checkpoint
+    # ========================================================
+    binary_checkpoint_path = Path(
+        cfg[
+            "BINARY_CKPT"
+        ]
+    )
+
+    if (
+        bool(
+            cfg[
+                "INIT_FROM_BINARY"
+            ]
+        )
+        and binary_checkpoint_path.exists()
+    ):
+        binary_checkpoint = safe_torch_load(
+            binary_checkpoint_path,
+            device,
+        )
+
+        model.backbone.load_state_dict(
+            binary_checkpoint[
+                "backbone_state"
+            ]
+        )
+
+        model.binary_head.load_state_dict(
+            binary_checkpoint[
+                "binary_head_state"
+            ]
+        )
+
+        print(
+            "[INIT] Loaded previous binary checkpoint:"
+        )
+
+        print(
+            binary_checkpoint_path
+        )
+
+        print(
+            f"[INIT] Previous Binary Score="
+            f"{binary_checkpoint.get('binary_score', float('nan')):.4f}"
+        )
+
+    else:
+        print(
+            "[INIT] Training from random initialization."
+        )
+
+    # All parts are trainable.
+    for parameter in model.parameters():
+        parameter.requires_grad = True
+
+    # ========================================================
+    # Shape test
+    # ========================================================
+    run_shape_test(
+        train_loader,
+        model,
         device,
-        shuffle=True,
-    )
-
-    # ========================================================
-    # Stage 1：加载并固定二分类模型
-    # ========================================================
-    binary_backbone = (
-        make_backbone(
-            cfg
-        ).to(device)
-    )
-
-    # 必须与原 best_binary.pth 的结构一致
-    binary_head = nn.Sequential(
-        nn.Dropout(
-            cfg["HEAD_DROPOUT"]
-        ),
-
-        nn.Linear(
-            cfg["D_MODEL"],
-            2,
-        ),
-    ).to(device)
-
-    binary_checkpoint = torch.load(
-        binary_checkpoint_path,
-        map_location=device,
-    )
-
-    binary_backbone.load_state_dict(
-        binary_checkpoint[
-            "backbone_state"
-        ]
-    )
-
-    binary_head.load_state_dict(
-        binary_checkpoint[
-            "binary_head_state"
-        ]
-    )
-
-    binary_threshold = float(
-        binary_checkpoint[
-            "threshold"
-        ]
-    )
-
-    binary_backbone.eval()
-    binary_head.eval()
-
-    for parameter in (
-        list(
-            binary_backbone
-            .parameters()
-        )
-        +
-        list(
-            binary_head
-            .parameters()
-        )
-    ):
-
-        parameter.requires_grad = (
-            False
-        )
-
-    print()
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "STAGE 1: "
-        "Fixed Normal / Abnormal checkpoint"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        f"Binary Score="
-        f"{binary_checkpoint['binary_score']:.4f}, "
-        f"Epoch="
-        f"{binary_checkpoint['epoch']}, "
-        f"Threshold="
-        f"{binary_threshold:.4f}"
-    )
-
-    # ========================================================
-    # Stage 2：多标签异常分类
-    # ========================================================
-    abnormal_backbone = (
-        make_backbone(
-            cfg
-        ).to(device)
-    )
-
-    # 使用二分类 Backbone 初始化
-    abnormal_backbone.load_state_dict(
-        binary_checkpoint[
-            "backbone_state"
-        ]
-    )
-
-    abnormal_head = (
-        MultilabelAbnormalHead(
-            cfg
-        ).to(device)
-    )
-
-    # 前两个 Epoch 冻结 Backbone
-    for parameter in (
-        abnormal_backbone.parameters()
-    ):
-
-        parameter.requires_grad = (
-            False
-        )
-
-    pos_weight = build_pos_weight(
-        abnormal_train_dataset.labels,
         cfg,
     )
 
+    # ========================================================
+    # Abnormal weights
+    # ========================================================
+    abnormal_class_weights = (
+        build_abnormal_class_weights(
+            train_dataset.class_counts,
+
+            cfg[
+                "ABNORMAL_WEIGHT_POWER"
+            ],
+        )
+        .to(device)
+    )
+
+    # ========================================================
+    # Optimizer
+    # ========================================================
     optimizer = torch.optim.AdamW(
         [
             {
                 "params": (
-                    abnormal_backbone
+                    model.backbone
                     .parameters()
                 ),
 
                 "lr": float(
                     cfg[
-                        "STAGE2_BACKBONE_LR"
+                        "BACKBONE_LR"
                     ]
                 ),
             },
 
             {
                 "params": (
-                    abnormal_head
+                    model.binary_head
                     .parameters()
                 ),
 
                 "lr": float(
                     cfg[
-                        "STAGE2_HEAD_LR"
+                        "BINARY_HEAD_LR"
+                    ]
+                ),
+            },
+
+            {
+                "params": (
+                    model.abnormal_head
+                    .parameters()
+                ),
+
+                "lr": float(
+                    cfg[
+                        "ABNORMAL_HEAD_LR"
                     ]
                 ),
             },
@@ -2400,12 +2144,14 @@ def main():
             optimizer,
 
             T_max=int(
-                cfg[
-                    "STAGE2_EPOCHS"
-                ]
+                cfg["EPOCHS"]
             ),
 
-            eta_min=5e-7,
+            eta_min=float(
+                cfg[
+                    "MIN_LR"
+                ]
+            ),
         )
     )
 
@@ -2418,139 +2164,117 @@ def main():
         use_amp
     )
 
+    # ========================================================
+    # Training
+    # ========================================================
     best_four_score = -1.0
+    best_macro_f1 = -1.0
     best_epoch = -1
+
     bad_epochs = 0
 
     print()
 
     print(
-        "=" * 80
+        "=" * 90
     )
 
     print(
-        "STAGE 2: "
-        "Multilabel Crackle/Wheeze presence"
+        "SOFT HIERARCHICAL JOINT TRAINING"
     )
 
     print(
-        "=" * 80
+        "=" * 90
     )
 
     for epoch in range(
         1,
         int(
-            cfg[
-                "STAGE2_EPOCHS"
-            ]
+            cfg["EPOCHS"]
         )
         + 1,
     ):
-
         start_time = time.time()
 
-        freeze_backbone = (
-            epoch
-            <= int(
-                cfg[
-                    "STAGE2_HEAD_ONLY_EPOCHS"
-                ]
-            )
-        )
-
-        if (
-            epoch
-            == int(
-                cfg[
-                    "STAGE2_HEAD_ONLY_EPOCHS"
-                ]
-            )
-            + 1
-        ):
-
-            for parameter in (
-                abnormal_backbone
-                .parameters()
-            ):
-
-                parameter.requires_grad = (
-                    True
-                )
-
-            print(
-                "[Stage 2] "
-                "Backbone 已解冻，"
-                "开始联合微调。"
-            )
-
-        (
-            train_loss,
-            optimizer_steps,
-        ) = train_stage2_epoch(
-            abnormal_train_loader,
-
-            abnormal_backbone,
-            abnormal_head,
-
+        train_metrics = train_one_epoch(
+            train_loader,
+            model,
             optimizer,
-
             device,
             scaler,
             use_amp,
-
+            abnormal_class_weights,
             cfg,
-
-            freeze_backbone,
-
-            pos_weight,
         )
 
-        metrics = (
-            evaluate_with_threshold_search(
-                selection_loader,
-
-                binary_backbone,
-                binary_head,
-
-                binary_threshold,
-
-                abnormal_backbone,
-                abnormal_head,
-
-                device,
-
-                cfg,
-            )
+        validation_metrics = evaluate(
+            selection_loader,
+            model,
+            device,
+            abnormal_class_weights,
+            cfg,
         )
 
-        backbone_lr = (
+        current_backbone_lr = (
             optimizer
             .param_groups[0]["lr"]
         )
 
-        head_lr = (
+        current_binary_head_lr = (
             optimizer
             .param_groups[1]["lr"]
         )
 
-        if optimizer_steps > 0:
+        current_abnormal_head_lr = (
+            optimizer
+            .param_groups[2]["lr"]
+        )
 
+        if (
+            train_metrics[
+                "OPTIMIZER_STEPS"
+            ]
+            > 0
+        ):
             scheduler.step()
 
-        current_score = float(
-            metrics[
+        current_four_score = float(
+            validation_metrics[
                 "FOUR_SCORE"
             ]
         )
 
-        if (
-            current_score
+        current_macro_f1 = float(
+            validation_metrics[
+                "MACRO_F1"
+            ]
+        )
+
+        improved = (
+            current_four_score
             > best_four_score
             + 1e-9
-        ):
+        )
 
+        if (
+            not improved
+            and abs(
+                current_four_score
+                - best_four_score
+            )
+            <= 1e-9
+            and current_macro_f1
+            > best_macro_f1
+        ):
+            improved = True
+
+        if improved:
             best_four_score = (
-                current_score
+                current_four_score
+            )
+
+            best_macro_f1 = (
+                current_macro_f1
             )
 
             best_epoch = (
@@ -2565,104 +2289,96 @@ def main():
 
             save_checkpoint(
                 best_checkpoint_path,
-
                 epoch,
-
-                abnormal_backbone,
-                abnormal_head,
-
+                model,
                 optimizer,
                 scheduler,
-
-                metrics,
-
-                pos_weight,
-
+                validation_metrics,
+                abnormal_class_weights,
                 cfg,
             )
 
         else:
-
             bad_epochs += 1
 
             marker = "-"
 
         save_checkpoint(
             last_checkpoint_path,
-
             epoch,
-
-            abnormal_backbone,
-            abnormal_head,
-
+            model,
             optimizer,
             scheduler,
-
-            metrics,
-
-            pos_weight,
-
+            validation_metrics,
+            abnormal_class_weights,
             cfg,
+        )
+
+        elapsed = (
+            time.time()
+            - start_time
         )
 
         print(
             f"[{marker}] "
             f"Epoch "
             f"{epoch:03d}/"
-            f"{cfg['STAGE2_EPOCHS']} | "
+            f"{cfg['EPOCHS']} | "
 
-            f"Mode "
-            f"{'Head-Only' if freeze_backbone else 'Fine-Tune'} | "
+            f"Train "
+            f"{train_metrics['TOTAL_LOSS']:.4f} | "
 
-            f"train "
-            f"{train_loss:.4f} | "
+            f"FourLoss "
+            f"{train_metrics['FOUR_LOSS']:.4f} | "
+
+            f"BinLoss "
+            f"{train_metrics['BINARY_LOSS']:.4f} | "
+
+            f"AbnLoss "
+            f"{train_metrics['ABNORMAL_LOSS']:.4f} | "
 
             f"4-Score "
-            f"{metrics['FOUR_SCORE']:.4f} | "
+            f"{validation_metrics['FOUR_SCORE']:.4f} | "
 
             f"4-SP "
-            f"{metrics['FOUR_SP']:.4f} | "
+            f"{validation_metrics['FOUR_SP']:.4f} | "
 
             f"4-SE "
-            f"{metrics['FOUR_SE']:.4f} | "
+            f"{validation_metrics['FOUR_SE']:.4f} | "
 
-            f"Abn-Acc "
-            f"{metrics['ABNORMAL_ACC']:.4f} | "
+            f"Final-Bin "
+            f"{validation_metrics['FINAL_BINARY_SCORE']:.4f} | "
 
-            f"Abn-F1 "
-            f"{metrics['ABNORMAL_F1']:.4f} | "
+            f"Gate-Bin "
+            f"{validation_metrics['GATE_BINARY_SCORE']:.4f} | "
 
-            f"C-Thr "
-            f"{metrics['CRACKLE_THRESHOLD']:.2f} | "
+            f"F1 "
+            f"{validation_metrics['MACRO_F1']:.4f} | "
 
-            f"W-Thr "
-            f"{metrics['WHEEZE_THRESHOLD']:.2f} | "
+            f"LR "
+            f"{current_backbone_lr:.8f}/"
+            f"{current_binary_head_lr:.8f}/"
+            f"{current_abnormal_head_lr:.8f} | "
 
-            f"B-LR "
-            f"{backbone_lr:.8f} | "
-
-            f"H-LR "
-            f"{head_lr:.8f} | "
-
-            f"{time.time() - start_time:.1f}s"
+            f"{elapsed:.1f}s"
         )
 
         print(
             "    Recall[0,1,2,3]="
-            f"{np.round(metrics['RECALL'], 3).tolist()} | "
+            f"{np.round(validation_metrics['RECALL'], 3).tolist()} | "
+
             f"PredCount="
-            f"{metrics['PRED_COUNTS'].tolist()}"
+            f"{validation_metrics['PRED_COUNTS'].tolist()}"
         )
 
         if (
             bad_epochs
             >= int(
                 cfg[
-                    "STAGE2_PATIENCE"
+                    "PATIENCE"
                 ]
             )
         ):
-
             print(
                 "[Early Stop] "
                 f"Best 4-Class Score="
@@ -2674,75 +2390,54 @@ def main():
             break
 
     # ========================================================
-    # 加载最佳 Stage 2
+    # Load best model
     # ========================================================
-    checkpoint = torch.load(
+    best_checkpoint = safe_torch_load(
         best_checkpoint_path,
-        map_location=device,
+        device,
     )
 
-    abnormal_backbone.load_state_dict(
-        checkpoint[
-            "abnormal_backbone_state"
+    model.load_state_dict(
+        best_checkpoint[
+            "model_state"
         ]
-    )
-
-    abnormal_head.load_state_dict(
-        checkpoint[
-            "abnormal_head_state"
-        ]
-    )
-
-    crackle_threshold = float(
-        checkpoint[
-            "crackle_threshold"
-        ]
-    )
-
-    wheeze_threshold = float(
-        checkpoint[
-            "wheeze_threshold"
-        ]
-    )
-
-    # ========================================================
-    # 最终测试
-    # ========================================================
-    final_metrics = (
-        evaluate_with_fixed_thresholds(
-            test_loader,
-
-            binary_backbone,
-            binary_head,
-
-            binary_threshold,
-
-            abnormal_backbone,
-            abnormal_head,
-
-            device,
-
-            crackle_threshold,
-
-            wheeze_threshold,
-        )
-    )
-
-    print_final(
-        final_metrics,
-        binary_threshold,
     )
 
     print()
 
     print(
-        "Binary checkpoint:",
-        binary_checkpoint_path,
+        f"[Training Completed] "
+        f"Best 4-Class Score="
+        f"{best_checkpoint['four_score']:.4f}, "
+        f"Epoch="
+        f"{best_checkpoint['epoch']}"
+    )
+
+    # ========================================================
+    # Final test
+    # ========================================================
+    final_metrics = evaluate(
+        test_loader,
+        model,
+        device,
+        abnormal_class_weights,
+        cfg,
+    )
+
+    print_final_results(
+        final_metrics
+    )
+
+    print()
+
+    print(
+        "Best checkpoint:",
+        best_checkpoint_path,
     )
 
     print(
-        "Multilabel checkpoint:",
-        best_checkpoint_path,
+        "Last checkpoint:",
+        last_checkpoint_path,
     )
 
 
