@@ -1,32 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Soft hierarchical joint training for ICBHI.
-
-Shared backbone:
-    AST tokens
-        -> Time-Mamba
-        -> Frequency-Attention
-        -> shared feature
-
-Two heads:
-    Binary head:
-        Normal / Abnormal
-
-    Abnormal head:
-        Crackle / Wheeze / Both
-
-Final four-class probabilities:
-    P(Normal)  = P(Normal)
-
-    P(Crackle) = P(Abnormal) * P(Crackle | Abnormal)
-    P(Wheeze)  = P(Abnormal) * P(Wheeze  | Abnormal)
-    P(Both)    = P(Abnormal) * P(Both    | Abnormal)
-
-There is no hard binary threshold during final four-class prediction.
-"""
-
 import random
 import sys
 import time
@@ -38,43 +12,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    f1_score,
-    recall_score,
-)
-
-from torch.utils.data import (
-    DataLoader,
-    Dataset,
-)
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, recall_score
+from torch.utils.data import DataLoader, Dataset
 
 
-# ============================================================
-# 1. Configuration
-# ============================================================
 CONFIG = {
-    # --------------------------------------------------------
-    # Data
-    # --------------------------------------------------------
-    "ROOT": (
-        "/data/dingcong/hybrid/"
-        "icbhi_official_ast_patch_tokens"
-    ),
+    "ROOT": "/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
 
-    # --------------------------------------------------------
-    # Save directory
-    # --------------------------------------------------------
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_soft_hierarchical"
+        "checkpoints_auxiliary_hierarchical_v2"
     ),
 
-    # --------------------------------------------------------
-    # Warm start from the previous binary model
-    # --------------------------------------------------------
     "INIT_FROM_BINARY": True,
 
     "BINARY_CKPT": (
@@ -83,15 +32,23 @@ CONFIG = {
         "best_binary.pth"
     ),
 
-    # --------------------------------------------------------
-    # General training
-    # --------------------------------------------------------
     "BATCH_SIZE": 4,
     "ACCUM_STEPS": 4,
     "NUM_WORKERS": 1,
 
     "EPOCHS": 40,
-    "PATIENCE": 12,
+
+    # 前 15 个 Epoch 不允许早停
+    "MIN_EPOCHS": 15,
+
+    # 第 15 个 Epoch 以后连续 10 轮无提升才停止
+    "PATIENCE": 10,
+
+    # 只冻结前两个 Epoch 的 Backbone
+    "BACKBONE_FREEZE_EPOCHS": 2,
+
+    # 异常类别总体敏感度低于 20 的模型不作为最佳模型
+    "MIN_VALID_FOUR_SE": 20.0,
 
     "SEED": 42,
     "DEVICE": "cuda",
@@ -99,10 +56,8 @@ CONFIG = {
     "REQUIRE_MAMBA": True,
 
     "WEIGHT_DECAY": 1e-2,
+    "GRAD_CLIP": 2.0,
 
-    # --------------------------------------------------------
-    # Backbone
-    # --------------------------------------------------------
     "INPUT_DIM": 768,
     "D_MODEL": 256,
 
@@ -115,49 +70,27 @@ CONFIG = {
     "NHEAD": 8,
     "DROPOUT": 0.15,
 
-    # --------------------------------------------------------
-    # Classification heads
-    # --------------------------------------------------------
     "HEAD_DROPOUT": 0.20,
 
-    # --------------------------------------------------------
-    # Learning rates
-    # --------------------------------------------------------
-    "BACKBONE_LR": 5e-6,
-    "BINARY_HEAD_LR": 1e-5,
-    "ABNORMAL_HEAD_LR": 2e-5,
+    "BACKBONE_LR": 2e-6,
+    "FOUR_HEAD_LR": 2e-5,
+    "ABNORMAL_HEAD_LR": 1e-5,
 
     "MIN_LR": 5e-7,
 
-    # --------------------------------------------------------
-    # Joint loss coefficients
-    #
-    # total_loss =
-    #     FOUR_LOSS_WEIGHT * four_loss
-    #   + BINARY_LOSS_WEIGHT * binary_loss
-    #   + ABNORMAL_LOSS_WEIGHT * abnormal_loss
-    # --------------------------------------------------------
+    # 主任务四分类损失
     "FOUR_LOSS_WEIGHT": 1.0,
-    "BINARY_LOSS_WEIGHT": 0.30,
-    "ABNORMAL_LOSS_WEIGHT": 0.50,
 
-    # --------------------------------------------------------
-    # Mild abnormal class weights
-    #
-    # weight = 1 / count^power
-    # --------------------------------------------------------
+    # 二分类辅助损失
+    "BINARY_LOSS_WEIGHT": 0.20,
+
+    # 异常三分类辅助损失
+    "ABNORMAL_LOSS_WEIGHT": 0.30,
+
     "ABNORMAL_WEIGHT_POWER": 0.5,
-
-    # --------------------------------------------------------
-    # Gradient clipping
-    # --------------------------------------------------------
-    "GRAD_CLIP": 2.0,
 }
 
 
-# ============================================================
-# 2. Import model
-# ============================================================
 PROJECT_ROOT = Path(
     __file__
 ).resolve().parents[1]
@@ -168,18 +101,17 @@ if str(PROJECT_ROOT) not in sys.path:
         str(PROJECT_ROOT),
     )
 
+
 from mymodels.model import (
     HAS_MAMBA,
     TimeFrequencyEncoder,
 )
 
 
-# ============================================================
-# 3. Random seed
-# ============================================================
 def set_seed(
-    seed,
-):
+    seed: int,
+) -> None:
+
     random.seed(
         seed
     )
@@ -204,24 +136,27 @@ def set_seed(
     torch.backends.cudnn.benchmark = False
 
     if torch.cuda.is_available():
+
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
     try:
+
         torch.set_float32_matmul_precision(
             "high"
         )
+
     except AttributeError:
+
         pass
 
 
-# ============================================================
-# 4. AMP scaler
-# ============================================================
 def make_scaler(
-    enabled,
+    enabled: bool,
 ):
+
     try:
+
         return torch.amp.GradScaler(
             "cuda",
             enabled=enabled,
@@ -231,19 +166,19 @@ def make_scaler(
         AttributeError,
         TypeError,
     ):
+
         return torch.cuda.amp.GradScaler(
             enabled=enabled
         )
 
 
-# ============================================================
-# 5. Safe checkpoint loading
-# ============================================================
 def safe_torch_load(
-    path,
-    device,
+    path: Path,
+    device: torch.device,
 ):
+
     try:
+
         return torch.load(
             path,
             map_location=device,
@@ -251,18 +186,17 @@ def safe_torch_load(
         )
 
     except TypeError:
+
         return torch.load(
             path,
             map_location=device,
         )
 
 
-# ============================================================
-# 6. Backbone
-# ============================================================
 def make_backbone(
     cfg,
 ):
+
     return TimeFrequencyEncoder(
         input_dim=int(
             cfg["INPUT_DIM"]
@@ -298,10 +232,7 @@ def make_backbone(
     )
 
 
-# ============================================================
-# 7. Soft hierarchical model
-# ============================================================
-class SoftHierarchicalClassifier(
+class AuxiliaryHierarchicalClassifier(
     nn.Module
 ):
 
@@ -309,13 +240,30 @@ class SoftHierarchicalClassifier(
         self,
         cfg,
     ):
+
         super().__init__()
 
         self.backbone = make_backbone(
             cfg
         )
 
-        # Must remain compatible with the previous binary checkpoint.
+        # 最终四分类预测头
+        self.four_head = nn.Sequential(
+            nn.Dropout(
+                float(
+                    cfg["HEAD_DROPOUT"]
+                )
+            ),
+
+            nn.Linear(
+                int(
+                    cfg["D_MODEL"]
+                ),
+                4,
+            ),
+        )
+
+        # 二分类辅助头
         self.binary_head = nn.Sequential(
             nn.Dropout(
                 float(
@@ -331,6 +279,7 @@ class SoftHierarchicalClassifier(
             ),
         )
 
+        # 异常三分类辅助头
         self.abnormal_head = nn.Sequential(
             nn.Dropout(
                 float(
@@ -350,98 +299,28 @@ class SoftHierarchicalClassifier(
         self,
         x,
     ):
+
         feature = self.backbone(
             x
-        )
-
-        binary_logits = self.binary_head(
-            feature
-        )
-
-        abnormal_logits = self.abnormal_head(
-            feature
-        )
-
-        four_log_probabilities = (
-            build_hierarchical_log_probabilities(
-                binary_logits,
-                abnormal_logits,
-            )
         )
 
         return {
             "feature": feature,
 
-            "binary_logits": (
-                binary_logits
+            "four_logits": self.four_head(
+                feature
             ),
 
-            "abnormal_logits": (
-                abnormal_logits
+            "binary_logits": self.binary_head(
+                feature
             ),
 
-            "four_log_probs": (
-                four_log_probabilities
+            "abnormal_logits": self.abnormal_head(
+                feature
             ),
         }
 
 
-# ============================================================
-# 8. Hierarchical probability combination
-#
-# log P(Normal)
-#
-# log P(Abnormal subtype)
-#     = log P(Abnormal)
-#       + log P(subtype | Abnormal)
-# ============================================================
-def build_hierarchical_log_probabilities(
-    binary_logits,
-    abnormal_logits,
-):
-    binary_log_probs = F.log_softmax(
-        binary_logits,
-        dim=1,
-    )
-
-    abnormal_log_probs = F.log_softmax(
-        abnormal_logits,
-        dim=1,
-    )
-
-    normal_log_probability = (
-        binary_log_probs[
-            :,
-            0:1,
-        ]
-    )
-
-    abnormal_gate_log_probability = (
-        binary_log_probs[
-            :,
-            1:2,
-        ]
-    )
-
-    conditional_abnormal_log_probabilities = (
-        abnormal_gate_log_probability
-        + abnormal_log_probs
-    )
-
-    four_log_probabilities = torch.cat(
-        [
-            normal_log_probability,
-            conditional_abnormal_log_probabilities,
-        ],
-        dim=1,
-    )
-
-    return four_log_probabilities
-
-
-# ============================================================
-# 9. Dataset
-# ============================================================
 class TokenDataset(
     Dataset
 ):
@@ -451,7 +330,6 @@ class TokenDataset(
         csv_path,
         cfg,
     ):
-        super().__init__()
 
         self.csv_path = Path(
             csv_path
@@ -476,11 +354,10 @@ class TokenDataset(
         )
 
         if missing_columns:
+
             raise ValueError(
                 f"{csv_path} 缺少列："
-                f"{sorted(missing_columns)}；"
-                f"当前列："
-                f"{self.df.columns.tolist()}"
+                f"{sorted(missing_columns)}"
             )
 
         self.df["label"] = (
@@ -510,10 +387,10 @@ class TokenDataset(
         if len(
             invalid_labels
         ) > 0:
+
             raise ValueError(
-                "标签必须为 0、1、2、3；"
-                f"发现："
-                f"{invalid_labels.tolist()}"
+                "标签必须为 0、1、2、3，"
+                f"发现：{invalid_labels.tolist()}"
             )
 
         self.expected_shape = (
@@ -539,25 +416,28 @@ class TokenDataset(
             f"[Dataset] "
             f"samples={len(self.df)} | "
             f"counts={self.class_counts.tolist()} | "
-            f"{csv_path}"
+            f"{self.csv_path}"
         )
 
     def __len__(
         self,
     ):
+
         return len(
             self.df
         )
 
-    def resolve_token_path(
+    def _resolve_path(
         self,
-        raw_path,
-    ):
+        raw_path: str,
+    ) -> Path:
+
         token_path = Path(
             raw_path
         )
 
         if token_path.exists():
+
             return token_path
 
         relative_path = (
@@ -566,6 +446,7 @@ class TokenDataset(
         )
 
         if relative_path.exists():
+
             return relative_path
 
         raise FileNotFoundError(
@@ -577,17 +458,14 @@ class TokenDataset(
         self,
         index,
     ):
+
         row = self.df.iloc[
             index
         ]
 
-        token_path = (
-            self.resolve_token_path(
-                str(
-                    row[
-                        "tokens_path"
-                    ]
-                )
+        token_path = self._resolve_path(
+            str(
+                row["tokens_path"]
             )
         )
 
@@ -595,19 +473,15 @@ class TokenDataset(
             token_path
         )
 
-        if (
-            tuple(
-                tokens.shape
-            )
-            != self.expected_shape
-        ):
+        if tuple(
+            tokens.shape
+        ) != self.expected_shape:
+
             raise ValueError(
-                f"Token shape error："
+                f"Token shape 错误："
                 f"{token_path}\n"
-                f"当前："
-                f"{tuple(tokens.shape)}；"
-                f"要求："
-                f"{self.expected_shape}"
+                f"当前={tuple(tokens.shape)}，"
+                f"要求={self.expected_shape}"
             )
 
         x = torch.from_numpy(
@@ -624,12 +498,10 @@ class TokenDataset(
         return x, y
 
 
-# ============================================================
-# 10. Collate
-# ============================================================
 def collate_fixed(
     batch,
 ):
+
     xs, ys = zip(
         *batch
     )
@@ -647,15 +519,13 @@ def collate_fixed(
     )
 
 
-# ============================================================
-# 11. DataLoader
-# ============================================================
 def make_loader(
     dataset,
     cfg,
     device,
     shuffle,
 ):
+
     workers = int(
         cfg["NUM_WORKERS"]
     )
@@ -672,7 +542,8 @@ def make_loader(
         num_workers=workers,
 
         pin_memory=(
-            device.type == "cuda"
+            device.type
+            == "cuda"
         ),
 
         persistent_workers=(
@@ -685,13 +556,11 @@ def make_loader(
     )
 
 
-# ============================================================
-# 12. Abnormal class weights
-# ============================================================
 def build_abnormal_class_weights(
     class_counts,
     power,
 ):
+
     abnormal_counts = (
         class_counts[
             1:4
@@ -740,14 +609,84 @@ def build_abnormal_class_weights(
     )
 
 
-# ============================================================
-# 13. Binary metrics
-# ============================================================
+def build_four_class_weights(
+    class_counts,
+):
+
+    class_counts = np.asarray(
+        class_counts,
+        dtype=np.float64,
+    )
+
+    abnormal_counts = (
+        class_counts[
+            1:4
+        ]
+    )
+
+    raw_weights = (
+        1.0
+        /
+        np.sqrt(
+            np.maximum(
+                abnormal_counts,
+                1.0,
+            )
+        )
+    )
+
+    scale = (
+        abnormal_counts.sum()
+        /
+        np.sum(
+            abnormal_counts
+            * raw_weights
+        )
+    )
+
+    abnormal_weights = (
+        raw_weights
+        * scale
+    )
+
+    weights = np.asarray(
+        [
+            1.0,
+            abnormal_weights[0],
+            abnormal_weights[1],
+            abnormal_weights[2],
+        ],
+
+        dtype=np.float32,
+    )
+
+    print(
+        "[Loss] four-class counts:",
+        class_counts
+        .astype(int)
+        .tolist(),
+    )
+
+    print(
+        "[Loss] four-class weights:",
+        np.round(
+            weights,
+            6,
+        ).tolist(),
+    )
+
+    return torch.tensor(
+        weights,
+        dtype=torch.float32,
+    )
+
+
 def calculate_binary_metrics(
     y_true_four,
     y_pred_binary,
     prefix,
 ):
+
     y_true_binary = (
         y_true_four > 0
     ).astype(
@@ -800,34 +739,24 @@ def calculate_binary_metrics(
         )
     )
 
-    score = (
-        sp + se
-    ) / 2.0
-
     return {
-        f"{prefix}_SP": float(
-            sp
-        ),
+        f"{prefix}_SP": sp,
 
-        f"{prefix}_SE": float(
-            se
-        ),
+        f"{prefix}_SE": se,
 
-        f"{prefix}_SCORE": float(
-            score
-        ),
+        f"{prefix}_SCORE": (
+            sp + se
+        ) / 2.0,
 
         f"{prefix}_CM": cm,
     }
 
 
-# ============================================================
-# 14. Strict four-class metrics
-# ============================================================
 def calculate_four_class_metrics(
     y_true,
     y_pred,
 ):
+
     cm = confusion_matrix(
         y_true,
         y_pred,
@@ -878,92 +807,71 @@ def calculate_four_class_metrics(
         + four_se
     ) / 2.0
 
-    accuracy = (
-        accuracy_score(
+    return {
+        "FOUR_SP": four_sp,
+
+        "FOUR_SE": four_se,
+
+        "FOUR_SCORE": four_score,
+
+        "ACC": (
+            accuracy_score(
+                y_true,
+                y_pred,
+            )
+            * 100.0
+        ),
+
+        "MACRO_F1": f1_score(
             y_true,
             y_pred,
-        )
-        * 100.0
-    )
-
-    macro_f1 = f1_score(
-        y_true,
-        y_pred,
-        average="macro",
-        zero_division=0,
-    )
-
-    class_recall = recall_score(
-        y_true,
-        y_pred,
-
-        labels=[
-            0,
-            1,
-            2,
-            3,
-        ],
-
-        average=None,
-
-        zero_division=0,
-    )
-
-    predicted_counts = np.bincount(
-        y_pred,
-        minlength=4,
-    )
-
-    return {
-        "FOUR_SP": float(
-            four_sp
+            average="macro",
+            zero_division=0,
         ),
 
-        "FOUR_SE": float(
-            four_se
+        "RECALL": recall_score(
+            y_true,
+            y_pred,
+
+            labels=[
+                0,
+                1,
+                2,
+                3,
+            ],
+
+            average=None,
+
+            zero_division=0,
         ),
 
-        "FOUR_SCORE": float(
-            four_score
-        ),
-
-        "ACC": float(
-            accuracy
-        ),
-
-        "MACRO_F1": float(
-            macro_f1
-        ),
-
-        "RECALL": class_recall,
-
-        "PRED_COUNTS": (
-            predicted_counts
+        "PRED_COUNTS": np.bincount(
+            y_pred,
+            minlength=4,
         ),
 
         "FOUR_CM": cm,
     }
 
 
-# ============================================================
-# 15. Joint loss
-# ============================================================
 def calculate_joint_loss(
     outputs,
     labels,
+    four_class_weights,
     abnormal_class_weights,
     cfg,
 ):
+
+    four_logits = outputs[
+        "four_logits"
+    ]
+
     binary_logits = outputs[
         "binary_logits"
     ]
 
     abnormal_logits = outputs[
         "abnormal_logits"
-    ]
-
-    four_log_probs = outputs[
-        "four_log_probs"
     ]
 
     binary_target = (
@@ -974,26 +882,22 @@ def calculate_joint_loss(
         labels > 0
     )
 
-    # --------------------------------------------------------
-    # Main four-class hierarchical loss
-    # --------------------------------------------------------
-    four_loss = F.nll_loss(
-        four_log_probs,
+    # 四分类主损失
+    four_loss = F.cross_entropy(
+        four_logits,
         labels,
+        weight=four_class_weights,
     )
 
-    # --------------------------------------------------------
-    # Auxiliary binary loss
-    # --------------------------------------------------------
+    # 二分类辅助损失
     binary_loss = F.cross_entropy(
         binary_logits,
         binary_target,
     )
 
-    # --------------------------------------------------------
-    # Auxiliary abnormal subtype loss
-    # --------------------------------------------------------
+    # 异常三分类辅助损失
     if abnormal_mask.any():
+
         abnormal_target = (
             labels[
                 abnormal_mask
@@ -1008,12 +912,11 @@ def calculate_joint_loss(
 
             abnormal_target,
 
-            weight=(
-                abnormal_class_weights
-            ),
+            weight=abnormal_class_weights,
         )
 
     else:
+
         abnormal_loss = torch.zeros(
             (),
             dtype=four_loss.dtype,
@@ -1022,42 +925,36 @@ def calculate_joint_loss(
 
     total_loss = (
         float(
-            cfg[
-                "FOUR_LOSS_WEIGHT"
-            ]
+            cfg["FOUR_LOSS_WEIGHT"]
         )
         * four_loss
 
         +
 
         float(
-            cfg[
-                "BINARY_LOSS_WEIGHT"
-            ]
+            cfg["BINARY_LOSS_WEIGHT"]
         )
         * binary_loss
 
         +
 
         float(
-            cfg[
-                "ABNORMAL_LOSS_WEIGHT"
-            ]
+            cfg["ABNORMAL_LOSS_WEIGHT"]
         )
         * abnormal_loss
     )
 
     return {
         "total": total_loss,
+
         "four": four_loss,
+
         "binary": binary_loss,
+
         "abnormal": abnormal_loss,
     }
 
 
-# ============================================================
-# 16. Train one epoch
-# ============================================================
 def train_one_epoch(
     loader,
     model,
@@ -1065,10 +962,24 @@ def train_one_epoch(
     device,
     scaler,
     use_amp,
+    four_class_weights,
     abnormal_class_weights,
     cfg,
+    freeze_backbone,
 ):
+
     model.train()
+
+    # 二分类头始终固定，关闭其中的 Dropout
+    model.binary_head.eval()
+
+    if freeze_backbone:
+
+        model.backbone.eval()
+
+    else:
+
+        model.backbone.train()
 
     optimizer.zero_grad(
         set_to_none=True
@@ -1082,10 +993,12 @@ def train_one_epoch(
         loader
     )
 
-    total_loss_sum = 0.0
-    four_loss_sum = 0.0
-    binary_loss_sum = 0.0
-    abnormal_loss_sum = 0.0
+    loss_sum = {
+        "total": 0.0,
+        "four": 0.0,
+        "binary": 0.0,
+        "abnormal": 0.0,
+    }
 
     optimizer_steps = 0
 
@@ -1102,6 +1015,7 @@ def train_one_epoch(
     ) in enumerate(
         loader
     ):
+
         x = x.to(
             device,
             non_blocking=True,
@@ -1116,6 +1030,7 @@ def train_one_epoch(
             device_type=device.type,
             enabled=use_amp,
         ):
+
             outputs = model(
                 x
             )
@@ -1123,6 +1038,7 @@ def train_one_epoch(
             losses = calculate_joint_loss(
                 outputs,
                 y,
+                four_class_weights,
                 abnormal_class_weights,
                 cfg,
             )
@@ -1136,29 +1052,13 @@ def train_one_epoch(
             scaled_loss
         ).backward()
 
-        total_loss_sum += float(
-            losses["total"]
-            .detach()
-            .item()
-        )
+        for key in loss_sum:
 
-        four_loss_sum += float(
-            losses["four"]
-            .detach()
-            .item()
-        )
-
-        binary_loss_sum += float(
-            losses["binary"]
-            .detach()
-            .item()
-        )
-
-        abnormal_loss_sum += float(
-            losses["abnormal"]
-            .detach()
-            .item()
-        )
+            loss_sum[key] += float(
+                losses[key]
+                .detach()
+                .item()
+            )
 
         should_step = (
             (
@@ -1176,6 +1076,7 @@ def train_one_epoch(
         )
 
         if should_step:
+
             scaler.unscale_(
                 optimizer
             )
@@ -1184,9 +1085,7 @@ def train_one_epoch(
                 trainable_parameters,
 
                 max_norm=float(
-                    cfg[
-                        "GRAD_CLIP"
-                    ]
+                    cfg["GRAD_CLIP"]
                 ),
             )
 
@@ -1200,11 +1099,11 @@ def train_one_epoch(
 
             scaler.update()
 
-            new_scale = (
+            if (
                 scaler.get_scale()
-            )
+                >= old_scale
+            ):
 
-            if new_scale >= old_scale:
                 optimizer_steps += 1
 
             optimizer.zero_grad(
@@ -1218,22 +1117,22 @@ def train_one_epoch(
 
     return {
         "TOTAL_LOSS": (
-            total_loss_sum
+            loss_sum["total"]
             / divisor
         ),
 
         "FOUR_LOSS": (
-            four_loss_sum
+            loss_sum["four"]
             / divisor
         ),
 
         "BINARY_LOSS": (
-            binary_loss_sum
+            loss_sum["binary"]
             / divisor
         ),
 
         "ABNORMAL_LOSS": (
-            abnormal_loss_sum
+            loss_sum["abnormal"]
             / divisor
         ),
 
@@ -1243,33 +1142,31 @@ def train_one_epoch(
     }
 
 
-# ============================================================
-# 17. Evaluation
-# ============================================================
 @torch.no_grad()
 def evaluate(
     loader,
     model,
     device,
+    four_class_weights,
     abnormal_class_weights,
     cfg,
 ):
+
     model.eval()
 
     all_true = []
-    all_four_pred = []
-    all_gate_binary_pred = []
+    all_four_prediction = []
+    all_binary_prediction = []
 
-    total_loss_sum = 0.0
-    four_loss_sum = 0.0
-    binary_loss_sum = 0.0
-    abnormal_loss_sum = 0.0
-
-    number_of_batches = len(
-        loader
-    )
+    loss_sum = {
+        "total": 0.0,
+        "four": 0.0,
+        "binary": 0.0,
+        "abnormal": 0.0,
+    }
 
     for x, y in loader:
+
         x = x.to(
             device,
             non_blocking=True,
@@ -1287,69 +1184,72 @@ def evaluate(
         losses = calculate_joint_loss(
             outputs,
             y,
+            four_class_weights,
             abnormal_class_weights,
             cfg,
         )
 
-        four_prediction = torch.argmax(
+        four_prediction = (
             outputs[
-                "four_log_probs"
-            ],
-            dim=1,
+                "four_logits"
+            ]
+            .argmax(
+                dim=1
+            )
         )
 
-        gate_binary_prediction = torch.argmax(
+        binary_prediction = (
             outputs[
                 "binary_logits"
-            ],
-            dim=1,
+            ]
+            .argmax(
+                dim=1
+            )
         )
 
         all_true.append(
             y.detach().cpu()
         )
 
-        all_four_pred.append(
+        all_four_prediction.append(
             four_prediction
             .detach()
             .cpu()
         )
 
-        all_gate_binary_pred.append(
-            gate_binary_prediction
+        all_binary_prediction.append(
+            binary_prediction
             .detach()
             .cpu()
         )
 
-        total_loss_sum += float(
-            losses["total"].item()
+        for key in loss_sum:
+
+            loss_sum[key] += float(
+                losses[key].item()
+            )
+
+    y_true = (
+        torch.cat(
+            all_true
         )
+        .numpy()
+    )
 
-        four_loss_sum += float(
-            losses["four"].item()
+    y_pred_four = (
+        torch.cat(
+            all_four_prediction
         )
+        .numpy()
+    )
 
-        binary_loss_sum += float(
-            losses["binary"].item()
+    y_pred_gate_binary = (
+        torch.cat(
+            all_binary_prediction
         )
+        .numpy()
+    )
 
-        abnormal_loss_sum += float(
-            losses["abnormal"].item()
-        )
-
-    y_true = torch.cat(
-        all_true
-    ).numpy()
-
-    y_pred_four = torch.cat(
-        all_four_pred
-    ).numpy()
-
-    y_pred_gate_binary = torch.cat(
-        all_gate_binary_pred
-    ).numpy()
-
-    # Binary prediction derived from final four-class prediction.
     y_pred_final_binary = (
         y_pred_four > 0
     ).astype(
@@ -1382,29 +1282,31 @@ def evaluate(
     )
 
     divisor = max(
-        number_of_batches,
+        len(
+            loader
+        ),
         1,
     )
 
     metrics.update(
         {
             "TOTAL_LOSS": (
-                total_loss_sum
+                loss_sum["total"]
                 / divisor
             ),
 
             "FOUR_LOSS": (
-                four_loss_sum
+                loss_sum["four"]
                 / divisor
             ),
 
             "BINARY_LOSS": (
-                binary_loss_sum
+                loss_sum["binary"]
                 / divisor
             ),
 
             "ABNORMAL_LOSS": (
-                abnormal_loss_sum
+                loss_sum["abnormal"]
                 / divisor
             ),
         }
@@ -1413,9 +1315,6 @@ def evaluate(
     return metrics
 
 
-# ============================================================
-# 18. Shape test
-# ============================================================
 @torch.no_grad()
 def run_shape_test(
     loader,
@@ -1423,6 +1322,7 @@ def run_shape_test(
     device,
     cfg,
 ):
+
     model.eval()
 
     x, _ = next(
@@ -1441,6 +1341,30 @@ def run_shape_test(
         x
     )
 
+    expected_shapes = {
+        "feature": (
+            1,
+            int(
+                cfg["D_MODEL"]
+            ),
+        ),
+
+        "four_logits": (
+            1,
+            4,
+        ),
+
+        "binary_logits": (
+            1,
+            2,
+        ),
+
+        "abnormal_logits": (
+            1,
+            3,
+        ),
+    }
+
     print(
         "[Shape] input:",
         tuple(
@@ -1448,145 +1372,60 @@ def run_shape_test(
         ),
     )
 
-    print(
-        "[Shape] feature:",
-        tuple(
-            outputs[
-                "feature"
-            ].shape
-        ),
-    )
-
-    print(
-        "[Shape] binary logits:",
-        tuple(
-            outputs[
-                "binary_logits"
-            ].shape
-        ),
-    )
-
-    print(
-        "[Shape] abnormal logits:",
-        tuple(
-            outputs[
-                "abnormal_logits"
-            ].shape
-        ),
-    )
-
-    print(
-        "[Shape] four log probs:",
-        tuple(
-            outputs[
-                "four_log_probs"
-            ].shape
-        ),
-    )
-
-    if tuple(
-        outputs[
-            "feature"
-        ].shape
-    ) != (
-        1,
-        int(
-            cfg["D_MODEL"]
-        ),
+    for key, expected_shape in (
+        expected_shapes.items()
     ):
-        raise RuntimeError(
-            "Backbone output shape error."
+
+        current_shape = tuple(
+            outputs[
+                key
+            ].shape
         )
 
-    if tuple(
-        outputs[
-            "binary_logits"
-        ].shape
-    ) != (
-        1,
-        2,
-    ):
-        raise RuntimeError(
-            "Binary head shape error."
+        print(
+            f"[Shape] {key}:",
+            current_shape,
         )
 
-    if tuple(
-        outputs[
-            "abnormal_logits"
-        ].shape
-    ) != (
-        1,
-        3,
-    ):
-        raise RuntimeError(
-            "Abnormal head shape error."
-        )
+        if current_shape != expected_shape:
 
-    if tuple(
-        outputs[
-            "four_log_probs"
-        ].shape
-    ) != (
-        1,
-        4,
-    ):
-        raise RuntimeError(
-            "Four-class probability shape error."
-        )
-
-    probability_sum = (
-        outputs[
-            "four_log_probs"
-        ]
-        .exp()
-        .sum(
-            dim=1
-        )
-    )
-
-    print(
-        "[Shape] probability sum:",
-        probability_sum
-        .detach()
-        .cpu()
-        .tolist(),
-    )
+            raise RuntimeError(
+                f"{key} shape 错误："
+                f"{current_shape} != "
+                f"{expected_shape}"
+            )
 
     print(
         "[Shape] Passed."
     )
 
 
-# ============================================================
-# 19. Serializable metrics
-# ============================================================
 def serializable_metrics(
     metrics,
 ):
+
     result = {}
 
     for key, value in (
         metrics.items()
     ):
+
         if isinstance(
             value,
             np.ndarray,
         ):
+
             result[key] = (
                 value.tolist()
             )
 
         else:
-            result[key] = (
-                value
-            )
+
+            result[key] = value
 
     return result
 
 
-# ============================================================
-# 20. Save checkpoint
-# ============================================================
 def save_checkpoint(
     path,
     epoch,
@@ -1594,9 +1433,11 @@ def save_checkpoint(
     optimizer,
     scheduler,
     metrics,
+    four_class_weights,
     abnormal_class_weights,
     cfg,
 ):
+
     torch.save(
         {
             "epoch": int(
@@ -1609,6 +1450,11 @@ def save_checkpoint(
 
             "backbone_state": (
                 model.backbone
+                .state_dict()
+            ),
+
+            "four_head_state": (
+                model.four_head
                 .state_dict()
             ),
 
@@ -1648,16 +1494,17 @@ def save_checkpoint(
                 ]
             ),
 
-            "final_binary_score": float(
+            "macro_f1": float(
                 metrics[
-                    "FINAL_BINARY_SCORE"
+                    "MACRO_F1"
                 ]
             ),
 
-            "gate_binary_score": float(
-                metrics[
-                    "GATE_BINARY_SCORE"
-                ]
+            "four_class_weights": (
+                four_class_weights
+                .detach()
+                .cpu()
+                .tolist()
             ),
 
             "abnormal_class_weights": (
@@ -1682,12 +1529,10 @@ def save_checkpoint(
     )
 
 
-# ============================================================
-# 21. Print final results
-# ============================================================
 def print_final_results(
     metrics,
 ):
+
     print()
 
     print(
@@ -1695,7 +1540,7 @@ def print_final_results(
     )
 
     print(
-        "[FINAL SOFT HIERARCHICAL TEST]"
+        "[FINAL AUXILIARY HIERARCHICAL TEST]"
     )
 
     print(
@@ -1730,42 +1575,34 @@ def print_final_results(
     print()
 
     print(
-        "Final-prediction Binary Metrics"
-    )
-
-    print(
-        f"Binary Score: "
+        f"Final Binary Score: "
         f"{metrics['FINAL_BINARY_SCORE']:.4f}"
     )
 
     print(
-        f"Binary SP: "
+        f"Final Binary SP: "
         f"{metrics['FINAL_BINARY_SP']:.4f}"
     )
 
     print(
-        f"Binary SE: "
+        f"Final Binary SE: "
         f"{metrics['FINAL_BINARY_SE']:.4f}"
     )
 
     print()
 
     print(
-        "Binary-gate Metrics"
-    )
-
-    print(
-        f"Gate Score: "
+        f"Fixed Gate Score: "
         f"{metrics['GATE_BINARY_SCORE']:.4f}"
     )
 
     print(
-        f"Gate SP: "
+        f"Fixed Gate SP: "
         f"{metrics['GATE_BINARY_SP']:.4f}"
     )
 
     print(
-        f"Gate SE: "
+        f"Fixed Gate SE: "
         f"{metrics['GATE_BINARY_SE']:.4f}"
     )
 
@@ -1773,6 +1610,7 @@ def print_final_results(
 
     print(
         "Recall[Normal,Crackle,Wheeze,Both]:",
+
         np.round(
             metrics[
                 "RECALL"
@@ -1783,6 +1621,7 @@ def print_final_results(
 
     print(
         "PredCount:",
+
         metrics[
             "PRED_COUNTS"
         ].tolist(),
@@ -1815,7 +1654,7 @@ def print_final_results(
     print()
 
     print(
-        "Binary gate confusion matrix:"
+        "Fixed binary-gate confusion matrix:"
     )
 
     print(
@@ -1825,9 +1664,6 @@ def print_final_results(
     )
 
 
-# ============================================================
-# 22. Main
-# ============================================================
 def main():
 
     cfg = CONFIG
@@ -1841,8 +1677,10 @@ def main():
     device = torch.device(
         "cuda"
         if (
-            cfg["DEVICE"] == "cuda"
-            and torch.cuda.is_available()
+            cfg["DEVICE"]
+            == "cuda"
+            and
+            torch.cuda.is_available()
         )
         else "cpu"
     )
@@ -1853,8 +1691,10 @@ def main():
     )
 
     if device.type == "cuda":
+
         print(
             "[INFO] GPU:",
+
             torch.cuda.get_device_name(
                 torch.cuda.current_device()
             ),
@@ -1869,15 +1709,14 @@ def main():
         bool(
             cfg["REQUIRE_MAMBA"]
         )
-        and not HAS_MAMBA
+        and
+        not HAS_MAMBA
     ):
+
         raise RuntimeError(
             "mamba_ssm 导入失败。"
         )
 
-    # ========================================================
-    # Paths
-    # ========================================================
     root = Path(
         cfg["ROOT"]
     )
@@ -1898,16 +1737,19 @@ def main():
     )
 
     if not train_csv.exists():
+
         raise FileNotFoundError(
             train_csv
         )
 
     if not test_csv.exists():
+
         raise FileNotFoundError(
             test_csv
         )
 
     if val_csv.exists():
+
         selection_csv = (
             val_csv
         )
@@ -1918,22 +1760,20 @@ def main():
         )
 
     else:
+
         selection_csv = (
             test_csv
         )
 
         print(
-            "[WARNING] val_index.csv 不存在。"
-        )
-
-        print(
-            "[WARNING] 当前暂时使用 test_index.csv "
-            "进行 checkpoint 选择。"
+            "[WARNING] val_index.csv 不存在，"
+            "当前使用 test_index.csv "
+            "选择 checkpoint。"
         )
 
         print(
             "[WARNING] 正式实验应建立独立验证集，"
-            "否则会产生测试集泄漏。"
+            "否则存在测试集泄漏。"
         )
 
     save_dir = Path(
@@ -1947,17 +1787,19 @@ def main():
 
     best_checkpoint_path = (
         save_dir
-        / "best_soft_hierarchical.pth"
+        / "best_auxiliary_hierarchical.pth"
+    )
+
+    fallback_checkpoint_path = (
+        save_dir
+        / "best_fallback_f1.pth"
     )
 
     last_checkpoint_path = (
         save_dir
-        / "last_soft_hierarchical.pth"
+        / "last_auxiliary_hierarchical.pth"
     )
 
-    # ========================================================
-    # Datasets
-    # ========================================================
     train_dataset = TokenDataset(
         train_csv,
         cfg,
@@ -1973,9 +1815,6 @@ def main():
         cfg,
     )
 
-    # ========================================================
-    # DataLoaders
-    # ========================================================
     train_loader = make_loader(
         train_dataset,
         cfg,
@@ -1997,18 +1836,15 @@ def main():
         shuffle=False,
     )
 
-    # ========================================================
-    # Model
-    # ========================================================
-    model = SoftHierarchicalClassifier(
-        cfg
-    ).to(
-        device
+    model = (
+        AuxiliaryHierarchicalClassifier(
+            cfg
+        )
+        .to(
+            device
+        )
     )
 
-    # ========================================================
-    # Optional warm start from previous binary checkpoint
-    # ========================================================
     binary_checkpoint_path = Path(
         cfg[
             "BINARY_CKPT"
@@ -2021,8 +1857,10 @@ def main():
                 "INIT_FROM_BINARY"
             ]
         )
-        and binary_checkpoint_path.exists()
+        and
+        binary_checkpoint_path.exists()
     ):
+
         binary_checkpoint = safe_torch_load(
             binary_checkpoint_path,
             device,
@@ -2041,11 +1879,9 @@ def main():
         )
 
         print(
-            "[INIT] Loaded previous binary checkpoint:"
-        )
-
-        print(
-            binary_checkpoint_path
+            "[INIT] Loaded previous "
+            "binary checkpoint:",
+            binary_checkpoint_path,
         )
 
         print(
@@ -2054,17 +1890,26 @@ def main():
         )
 
     else:
+
         print(
-            "[INIT] Training from random initialization."
+            "[INIT] Binary checkpoint "
+            "not loaded."
         )
 
-    # All parts are trainable.
-    for parameter in model.parameters():
-        parameter.requires_grad = True
+    # 二分类头始终冻结
+    for parameter in (
+        model.binary_head.parameters()
+    ):
 
-    # ========================================================
-    # Shape test
-    # ========================================================
+        parameter.requires_grad = False
+
+    # Backbone 初始冻结
+    for parameter in (
+        model.backbone.parameters()
+    ):
+
+        parameter.requires_grad = False
+
     run_shape_test(
         train_loader,
         model,
@@ -2072,9 +1917,15 @@ def main():
         cfg,
     )
 
-    # ========================================================
-    # Abnormal weights
-    # ========================================================
+    four_class_weights = (
+        build_four_class_weights(
+            train_dataset.class_counts
+        )
+        .to(
+            device
+        )
+    )
+
     abnormal_class_weights = (
         build_abnormal_class_weights(
             train_dataset.class_counts,
@@ -2083,12 +1934,11 @@ def main():
                 "ABNORMAL_WEIGHT_POWER"
             ],
         )
-        .to(device)
+        .to(
+            device
+        )
     )
 
-    # ========================================================
-    # Optimizer
-    # ========================================================
     optimizer = torch.optim.AdamW(
         [
             {
@@ -2106,13 +1956,13 @@ def main():
 
             {
                 "params": (
-                    model.binary_head
+                    model.four_head
                     .parameters()
                 ),
 
                 "lr": float(
                     cfg[
-                        "BINARY_HEAD_LR"
+                        "FOUR_HEAD_LR"
                     ]
                 ),
             },
@@ -2144,7 +1994,9 @@ def main():
             optimizer,
 
             T_max=int(
-                cfg["EPOCHS"]
+                cfg[
+                    "EPOCHS"
+                ]
             ),
 
             eta_min=float(
@@ -2157,21 +2009,31 @@ def main():
 
     use_amp = bool(
         cfg["AMP"]
-        and device.type == "cuda"
+        and
+        device.type == "cuda"
     )
 
     scaler = make_scaler(
         use_amp
     )
 
-    # ========================================================
-    # Training
-    # ========================================================
-    best_four_score = -1.0
-    best_macro_f1 = -1.0
+    best_four_score = float(
+        "-inf"
+    )
+
+    best_four_f1 = float(
+        "-inf"
+    )
+
+    best_fallback_f1 = float(
+        "-inf"
+    )
+
     best_epoch = -1
 
     bad_epochs = 0
+
+    has_valid_best = False
 
     print()
 
@@ -2180,7 +2042,8 @@ def main():
     )
 
     print(
-        "SOFT HIERARCHICAL JOINT TRAINING"
+        "AUXILIARY HIERARCHICAL "
+        "JOINT TRAINING"
     )
 
     print(
@@ -2194,7 +2057,40 @@ def main():
         )
         + 1,
     ):
+
         start_time = time.time()
+
+        freeze_backbone = (
+            epoch
+            <= int(
+                cfg[
+                    "BACKBONE_FREEZE_EPOCHS"
+                ]
+            )
+        )
+
+        for parameter in (
+            model.backbone.parameters()
+        ):
+
+            parameter.requires_grad = (
+                not freeze_backbone
+            )
+
+        if (
+            epoch
+            == int(
+                cfg[
+                    "BACKBONE_FREEZE_EPOCHS"
+                ]
+            )
+            + 1
+        ):
+
+            print(
+                "[Training] Backbone 已解冻，"
+                "开始联合微调。"
+            )
 
         train_metrics = train_one_epoch(
             train_loader,
@@ -2203,32 +2099,26 @@ def main():
             device,
             scaler,
             use_amp,
+            four_class_weights,
             abnormal_class_weights,
             cfg,
+            freeze_backbone,
         )
 
         validation_metrics = evaluate(
             selection_loader,
             model,
             device,
+            four_class_weights,
             abnormal_class_weights,
             cfg,
         )
 
-        current_backbone_lr = (
-            optimizer
-            .param_groups[0]["lr"]
-        )
-
-        current_binary_head_lr = (
-            optimizer
-            .param_groups[1]["lr"]
-        )
-
-        current_abnormal_head_lr = (
-            optimizer
-            .param_groups[2]["lr"]
-        )
+        current_learning_rates = [
+            group["lr"]
+            for group
+            in optimizer.param_groups
+        ]
 
         if (
             train_metrics[
@@ -2236,11 +2126,18 @@ def main():
             ]
             > 0
         ):
+
             scheduler.step()
 
         current_four_score = float(
             validation_metrics[
                 "FOUR_SCORE"
+            ]
+        )
+
+        current_four_se = float(
+            validation_metrics[
+                "FOUR_SE"
             ]
         )
 
@@ -2250,36 +2147,101 @@ def main():
             ]
         )
 
-        improved = (
-            current_four_score
-            > best_four_score
-            + 1e-9
+        # 始终保存最后一轮
+        save_checkpoint(
+            last_checkpoint_path,
+            epoch,
+            model,
+            optimizer,
+            scheduler,
+            validation_metrics,
+            four_class_weights,
+            abnormal_class_weights,
+            cfg,
         )
 
+        # 始终保存 Macro-F1 最好的备用模型
         if (
-            not improved
-            and abs(
-                current_four_score
-                - best_four_score
-            )
-            <= 1e-9
-            and current_macro_f1
-            > best_macro_f1
+            current_macro_f1
+            > best_fallback_f1
+            + 1e-9
         ):
-            improved = True
+
+            best_fallback_f1 = (
+                current_macro_f1
+            )
+
+            save_checkpoint(
+                fallback_checkpoint_path,
+                epoch,
+                model,
+                optimizer,
+                scheduler,
+                validation_metrics,
+                four_class_weights,
+                abnormal_class_weights,
+                cfg,
+            )
+
+        valid_candidate = (
+            epoch
+            > int(
+                cfg[
+                    "BACKBONE_FREEZE_EPOCHS"
+                ]
+            )
+            and
+            current_four_se
+            >= float(
+                cfg[
+                    "MIN_VALID_FOUR_SE"
+                ]
+            )
+        )
+
+        improved = False
+
+        if valid_candidate:
+
+            if (
+                current_four_score
+                > best_four_score
+                + 1e-9
+            ):
+
+                improved = True
+
+            elif (
+                abs(
+                    current_four_score
+                    - best_four_score
+                )
+                <= 1e-9
+
+                and
+
+                current_macro_f1
+                > best_four_f1
+                + 1e-9
+            ):
+
+                improved = True
 
         if improved:
+
             best_four_score = (
                 current_four_score
             )
 
-            best_macro_f1 = (
+            best_four_f1 = (
                 current_macro_f1
             )
 
             best_epoch = (
                 epoch
             )
+
+            has_valid_best = True
 
             bad_epochs = 0
 
@@ -2294,25 +2256,31 @@ def main():
                 optimizer,
                 scheduler,
                 validation_metrics,
+                four_class_weights,
                 abnormal_class_weights,
                 cfg,
             )
 
         else:
-            bad_epochs += 1
 
             marker = "-"
 
-        save_checkpoint(
-            last_checkpoint_path,
-            epoch,
-            model,
-            optimizer,
-            scheduler,
-            validation_metrics,
-            abnormal_class_weights,
-            cfg,
-        )
+            # 前 15 个 Epoch 不累计 bad_epochs
+            # 没有出现有效最佳模型时也不累计
+            if (
+                epoch
+                >= int(
+                    cfg[
+                        "MIN_EPOCHS"
+                    ]
+                )
+
+                and
+
+                has_valid_best
+            ):
+
+                bad_epochs += 1
 
         elapsed = (
             time.time()
@@ -2324,6 +2292,9 @@ def main():
             f"Epoch "
             f"{epoch:03d}/"
             f"{cfg['EPOCHS']} | "
+
+            f"Mode "
+            f"{'Frozen' if freeze_backbone else 'Fine-Tune'} | "
 
             f"Train "
             f"{train_metrics['TOTAL_LOSS']:.4f} | "
@@ -2338,27 +2309,28 @@ def main():
             f"{train_metrics['ABNORMAL_LOSS']:.4f} | "
 
             f"4-Score "
-            f"{validation_metrics['FOUR_SCORE']:.4f} | "
+            f"{current_four_score:.4f} | "
 
             f"4-SP "
             f"{validation_metrics['FOUR_SP']:.4f} | "
 
             f"4-SE "
-            f"{validation_metrics['FOUR_SE']:.4f} | "
-
-            f"Final-Bin "
-            f"{validation_metrics['FINAL_BINARY_SCORE']:.4f} | "
-
-            f"Gate-Bin "
-            f"{validation_metrics['GATE_BINARY_SCORE']:.4f} | "
+            f"{current_four_se:.4f} | "
 
             f"F1 "
-            f"{validation_metrics['MACRO_F1']:.4f} | "
+            f"{current_macro_f1:.4f} | "
+
+            f"Valid "
+            f"{valid_candidate} | "
+
+            f"Bad "
+            f"{bad_epochs}/"
+            f"{cfg['PATIENCE']} | "
 
             f"LR "
-            f"{current_backbone_lr:.8f}/"
-            f"{current_binary_head_lr:.8f}/"
-            f"{current_abnormal_head_lr:.8f} | "
+            f"{current_learning_rates[0]:.8f}/"
+            f"{current_learning_rates[1]:.8f}/"
+            f"{current_learning_rates[2]:.8f} | "
 
             f"{elapsed:.1f}s"
         )
@@ -2368,58 +2340,111 @@ def main():
             f"{np.round(validation_metrics['RECALL'], 3).tolist()} | "
 
             f"PredCount="
-            f"{validation_metrics['PRED_COUNTS'].tolist()}"
+            f"{validation_metrics['PRED_COUNTS'].tolist()} | "
+
+            f"Final-Bin="
+            f"{validation_metrics['FINAL_BINARY_SCORE']:.4f} | "
+
+            f"Gate-Bin="
+            f"{validation_metrics['GATE_BINARY_SCORE']:.4f}"
         )
 
-        if (
+        should_early_stop = (
+            epoch
+            >= int(
+                cfg[
+                    "MIN_EPOCHS"
+                ]
+            )
+
+            and
+
+            has_valid_best
+
+            and
+
             bad_epochs
             >= int(
                 cfg[
                     "PATIENCE"
                 ]
             )
-        ):
+        )
+
+        if should_early_stop:
+
             print(
                 "[Early Stop] "
-                f"Best 4-Class Score="
+                f"Epoch={epoch}, "
+                f"Best Epoch={best_epoch}, "
+                f"Best Score="
                 f"{best_four_score:.4f}, "
-                f"Epoch="
-                f"{best_epoch}"
+                f"Bad Epochs="
+                f"{bad_epochs}"
             )
 
             break
 
-    # ========================================================
-    # Load best model
-    # ========================================================
-    best_checkpoint = safe_torch_load(
-        best_checkpoint_path,
+    if best_checkpoint_path.exists():
+
+        selected_checkpoint_path = (
+            best_checkpoint_path
+        )
+
+        print(
+            "[Checkpoint] 使用满足 "
+            "FOUR_SE 条件的最佳模型。"
+        )
+
+    elif fallback_checkpoint_path.exists():
+
+        selected_checkpoint_path = (
+            fallback_checkpoint_path
+        )
+
+        print(
+            "[Checkpoint] 没有有效主模型，"
+            "使用 Macro-F1 最佳模型。"
+        )
+
+    else:
+
+        selected_checkpoint_path = (
+            last_checkpoint_path
+        )
+
+        print(
+            "[Checkpoint] 使用最后一轮模型。"
+        )
+
+    selected_checkpoint = safe_torch_load(
+        selected_checkpoint_path,
         device,
     )
 
     model.load_state_dict(
-        best_checkpoint[
+        selected_checkpoint[
             "model_state"
         ]
     )
 
-    print()
-
     print(
-        f"[Training Completed] "
-        f"Best 4-Class Score="
-        f"{best_checkpoint['four_score']:.4f}, "
-        f"Epoch="
-        f"{best_checkpoint['epoch']}"
+        "[Training Completed] "
+        f"Selected Epoch="
+        f"{selected_checkpoint['epoch']}, "
+        f"Score="
+        f"{selected_checkpoint['four_score']:.4f}, "
+        f"SE="
+        f"{selected_checkpoint['four_se']:.4f}, "
+        f"F1="
+        f"{selected_checkpoint['macro_f1']:.4f}"
     )
 
-    # ========================================================
-    # Final test
-    # ========================================================
     final_metrics = evaluate(
         test_loader,
         model,
         device,
+        four_class_weights,
         abnormal_class_weights,
         cfg,
     )
@@ -2431,8 +2456,18 @@ def main():
     print()
 
     print(
-        "Best checkpoint:",
+        "Selected checkpoint:",
+        selected_checkpoint_path,
+    )
+
+    print(
+        "Best valid checkpoint:",
         best_checkpoint_path,
+    )
+
+    print(
+        "Fallback checkpoint:",
+        fallback_checkpoint_path,
     )
 
     print(
@@ -2442,4 +2477,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
