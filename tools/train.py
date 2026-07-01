@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import math
 import random
 import sys
 import time
@@ -11,13 +12,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     f1_score,
     recall_score,
 )
+
 from torch.utils.data import (
+    BatchSampler,
     DataLoader,
     Dataset,
     WeightedRandomSampler,
@@ -25,7 +29,7 @@ from torch.utils.data import (
 
 
 # ============================================================
-# 配置
+# 1. 配置
 # ============================================================
 CONFIG = {
     "ROOT": (
@@ -35,20 +39,12 @@ CONFIG = {
 
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_two_stage_cascade_v2"
+        "checkpoints_two_stage_cascade_v3"
     ),
 
-    # 已经有上一轮 best_binary.pth 时，直接复用 Stage 1。
-    # 若需要重新训练二分类模型，改成 False。
-    "REUSE_STAGE1_IF_EXISTS": True,
-
-    "PREVIOUS_BINARY_CKPT": (
-        "/data/dingcong/hybrid/"
-        "checkpoints_two_stage_cascade/"
-        "best_binary.pth"
-    ),
-
+    # --------------------------------------------------------
     # 通用参数
+    # --------------------------------------------------------
     "BATCH_SIZE": 4,
     "ACCUM_STEPS": 4,
     "NUM_WORKERS": 1,
@@ -60,7 +56,9 @@ CONFIG = {
 
     "WEIGHT_DECAY": 1e-2,
 
+    # --------------------------------------------------------
     # Backbone
+    # --------------------------------------------------------
     "INPUT_DIM": 768,
     "D_MODEL": 256,
 
@@ -72,43 +70,80 @@ CONFIG = {
 
     "NHEAD": 8,
     "DROPOUT": 0.15,
+
+    # --------------------------------------------------------
+    # MLP 分类头
+    # --------------------------------------------------------
+    "HEAD_HIDDEN_DIM": 128,
     "HEAD_DROPOUT": 0.20,
+
+    # --------------------------------------------------------
+    # 轻量 Token Masking
+    # --------------------------------------------------------
+    "TIME_MASK_MAX": 4,
+    "FREQ_MASK_MAX": 1,
 
     # ========================================================
     # Stage 1：Normal / Abnormal
     # ========================================================
-    "STAGE1_EPOCHS": 30,
-    "STAGE1_LR": 1e-5,
-    "STAGE1_PATIENCE": 10,
+    "STAGE1_EPOCHS": 40,
+    "STAGE1_PATIENCE": 12,
 
-    # 二分类阈值只根据 Binary Score 搜索
+    # Backbone 与分类头使用不同学习率
+    "STAGE1_BACKBONE_LR": 5e-6,
+    "STAGE1_HEAD_LR": 1e-5,
+
+    "STAGE1_MIN_BACKBONE_LR": 1e-6,
+    "STAGE1_MIN_HEAD_LR": 2e-6,
+
+    "STAGE1_WARMUP_EPOCHS": 3,
+
+    # 每个 Batch 保持 Normal / Abnormal = 1:1
+    "STAGE1_BALANCED_BATCH": True,
+
+    "STAGE1_LABEL_SMOOTHING": 0.02,
+
+    # 50% 样本使用轻量 Token Masking
+    "STAGE1_AUG_PROB": 0.50,
+
+    # --------------------------------------------------------
+    # Binary threshold
+    # --------------------------------------------------------
     "THRESHOLD_MIN": 0.05,
     "THRESHOLD_MAX": 0.95,
-    "THRESHOLD_STEP": 0.01,
+
+    # 更细的阈值搜索
+    "THRESHOLD_STEP": 0.001,
 
     # ========================================================
     # Stage 2：Crackle / Wheeze / Both
     # ========================================================
     "STAGE2_EPOCHS": 40,
-
-    # 前 3 个 Epoch 只训练异常分类头
-    "STAGE2_HEAD_ONLY_EPOCHS": 3,
-
-    # 第 4 个 Epoch 开始解冻 Backbone
-    "STAGE2_BACKBONE_LR": 2e-6,
-
-    # 异常分类头使用更高学习率
-    "STAGE2_HEAD_LR": 5e-5,
-
     "STAGE2_PATIENCE": 15,
 
-    # 1.0 表示完全按照异常类别频数倒数进行平衡采样
-    "ABNORMAL_SAMPLER_POWER": 1.0,
+    # 只冻结一个 Epoch
+    "STAGE2_HEAD_ONLY_EPOCHS": 1,
+
+    "STAGE2_BACKBONE_LR": 5e-6,
+    "STAGE2_HEAD_LR": 2e-5,
+
+    "STAGE2_MIN_BACKBONE_LR": 1e-6,
+    "STAGE2_MIN_HEAD_LR": 2e-6,
+
+    "STAGE2_WARMUP_EPOCHS": 2,
+
+    # 中等强度平衡采样
+    "ABNORMAL_SAMPLER_POWER": 0.5,
+
+    "STAGE2_LABEL_SMOOTHING": 0.03,
+
+    # Stage 2 轻量 Token Masking
+    "STAGE2_AUG_PROB": 0.30,
 }
 
 
 # ============================================================
-# 导入模型
+# 2. 导入项目模型
 # ============================================================
 PROJECT_ROOT = Path(
     __file__
@@ -127,7 +162,7 @@ from mymodels.model import (
 
 
 # ============================================================
-# 随机种子
+# 3. 随机种子
 # ============================================================
 def set_seed(
     seed,
@@ -171,21 +206,24 @@ def set_seed(
         )
 
     try:
+
         torch.set_float32_matmul_precision(
             "high"
         )
 
     except AttributeError:
+
         pass
 
 
 # ============================================================
-# AMP Scaler
+# 4. AMP Scaler
 # ============================================================
 def make_scaler(
     enabled,
 ):
     try:
+
         return torch.amp.GradScaler(
             "cuda",
             enabled=enabled,
@@ -202,7 +240,7 @@ def make_scaler(
 
 
 # ============================================================
-# 创建 Backbone
+# 5. Backbone
 # ============================================================
 def make_backbone(
     cfg,
@@ -243,7 +281,282 @@ def make_backbone(
 
 
 # ============================================================
-# Dataset
+# 6. 两层 MLP 分类头
+# ============================================================
+class MLPHead(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(
+                input_dim
+            ),
+
+            nn.Linear(
+                input_dim,
+                hidden_dim,
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                hidden_dim,
+                output_dim,
+            ),
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        return self.net(
+            x
+        )
+
+
+# ============================================================
+# 7. Warm-up + Cosine 学习率
+# ============================================================
+def set_epoch_lrs(
+    optimizer,
+    base_lrs,
+    min_lrs,
+    epoch,
+    total_epochs,
+    warmup_epochs,
+):
+    if epoch <= warmup_epochs:
+
+        progress = (
+            epoch
+            / max(
+                warmup_epochs,
+                1,
+            )
+        )
+
+        scale = (
+            0.20
+            + 0.80
+            * progress
+        )
+
+        current_lrs = [
+            base_lr
+            * scale
+            for base_lr
+            in base_lrs
+        ]
+
+    else:
+
+        cosine_total = max(
+            total_epochs
+            - warmup_epochs,
+            1,
+        )
+
+        cosine_epoch = min(
+            epoch
+            - warmup_epochs,
+            cosine_total,
+        )
+
+        cosine_ratio = (
+            0.5
+            * (
+                1.0
+                + math.cos(
+                    math.pi
+                    * cosine_epoch
+                    / cosine_total
+                )
+            )
+        )
+
+        current_lrs = [
+            min_lr
+            + (
+                base_lr
+                - min_lr
+            )
+            * cosine_ratio
+            for (
+                base_lr,
+                min_lr,
+            )
+            in zip(
+                base_lrs,
+                min_lrs,
+            )
+        ]
+
+    for (
+        parameter_group,
+        current_lr,
+    ) in zip(
+        optimizer.param_groups,
+        current_lrs,
+    ):
+
+        parameter_group[
+            "lr"
+        ] = float(
+            current_lr
+        )
+
+    return current_lrs
+
+
+# ============================================================
+# 8. Token Masking
+# ============================================================
+def apply_patch_mask(
+    x,
+    cfg,
+    probability,
+):
+    if probability <= 0.0:
+
+        return x
+
+    (
+        batch_size,
+        token_count,
+        feature_dim,
+    ) = x.shape
+
+    freq_patches = int(
+        cfg["FREQ_PATCHES"]
+    )
+
+    time_patches = int(
+        cfg["TIME_PATCHES"]
+    )
+
+    expected_tokens = (
+        freq_patches
+        * time_patches
+    )
+
+    if token_count != expected_tokens:
+
+        raise RuntimeError(
+            f"Token 数量为 "
+            f"{token_count}，"
+            f"要求为 "
+            f"{expected_tokens}。"
+        )
+
+    masked_x = (
+        x.clone()
+        .view(
+            batch_size,
+            freq_patches,
+            time_patches,
+            feature_dim,
+        )
+    )
+
+    for sample_index in range(
+        batch_size
+    ):
+
+        if (
+            random.random()
+            >= probability
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # 时间轴 Mask
+        # ----------------------------------------------------
+        max_time_mask = min(
+            int(
+                cfg[
+                    "TIME_MASK_MAX"
+                ]
+            ),
+            time_patches,
+        )
+
+        if max_time_mask > 0:
+
+            width = random.randint(
+                1,
+                max_time_mask,
+            )
+
+            start = random.randint(
+                0,
+                time_patches
+                - width,
+            )
+
+            masked_x[
+                sample_index,
+                :,
+                start:
+                start + width,
+                :,
+            ] = 0.0
+
+        # ----------------------------------------------------
+        # 频率轴 Mask
+        # ----------------------------------------------------
+        max_freq_mask = min(
+            int(
+                cfg[
+                    "FREQ_MASK_MAX"
+                ]
+            ),
+            freq_patches,
+        )
+
+        if max_freq_mask > 0:
+
+            width = random.randint(
+                1,
+                max_freq_mask,
+            )
+
+            start = random.randint(
+                0,
+                freq_patches
+                - width,
+            )
+
+            masked_x[
+                sample_index,
+                start:
+                start + width,
+                :,
+                :,
+            ] = 0.0
+
+    return masked_x.view(
+        batch_size,
+        token_count,
+        feature_dim,
+    )
+
+
+# ============================================================
+# 9. Dataset
 # ============================================================
 class TokenDataset(
     Dataset
@@ -293,12 +606,13 @@ class TokenDataset(
             .astype(int)
         )
 
-        # Stage 2 只使用真实异常样本
+        # Stage 2 只使用异常样本
         if abnormal_only:
 
             self.df = (
                 self.df[
-                    self.df["label"] > 0
+                    self.df["label"]
+                    > 0
                 ]
                 .reset_index(
                     drop=True
@@ -321,8 +635,13 @@ class TokenDataset(
 
         invalid_labels = np.unique(
             self.labels[
-                (self.labels < 0)
-                | (self.labels > 3)
+                (
+                    self.labels < 0
+                )
+                |
+                (
+                    self.labels > 3
+                )
             ]
         )
 
@@ -331,21 +650,10 @@ class TokenDataset(
         ) > 0:
 
             raise ValueError(
-                "标签必须为 0、1、2、3；"
-                f"发现无效标签："
+                "标签必须为 "
+                "0、1、2、3；"
+                f"发现："
                 f"{invalid_labels.tolist()}"
-            )
-
-        if (
-            abnormal_only
-            and np.any(
-                self.labels == 0
-            )
-        ):
-
-            raise RuntimeError(
-                "abnormal_only=True "
-                "时仍包含 Normal 样本。"
             )
 
         self.class_counts = (
@@ -358,7 +666,8 @@ class TokenDataset(
         print(
             f"[Dataset] "
             f"samples={len(self.df)} | "
-            f"abnormal_only={abnormal_only} | "
+            f"abnormal_only="
+            f"{abnormal_only} | "
             f"counts="
             f"{self.class_counts.tolist()} | "
             f"{csv_path}"
@@ -380,6 +689,7 @@ class TokenDataset(
         )
 
         if token_path.exists():
+
             return token_path
 
         relative_path = (
@@ -388,6 +698,7 @@ class TokenDataset(
         )
 
         if relative_path.exists():
+
             return relative_path
 
         raise FileNotFoundError(
@@ -448,7 +759,7 @@ class TokenDataset(
 
 
 # ============================================================
-# Collate
+# 10. Collate
 # ============================================================
 def collate_fixed(
     batch,
@@ -471,9 +782,206 @@ def collate_fixed(
 
 
 # ============================================================
-# 普通 DataLoader
+# 11. Stage 1 平衡 BatchSampler
 # ============================================================
-def make_loader(
+class BinaryBalancedBatchSampler(
+    BatchSampler
+):
+    """
+    BATCH_SIZE=4 时，每个 Batch 固定：
+
+        2 个 Normal
+        2 个 Abnormal
+    """
+
+    def __init__(
+        self,
+        labels,
+        batch_size,
+        seed=42,
+    ):
+        if (
+            batch_size
+            % 2
+            != 0
+        ):
+
+            raise ValueError(
+                "Binary balanced batch "
+                "要求 batch_size 为偶数。"
+            )
+
+        labels = np.asarray(
+            labels,
+            dtype=np.int64,
+        )
+
+        self.normal_indices = np.where(
+            labels == 0
+        )[0]
+
+        self.abnormal_indices = np.where(
+            labels > 0
+        )[0]
+
+        if (
+            len(
+                self.normal_indices
+            )
+            == 0
+            or
+            len(
+                self.abnormal_indices
+            )
+            == 0
+        ):
+
+            raise ValueError(
+                "训练集必须同时包含 "
+                "Normal 和 Abnormal。"
+            )
+
+        self.batch_size = int(
+            batch_size
+        )
+
+        self.half_batch = (
+            self.batch_size
+            // 2
+        )
+
+        self.seed = int(
+            seed
+        )
+
+        self.epoch = 0
+
+        largest_group = max(
+            len(
+                self.normal_indices
+            ),
+
+            len(
+                self.abnormal_indices
+            ),
+        )
+
+        self.number_of_batches = (
+            math.ceil(
+                largest_group
+                / self.half_batch
+            )
+        )
+
+    def __len__(
+        self,
+    ):
+        return (
+            self.number_of_batches
+        )
+
+    def __iter__(
+        self,
+    ):
+        rng = (
+            np.random
+            .default_rng(
+                self.seed
+                + self.epoch
+            )
+        )
+
+        self.epoch += 1
+
+        normal_pool = (
+            rng.permutation(
+                self.normal_indices
+            )
+        )
+
+        abnormal_pool = (
+            rng.permutation(
+                self.abnormal_indices
+            )
+        )
+
+        normal_cursor = 0
+        abnormal_cursor = 0
+
+        for _ in range(
+            self.number_of_batches
+        ):
+
+            if (
+                normal_cursor
+                + self.half_batch
+                > len(
+                    normal_pool
+                )
+            ):
+
+                normal_pool = (
+                    rng.permutation(
+                        self.normal_indices
+                    )
+                )
+
+                normal_cursor = 0
+
+            if (
+                abnormal_cursor
+                + self.half_batch
+                > len(
+                    abnormal_pool
+                )
+            ):
+
+                abnormal_pool = (
+                    rng.permutation(
+                        self.abnormal_indices
+                    )
+                )
+
+                abnormal_cursor = 0
+
+            normal_batch = normal_pool[
+                normal_cursor:
+                normal_cursor
+                + self.half_batch
+            ]
+
+            abnormal_batch = abnormal_pool[
+                abnormal_cursor:
+                abnormal_cursor
+                + self.half_batch
+            ]
+
+            normal_cursor += (
+                self.half_batch
+            )
+
+            abnormal_cursor += (
+                self.half_batch
+            )
+
+            batch = np.concatenate(
+                [
+                    normal_batch,
+                    abnormal_batch,
+                ]
+            )
+
+            rng.shuffle(
+                batch
+            )
+
+            yield batch.tolist()
+
+
+# ============================================================
+# 12. 普通 DataLoader
+# ============================================================
+def make_standard_loader(
     dataset,
     cfg,
     device,
@@ -495,7 +1003,8 @@ def make_loader(
         num_workers=workers,
 
         pin_memory=(
-            device.type == "cuda"
+            device.type
+            == "cuda"
         ),
 
         persistent_workers=(
@@ -509,23 +1018,90 @@ def make_loader(
 
 
 # ============================================================
-# Stage 2 平衡采样 DataLoader
+# 13. Stage 1 平衡 DataLoader
+# ============================================================
+def make_binary_train_loader(
+    dataset,
+    cfg,
+    device,
+):
+    if not bool(
+        cfg[
+            "STAGE1_BALANCED_BATCH"
+        ]
+    ):
+
+        return make_standard_loader(
+            dataset,
+            cfg,
+            device,
+            shuffle=True,
+        )
+
+    workers = int(
+        cfg["NUM_WORKERS"]
+    )
+
+    batch_sampler = (
+        BinaryBalancedBatchSampler(
+            labels=(
+                dataset.labels
+            ),
+
+            batch_size=int(
+                cfg["BATCH_SIZE"]
+            ),
+
+            seed=int(
+                cfg["SEED"]
+            ),
+        )
+    )
+
+    print(
+        "[Stage 1 Loader] "
+        "使用 1:1 Normal/Abnormal "
+        "balanced batches。"
+    )
+
+    return DataLoader(
+        dataset,
+
+        batch_sampler=(
+            batch_sampler
+        ),
+
+        num_workers=workers,
+
+        pin_memory=(
+            device.type
+            == "cuda"
+        ),
+
+        persistent_workers=(
+            workers > 0
+        ),
+
+        collate_fn=collate_fixed,
+    )
+
+
+# ============================================================
+# 14. Stage 2 中等强度平衡采样
 # ============================================================
 def make_balanced_abnormal_loader(
     dataset,
     cfg,
     device,
 ):
-    labels = (
-        dataset.labels
-    )
+    labels = dataset.labels
 
     if np.any(
         labels == 0
     ):
 
         raise RuntimeError(
-            "Stage 2 平衡采样器"
+            "Stage 2 sampler "
             "只能接收异常样本。"
         )
 
@@ -539,7 +1115,7 @@ def make_balanced_abnormal_loader(
         )
     )
 
-    power = float(
+    sampler_power = float(
         cfg[
             "ABNORMAL_SAMPLER_POWER"
         ]
@@ -552,16 +1128,18 @@ def make_balanced_abnormal_loader(
                 class_counts,
                 1.0,
             ),
-            power,
+            sampler_power,
         )
     )
 
     sample_weights = np.asarray(
         [
             class_weights[
-                int(label) - 1
+                int(label)
+                - 1
             ]
-            for label in labels
+            for label
+            in labels
         ],
         dtype=np.float64,
     )
@@ -581,8 +1159,14 @@ def make_balanced_abnormal_loader(
         )
     )
 
-    workers = int(
-        cfg["NUM_WORKERS"]
+    expected_mass = (
+        class_counts
+        * class_weights
+    )
+
+    expected_ratio = (
+        expected_mass
+        / expected_mass.sum()
     )
 
     print(
@@ -595,6 +1179,19 @@ def make_balanced_abnormal_loader(
         "[Stage 2 Sampler] "
         "class weights:",
         class_weights.tolist(),
+    )
+
+    print(
+        "[Stage 2 Sampler] "
+        "expected ratio:",
+        np.round(
+            expected_ratio,
+            4,
+        ).tolist(),
+    )
+
+    workers = int(
+        cfg["NUM_WORKERS"]
     )
 
     return DataLoader(
@@ -611,7 +1208,8 @@ def make_balanced_abnormal_loader(
         num_workers=workers,
 
         pin_memory=(
-            device.type == "cuda"
+            device.type
+            == "cuda"
         ),
 
         persistent_workers=(
@@ -625,7 +1223,7 @@ def make_balanced_abnormal_loader(
 
 
 # ============================================================
-# 二分类指标
+# 15. 二分类指标
 # ============================================================
 def binary_metrics(
     y_true_four,
@@ -706,7 +1304,7 @@ def binary_metrics(
 
 
 # ============================================================
-# 严格四分类指标
+# 16. 四分类指标
 # ============================================================
 def four_class_metrics(
     y_true,
@@ -774,7 +1372,9 @@ def four_class_metrics(
         f1_score(
             y_true,
             y_pred,
+
             average="macro",
+
             zero_division=0,
         )
     )
@@ -825,7 +1425,9 @@ def four_class_metrics(
             macro_f1
         ),
 
-        "RECALL": class_recall,
+        "RECALL": (
+            class_recall
+        ),
 
         "PRED_COUNTS": (
             predicted_counts
@@ -836,7 +1438,7 @@ def four_class_metrics(
 
 
 # ============================================================
-# Stage 1：训练一个 Epoch
+# 17. Stage 1：训练一个 Epoch
 # ============================================================
 def train_binary_epoch(
     loader,
@@ -846,13 +1448,19 @@ def train_binary_epoch(
     device,
     scaler,
     use_amp,
-    accum_steps,
+    cfg,
 ):
     backbone.train()
     binary_head.train()
 
     criterion = (
-        nn.CrossEntropyLoss()
+        nn.CrossEntropyLoss(
+            label_smoothing=float(
+                cfg[
+                    "STAGE1_LABEL_SMOOTHING"
+                ]
+            )
+        )
     )
 
     parameters = (
@@ -875,6 +1483,10 @@ def train_binary_epoch(
         loader
     )
 
+    accum_steps = int(
+        cfg["ACCUM_STEPS"]
+    )
+
     for batch_index, (
         x,
         y,
@@ -890,8 +1502,17 @@ def train_binary_epoch(
             non_blocking=True,
         )
 
-        # 0 = Normal
-        # 1 = Abnormal
+        x = apply_patch_mask(
+            x,
+            cfg,
+
+            probability=float(
+                cfg[
+                    "STAGE1_AUG_PROB"
+                ]
+            ),
+        )
+
         binary_target = (
             y > 0
         ).long()
@@ -952,7 +1573,7 @@ def train_binary_epoch(
 
             torch.nn.utils.clip_grad_norm_(
                 parameters,
-                max_norm=5.0,
+                max_norm=2.0,
             )
 
             old_scale = (
@@ -970,6 +1591,7 @@ def train_binary_epoch(
             )
 
             if new_scale >= old_scale:
+
                 optimizer_steps += 1
 
             optimizer.zero_grad(
@@ -991,7 +1613,7 @@ def train_binary_epoch(
 
 
 # ============================================================
-# 收集二分类概率
+# 18. 收集二分类输出
 # ============================================================
 @torch.no_grad()
 def collect_binary_outputs(
@@ -1096,7 +1718,7 @@ def collect_binary_outputs(
 
 
 # ============================================================
-# Stage 1：搜索二分类最佳阈值
+# 19. 二分类阈值搜索
 # ============================================================
 def search_binary_threshold(
     probabilities,
@@ -1104,28 +1726,36 @@ def search_binary_threshold(
     cfg,
 ):
     thresholds = np.arange(
-        cfg[
-            "THRESHOLD_MIN"
-        ],
+        float(
+            cfg[
+                "THRESHOLD_MIN"
+            ]
+        ),
 
-        cfg[
-            "THRESHOLD_MAX"
-        ]
-        + cfg[
-            "THRESHOLD_STEP"
-        ]
+        float(
+            cfg[
+                "THRESHOLD_MAX"
+            ]
+        )
+        + float(
+            cfg[
+                "THRESHOLD_STEP"
+            ]
+        )
         / 2.0,
 
-        cfg[
-            "THRESHOLD_STEP"
-        ],
+        float(
+            cfg[
+                "THRESHOLD_STEP"
+            ]
+        ),
     )
 
     best_metrics = None
     best_threshold = None
 
-    best_balance = float(
-        "inf"
+    best_balance_difference = (
+        float("inf")
     )
 
     for threshold in thresholds:
@@ -1142,15 +1772,24 @@ def search_binary_threshold(
             prediction,
         )
 
-        score = (
+        score = float(
             metrics[
                 "BINARY_SCORE"
             ]
         )
 
-        balance = abs(
-            metrics["BINARY_SP"]
-            - metrics["BINARY_SE"]
+        balance_difference = abs(
+            float(
+                metrics[
+                    "BINARY_SP"
+                ]
+            )
+            -
+            float(
+                metrics[
+                    "BINARY_SE"
+                ]
+            )
         )
 
         if best_metrics is None:
@@ -1159,7 +1798,7 @@ def search_binary_threshold(
 
         else:
 
-            best_score = (
+            best_score = float(
                 best_metrics[
                     "BINARY_SCORE"
                 ]
@@ -1176,23 +1815,30 @@ def search_binary_threshold(
                 and abs(
                     score
                     - best_score
-                ) <= 1e-12
-                and balance
-                < best_balance
+                )
+                <= 1e-12
+                and
+                balance_difference
+                <
+                best_balance_difference
             ):
 
                 improved = True
 
         if improved:
 
-            best_metrics = metrics
-
-            best_threshold = float(
-                threshold
+            best_metrics = (
+                metrics
             )
 
-            best_balance = (
-                balance
+            best_threshold = (
+                float(
+                    threshold
+                )
+            )
+
+            best_balance_difference = (
+                balance_difference
             )
 
     if best_metrics is None:
@@ -1209,7 +1855,7 @@ def search_binary_threshold(
 
 
 # ============================================================
-# Stage 1：验证
+# 20. Stage 1 验证
 # ============================================================
 @torch.no_grad()
 def evaluate_binary(
@@ -1246,7 +1892,7 @@ def evaluate_binary(
 
 
 # ============================================================
-# Stage 2：训练一个 Epoch
+# 21. Stage 2 训练一个 Epoch
 # ============================================================
 def train_abnormal_epoch(
     loader,
@@ -1256,7 +1902,7 @@ def train_abnormal_epoch(
     device,
     scaler,
     use_amp,
-    accum_steps,
+    cfg,
     freeze_backbone,
 ):
     if freeze_backbone:
@@ -1269,20 +1915,26 @@ def train_abnormal_epoch(
 
     abnormal_head.train()
 
-    # 已经使用平衡采样，
-    # 此处不要再叠加类别权重
     criterion = (
-        nn.CrossEntropyLoss()
+        nn.CrossEntropyLoss(
+            label_smoothing=float(
+                cfg[
+                    "STAGE2_LABEL_SMOOTHING"
+                ]
+            )
+        )
     )
 
     trainable_parameters = [
         parameter
-        for parameter in (
+        for parameter
+        in (
             list(
                 abnormal_backbone
                 .parameters()
             )
-            + list(
+            +
+            list(
                 abnormal_head
                 .parameters()
             )
@@ -1301,6 +1953,10 @@ def train_abnormal_epoch(
         loader
     )
 
+    accum_steps = int(
+        cfg["ACCUM_STEPS"]
+    )
+
     for batch_index, (
         x,
         y,
@@ -1316,7 +1972,17 @@ def train_abnormal_epoch(
             non_blocking=True,
         )
 
-        # 1/2/3 转成 0/1/2
+        x = apply_patch_mask(
+            x,
+            cfg,
+
+            probability=float(
+                cfg[
+                    "STAGE2_AUG_PROB"
+                ]
+            ),
+        )
+
         abnormal_target = (
             y - 1
         )
@@ -1391,7 +2057,7 @@ def train_abnormal_epoch(
 
             torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
-                max_norm=5.0,
+                max_norm=2.0,
             )
 
             old_scale = (
@@ -1409,6 +2075,7 @@ def train_abnormal_epoch(
             )
 
             if new_scale >= old_scale:
+
                 optimizer_steps += 1
 
             optimizer.zero_grad(
@@ -1430,7 +2097,7 @@ def train_abnormal_epoch(
 
 
 # ============================================================
-# 单独评价异常三分类模型
+# 22. 单独评价异常三分类
 # ============================================================
 @torch.no_grad()
 def evaluate_abnormal(
@@ -1453,7 +2120,8 @@ def evaluate_abnormal(
         )
 
         abnormal_target = (
-            y.numpy() - 1
+            y.numpy()
+            - 1
         )
 
         feature = (
@@ -1561,7 +2229,7 @@ def evaluate_abnormal(
 
 
 # ============================================================
-# 完整级联评价
+# 23. 完整级联评价
 # ============================================================
 @torch.no_grad()
 def evaluate_cascade(
@@ -1590,9 +2258,9 @@ def evaluate_cascade(
             non_blocking=True,
         )
 
-        # ====================================================
-        # Stage 1：Normal / Abnormal
-        # ====================================================
+        # ----------------------------------------------------
+        # Stage 1
+        # ----------------------------------------------------
         binary_feature = (
             binary_backbone(
                 x
@@ -1617,16 +2285,17 @@ def evaluate_cascade(
             >= binary_threshold
         )
 
-        # 默认预测 Normal
-        final_prediction = torch.zeros(
-            x.size(0),
-            dtype=torch.long,
-            device=device,
+        final_prediction = (
+            torch.zeros(
+                x.size(0),
+                dtype=torch.long,
+                device=device,
+            )
         )
 
-        # ====================================================
-        # Stage 2：只处理第一阶段预测为异常的样本
-        # ====================================================
+        # ----------------------------------------------------
+        # Stage 2
+        # ----------------------------------------------------
         if binary_prediction.any():
 
             abnormal_input = x[
@@ -1718,7 +2387,37 @@ def evaluate_cascade(
 
 
 # ============================================================
-# 保存 Stage 1
+# 24. 转换指标
+# ============================================================
+def serializable_metrics(
+    metrics,
+):
+    result = {}
+
+    for key, value in (
+        metrics.items()
+    ):
+
+        if isinstance(
+            value,
+            np.ndarray,
+        ):
+
+            result[key] = (
+                value.tolist()
+            )
+
+        else:
+
+            result[key] = (
+                value
+            )
+
+    return result
+
+
+# ============================================================
+# 25. 保存 Stage 1
 # ============================================================
 def save_stage1(
     path,
@@ -1726,13 +2425,14 @@ def save_stage1(
     backbone,
     binary_head,
     optimizer,
-    scheduler,
     metrics,
     cfg,
 ):
     torch.save(
         {
-            "epoch": epoch,
+            "epoch": int(
+                epoch
+            ),
 
             "backbone_state": (
                 backbone.state_dict()
@@ -1744,10 +2444,6 @@ def save_stage1(
 
             "optimizer_state": (
                 optimizer.state_dict()
-            ),
-
-            "scheduler_state": (
-                scheduler.state_dict()
             ),
 
             "binary_score": float(
@@ -1762,6 +2458,12 @@ def save_stage1(
                 ]
             ),
 
+            "metrics": (
+                serializable_metrics(
+                    metrics
+                )
+            ),
+
             "config": deepcopy(
                 cfg
             ),
@@ -1771,7 +2473,7 @@ def save_stage1(
 
 
 # ============================================================
-# 保存 Stage 2
+# 26. 保存 Stage 2
 # ============================================================
 def save_stage2(
     path,
@@ -1779,14 +2481,15 @@ def save_stage2(
     abnormal_backbone,
     abnormal_head,
     optimizer,
-    scheduler,
     cascade_metrics,
     abnormal_metrics,
     cfg,
 ):
     torch.save(
         {
-            "epoch": epoch,
+            "epoch": int(
+                epoch
+            ),
 
             "abnormal_backbone_state": (
                 abnormal_backbone
@@ -1802,10 +2505,6 @@ def save_stage2(
                 optimizer.state_dict()
             ),
 
-            "scheduler_state": (
-                scheduler.state_dict()
-            ),
-
             "four_score": float(
                 cascade_metrics[
                     "FOUR_SCORE"
@@ -1818,16 +2517,16 @@ def save_stage2(
                 ]
             ),
 
-            "abnormal_acc": float(
-                abnormal_metrics[
-                    "ABNORMAL_ACC"
-                ]
+            "cascade_metrics": (
+                serializable_metrics(
+                    cascade_metrics
+                )
             ),
 
-            "abnormal_f1": float(
-                abnormal_metrics[
-                    "ABNORMAL_F1"
-                ]
+            "abnormal_metrics": (
+                serializable_metrics(
+                    abnormal_metrics
+                )
             ),
 
             "config": deepcopy(
@@ -1839,12 +2538,13 @@ def save_stage2(
 
 
 # ============================================================
-# 输出最终结果
+# 27. 最终结果
 # ============================================================
 def print_final(
     metrics,
 ):
     print()
+
     print(
         "=" * 80
     )
@@ -1949,21 +2649,25 @@ def print_final(
 
 
 # ============================================================
-# 主函数
+# 28. 主函数
 # ============================================================
 def main():
 
     cfg = CONFIG
 
     set_seed(
-        cfg["SEED"]
+        int(
+            cfg["SEED"]
+        )
     )
 
     device = torch.device(
         "cuda"
         if (
-            cfg["DEVICE"] == "cuda"
-            and torch.cuda.is_available()
+            cfg["DEVICE"]
+            == "cuda"
+            and
+            torch.cuda.is_available()
         )
         else "cpu"
     )
@@ -1989,16 +2693,17 @@ def main():
 
     if (
         cfg["REQUIRE_MAMBA"]
-        and not HAS_MAMBA
+        and
+        not HAS_MAMBA
     ):
 
         raise RuntimeError(
             "mamba_ssm 导入失败。"
         )
 
-    # ========================================================
-    # 数据路径
-    # ========================================================
+    # --------------------------------------------------------
+    # 路径
+    # --------------------------------------------------------
     root = Path(
         cfg["ROOT"]
     )
@@ -2048,15 +2753,11 @@ def main():
         )
 
         print(
-            "[WARNING] 没有 "
-            "val_index.csv，"
+            "[WARNING] 没有 val_index.csv，"
             "暂时使用 test_index.csv "
-            "选模型和阈值。"
+            "选择模型和阈值。"
         )
 
-    # ========================================================
-    # 保存目录
-    # ========================================================
     save_dir = Path(
         cfg["SAVE_DIR"]
     )
@@ -2086,9 +2787,9 @@ def main():
         / "last_abnormal.pth"
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # Dataset
-    # ========================================================
+    # --------------------------------------------------------
     train_set = TokenDataset(
         train_csv,
         cfg,
@@ -2123,18 +2824,19 @@ def main():
         )
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # DataLoader
-    # ========================================================
-    train_loader = make_loader(
-        train_set,
-        cfg,
-        device,
-        shuffle=True,
+    # --------------------------------------------------------
+    train_loader = (
+        make_binary_train_loader(
+            train_set,
+            cfg,
+            device,
+        )
     )
 
     selection_loader = (
-        make_loader(
+        make_standard_loader(
             selection_set,
             cfg,
             device,
@@ -2142,14 +2844,15 @@ def main():
         )
     )
 
-    test_loader = make_loader(
-        test_set,
-        cfg,
-        device,
-        shuffle=False,
+    test_loader = (
+        make_standard_loader(
+            test_set,
+            cfg,
+            device,
+            shuffle=False,
+        )
     )
 
-    # Stage 2 使用平衡采样
     abnormal_train_loader = (
         make_balanced_abnormal_loader(
             abnormal_train_set,
@@ -2158,9 +2861,8 @@ def main():
         )
     )
 
-    # 验证集不能平衡采样
     abnormal_selection_loader = (
-        make_loader(
+        make_standard_loader(
             abnormal_selection_set,
             cfg,
             device,
@@ -2170,15 +2872,17 @@ def main():
 
     use_amp = bool(
         cfg["AMP"]
-        and device.type == "cuda"
+        and
+        device.type == "cuda"
     )
 
     # ========================================================
     # Stage 1
     # ========================================================
     print()
+
     print(
-        "=" * 80
+        "=" * 90
     )
 
     print(
@@ -2187,7 +2891,7 @@ def main():
     )
 
     print(
-        "=" * 80
+        "=" * 90
     )
 
     binary_backbone = (
@@ -2196,227 +2900,191 @@ def main():
         ).to(device)
     )
 
-    binary_head = nn.Sequential(
-        nn.Dropout(
+    binary_head = MLPHead(
+        input_dim=int(
+            cfg["D_MODEL"]
+        ),
+
+        hidden_dim=int(
+            cfg[
+                "HEAD_HIDDEN_DIM"
+            ]
+        ),
+
+        output_dim=2,
+
+        dropout=float(
             cfg[
                 "HEAD_DROPOUT"
             ]
         ),
-
-        nn.Linear(
-            cfg["D_MODEL"],
-            2,
-        ),
     ).to(device)
 
-    previous_binary_path = Path(
-        cfg[
-            "PREVIOUS_BINARY_CKPT"
-        ]
+    binary_optimizer = (
+        torch.optim.AdamW(
+            [
+                {
+                    "params": (
+                        binary_backbone
+                        .parameters()
+                    ),
+
+                    "lr": float(
+                        cfg[
+                            "STAGE1_BACKBONE_LR"
+                        ]
+                    ),
+                },
+
+                {
+                    "params": (
+                        binary_head
+                        .parameters()
+                    ),
+
+                    "lr": float(
+                        cfg[
+                            "STAGE1_HEAD_LR"
+                        ]
+                    ),
+                },
+            ],
+
+            weight_decay=float(
+                cfg[
+                    "WEIGHT_DECAY"
+                ]
+            ),
+        )
     )
 
-    reuse_stage1 = (
-        bool(
+    binary_scaler = (
+        make_scaler(
+            use_amp
+        )
+    )
+
+    best_binary_score = -1.0
+    best_binary_epoch = -1
+
+    bad_epochs = 0
+
+    for epoch in range(
+        1,
+        int(
             cfg[
-                "REUSE_STAGE1_IF_EXISTS"
+                "STAGE1_EPOCHS"
             ]
         )
-        and previous_binary_path.exists()
-    )
+        + 1,
+    ):
 
-    # ========================================================
-    # 直接加载已有 Stage 1
-    # ========================================================
-    if reuse_stage1:
+        start_time = time.time()
 
-        print(
-            "[Stage 1] 加载已有模型：",
-            previous_binary_path,
-        )
-
-        binary_checkpoint = torch.load(
-            previous_binary_path,
-            map_location=device,
-        )
-
-        binary_backbone.load_state_dict(
-            binary_checkpoint[
-                "backbone_state"
-            ]
-        )
-
-        binary_head.load_state_dict(
-            binary_checkpoint[
-                "binary_head_state"
-            ]
-        )
-
-        binary_threshold = float(
-            binary_checkpoint[
-                "threshold"
-            ]
-        )
-
-        print(
-            f"[Stage 1 Loaded] "
-            f"Binary Score="
-            f"{binary_checkpoint['binary_score']:.4f}, "
-            f"Epoch="
-            f"{binary_checkpoint['epoch']}, "
-            f"Threshold="
-            f"{binary_threshold:.4f}"
-        )
-
-    # ========================================================
-    # 没有已有模型时重新训练 Stage 1
-    # ========================================================
-    else:
-
-        binary_optimizer = (
-            torch.optim.AdamW(
-                list(
-                    binary_backbone
-                    .parameters()
-                )
-                + list(
-                    binary_head
-                    .parameters()
+        current_lrs = (
+            set_epoch_lrs(
+                optimizer=(
+                    binary_optimizer
                 ),
 
-                lr=(
-                    cfg[
-                        "STAGE1_LR"
-                    ]
-                ),
+                base_lrs=[
+                    float(
+                        cfg[
+                            "STAGE1_BACKBONE_LR"
+                        ]
+                    ),
 
-                weight_decay=(
-                    cfg[
-                        "WEIGHT_DECAY"
-                    ]
-                ),
-            )
-        )
+                    float(
+                        cfg[
+                            "STAGE1_HEAD_LR"
+                        ]
+                    ),
+                ],
 
-        binary_scheduler = (
-            torch.optim.lr_scheduler
-            .CosineAnnealingLR(
-                binary_optimizer,
+                min_lrs=[
+                    float(
+                        cfg[
+                            "STAGE1_MIN_BACKBONE_LR"
+                        ]
+                    ),
 
-                T_max=(
+                    float(
+                        cfg[
+                            "STAGE1_MIN_HEAD_LR"
+                        ]
+                    ),
+                ],
+
+                epoch=epoch,
+
+                total_epochs=int(
                     cfg[
                         "STAGE1_EPOCHS"
                     ]
                 ),
 
-                eta_min=1e-6,
+                warmup_epochs=int(
+                    cfg[
+                        "STAGE1_WARMUP_EPOCHS"
+                    ]
+                ),
             )
         )
 
-        binary_scaler = (
-            make_scaler(
-                use_amp
-            )
+        (
+            train_loss,
+            _,
+        ) = train_binary_epoch(
+            train_loader,
+
+            binary_backbone,
+            binary_head,
+
+            binary_optimizer,
+
+            device,
+            binary_scaler,
+            use_amp,
+
+            cfg,
         )
 
-        best_binary_score = -1.0
-        best_binary_epoch = -1
-        bad_epochs = 0
+        metrics = evaluate_binary(
+            selection_loader,
 
-        for epoch in range(
-            1,
-            cfg["STAGE1_EPOCHS"]
-            + 1,
+            binary_backbone,
+            binary_head,
+
+            device,
+            cfg,
+        )
+
+        if (
+            metrics[
+                "BINARY_SCORE"
+            ]
+            > best_binary_score
+            + 1e-9
         ):
 
-            start_time = time.time()
-
-            (
-                train_loss,
-                optimizer_steps,
-            ) = train_binary_epoch(
-                train_loader,
-
-                binary_backbone,
-                binary_head,
-
-                binary_optimizer,
-
-                device,
-                binary_scaler,
-                use_amp,
-
-                cfg[
-                    "ACCUM_STEPS"
-                ],
-            )
-
-            metrics = (
-                evaluate_binary(
-                    selection_loader,
-
-                    binary_backbone,
-                    binary_head,
-
-                    device,
-                    cfg,
-                )
-            )
-
-            current_lr = (
-                binary_optimizer
-                .param_groups[0]["lr"]
-            )
-
-            if optimizer_steps > 0:
-
-                binary_scheduler.step()
-
-            if (
+            best_binary_score = float(
                 metrics[
                     "BINARY_SCORE"
                 ]
-                > best_binary_score
-                + 1e-9
-            ):
+            )
 
-                best_binary_score = (
-                    metrics[
-                        "BINARY_SCORE"
-                    ]
-                )
+            best_binary_epoch = (
+                epoch
+            )
 
-                best_binary_epoch = (
-                    epoch
-                )
+            bad_epochs = 0
 
-                bad_epochs = 0
-
-                marker = (
-                    "BEST-BINARY"
-                )
-
-                save_stage1(
-                    best_binary_path,
-
-                    epoch,
-
-                    binary_backbone,
-                    binary_head,
-
-                    binary_optimizer,
-                    binary_scheduler,
-
-                    metrics,
-                    cfg,
-                )
-
-            else:
-
-                bad_epochs += 1
-                marker = "-"
+            marker = (
+                "BEST-BINARY"
+            )
 
             save_stage1(
-                last_binary_path,
+                best_binary_path,
 
                 epoch,
 
@@ -2424,104 +3092,133 @@ def main():
                 binary_head,
 
                 binary_optimizer,
-                binary_scheduler,
 
                 metrics,
+
                 cfg,
             )
 
-            print(
-                f"[{marker}] "
-                f"S1 Epoch "
-                f"{epoch:03d}/"
-                f"{cfg['STAGE1_EPOCHS']} | "
+        else:
 
-                f"train "
-                f"{train_loss:.4f} | "
+            bad_epochs += 1
 
-                f"val "
-                f"{metrics['LOSS']:.4f} | "
+            marker = "-"
 
-                f"Binary-Score "
-                f"{metrics['BINARY_SCORE']:.4f} | "
+        save_stage1(
+            last_binary_path,
 
-                f"SP "
-                f"{metrics['BINARY_SP']:.4f} | "
+            epoch,
 
-                f"SE "
-                f"{metrics['BINARY_SE']:.4f} | "
+            binary_backbone,
+            binary_head,
 
-                f"Thr "
-                f"{metrics['THRESHOLD']:.2f} | "
+            binary_optimizer,
 
-                f"LR "
-                f"{current_lr:.8f} | "
+            metrics,
 
-                f"{time.time() - start_time:.1f}s"
-            )
-
-            if (
-                bad_epochs
-                >= cfg[
-                    "STAGE1_PATIENCE"
-                ]
-            ):
-
-                print(
-                    "[Stage 1 Early Stop] "
-                    f"Best Binary Score="
-                    f"{best_binary_score:.4f}, "
-                    f"Epoch="
-                    f"{best_binary_epoch}"
-                )
-
-                break
-
-        binary_checkpoint = (
-            torch.load(
-                best_binary_path,
-                map_location=device,
-            )
-        )
-
-        binary_backbone.load_state_dict(
-            binary_checkpoint[
-                "backbone_state"
-            ]
-        )
-
-        binary_head.load_state_dict(
-            binary_checkpoint[
-                "binary_head_state"
-            ]
-        )
-
-        binary_threshold = float(
-            binary_checkpoint[
-                "threshold"
-            ]
+            cfg,
         )
 
         print(
-            f"[Stage 1 完成] "
-            f"Binary Score="
-            f"{binary_checkpoint['binary_score']:.4f}, "
-            f"Epoch="
-            f"{binary_checkpoint['epoch']}, "
-            f"Threshold="
-            f"{binary_threshold:.4f}"
+            f"[{marker}] "
+            f"S1 Epoch "
+            f"{epoch:03d}/"
+            f"{cfg['STAGE1_EPOCHS']} | "
+
+            f"train "
+            f"{train_loss:.4f} | "
+
+            f"val "
+            f"{metrics['LOSS']:.4f} | "
+
+            f"Binary-Score "
+            f"{metrics['BINARY_SCORE']:.4f} | "
+
+            f"SP "
+            f"{metrics['BINARY_SP']:.4f} | "
+
+            f"SE "
+            f"{metrics['BINARY_SE']:.4f} | "
+
+            f"Thr "
+            f"{metrics['THRESHOLD']:.3f} | "
+
+            f"B-LR "
+            f"{current_lrs[0]:.8f} | "
+
+            f"H-LR "
+            f"{current_lrs[1]:.8f} | "
+
+            f"{time.time() - start_time:.1f}s"
         )
 
-    # Stage 2 期间固定二分类模型
+        if (
+            bad_epochs
+            >= int(
+                cfg[
+                    "STAGE1_PATIENCE"
+                ]
+            )
+        ):
+
+            print(
+                "[Stage 1 Early Stop] "
+                f"Best Binary Score="
+                f"{best_binary_score:.4f}, "
+                f"Epoch="
+                f"{best_binary_epoch}"
+            )
+
+            break
+
+    # --------------------------------------------------------
+    # 加载最佳 Stage 1
+    # --------------------------------------------------------
+    binary_checkpoint = torch.load(
+        best_binary_path,
+        map_location=device,
+    )
+
+    binary_backbone.load_state_dict(
+        binary_checkpoint[
+            "backbone_state"
+        ]
+    )
+
+    binary_head.load_state_dict(
+        binary_checkpoint[
+            "binary_head_state"
+        ]
+    )
+
+    binary_threshold = float(
+        binary_checkpoint[
+            "threshold"
+        ]
+    )
+
+    print(
+        f"[Stage 1 完成] "
+        f"Binary Score="
+        f"{binary_checkpoint['binary_score']:.4f}, "
+        f"Epoch="
+        f"{binary_checkpoint['epoch']}, "
+        f"Threshold="
+        f"{binary_threshold:.4f}"
+    )
+
     binary_backbone.eval()
     binary_head.eval()
 
     for parameter in (
         list(
-            binary_backbone.parameters()
+            binary_backbone
+            .parameters()
         )
-        + list(
-            binary_head.parameters()
+        +
+        list(
+            binary_head
+            .parameters()
         )
     ):
 
@@ -2533,8 +3230,9 @@ def main():
     # Stage 2
     # ========================================================
     print()
+
     print(
-        "=" * 80
+        "=" * 90
     )
 
     print(
@@ -2543,7 +3241,7 @@ def main():
     )
 
     print(
-        "=" * 80
+        "=" * 90
     )
 
     abnormal_backbone = (
@@ -2552,40 +3250,42 @@ def main():
         ).to(device)
     )
 
-    # 使用最佳二分类 Backbone 初始化
+    # 使用 Stage 1 最佳 Backbone 初始化
     abnormal_backbone.load_state_dict(
         binary_checkpoint[
             "backbone_state"
         ]
     )
 
-    abnormal_head = nn.Sequential(
-        nn.Dropout(
+    abnormal_head = MLPHead(
+        input_dim=int(
+            cfg["D_MODEL"]
+        ),
+
+        hidden_dim=int(
+            cfg[
+                "HEAD_HIDDEN_DIM"
+            ]
+        ),
+
+        output_dim=3,
+
+        dropout=float(
             cfg[
                 "HEAD_DROPOUT"
             ]
         ),
-
-        nn.Linear(
-            cfg["D_MODEL"],
-            3,
-        ),
     ).to(device)
 
-    # 前 3 个 Epoch 冻结 Backbone
+    # 第 1 个 Epoch 冻结 Backbone
     for parameter in (
-        abnormal_backbone.parameters()
+        abnormal_backbone
+        .parameters()
     ):
 
         parameter.requires_grad = (
             False
         )
-
-    print(
-        f"[Stage 2] 前 "
-        f"{cfg['STAGE2_HEAD_ONLY_EPOCHS']} "
-        "个 Epoch 只训练异常分类头。"
-    )
 
     abnormal_optimizer = (
         torch.optim.AdamW(
@@ -2596,7 +3296,7 @@ def main():
                         .parameters()
                     ),
 
-                    "lr": (
+                    "lr": float(
                         cfg[
                             "STAGE2_BACKBONE_LR"
                         ]
@@ -2609,7 +3309,7 @@ def main():
                         .parameters()
                     ),
 
-                    "lr": (
+                    "lr": float(
                         cfg[
                             "STAGE2_HEAD_LR"
                         ]
@@ -2617,26 +3317,11 @@ def main():
                 },
             ],
 
-            weight_decay=(
+            weight_decay=float(
                 cfg[
                     "WEIGHT_DECAY"
                 ]
             ),
-        )
-    )
-
-    abnormal_scheduler = (
-        torch.optim.lr_scheduler
-        .CosineAnnealingLR(
-            abnormal_optimizer,
-
-            T_max=(
-                cfg[
-                    "STAGE2_EPOCHS"
-                ]
-            ),
-
-            eta_min=5e-7,
         )
     )
 
@@ -2648,11 +3333,16 @@ def main():
 
     best_four_score = -1.0
     best_stage2_epoch = -1
+
     bad_epochs = 0
 
     for epoch in range(
         1,
-        cfg["STAGE2_EPOCHS"]
+        int(
+            cfg[
+                "STAGE2_EPOCHS"
+            ]
+        )
         + 1,
     ):
 
@@ -2660,17 +3350,21 @@ def main():
 
         freeze_backbone = (
             epoch
-            <= cfg[
-                "STAGE2_HEAD_ONLY_EPOCHS"
-            ]
+            <= int(
+                cfg[
+                    "STAGE2_HEAD_ONLY_EPOCHS"
+                ]
+            )
         )
 
-        # 第 4 个 Epoch 解冻 Backbone
+        # 第 2 个 Epoch 解冻
         if (
             epoch
-            == cfg[
-                "STAGE2_HEAD_ONLY_EPOCHS"
-            ]
+            == int(
+                cfg[
+                    "STAGE2_HEAD_ONLY_EPOCHS"
+                ]
+            )
             + 1
         ):
 
@@ -2689,9 +3383,59 @@ def main():
                 "开始联合微调。"
             )
 
+        current_lrs = (
+            set_epoch_lrs(
+                optimizer=(
+                    abnormal_optimizer
+                ),
+
+                base_lrs=[
+                    float(
+                        cfg[
+                            "STAGE2_BACKBONE_LR"
+                        ]
+                    ),
+
+                    float(
+                        cfg[
+                            "STAGE2_HEAD_LR"
+                        ]
+                    ),
+                ],
+
+                min_lrs=[
+                    float(
+                        cfg[
+                            "STAGE2_MIN_BACKBONE_LR"
+                        ]
+                    ),
+
+                    float(
+                        cfg[
+                            "STAGE2_MIN_HEAD_LR"
+                        ]
+                    ),
+                ],
+
+                epoch=epoch,
+
+                total_epochs=int(
+                    cfg[
+                        "STAGE2_EPOCHS"
+                    ]
+                ),
+
+                warmup_epochs=int(
+                    cfg[
+                        "STAGE2_WARMUP_EPOCHS"
+                    ]
+                ),
+            )
+        )
+
         (
             train_loss,
-            optimizer_steps,
+            _,
         ) = train_abnormal_epoch(
             abnormal_train_loader,
 
@@ -2704,14 +3448,12 @@ def main():
             abnormal_scaler,
             use_amp,
 
-            cfg[
-                "ACCUM_STEPS"
-            ],
+            cfg,
 
             freeze_backbone,
         )
 
-        abnormal_evaluation = (
+        abnormal_metrics = (
             evaluate_abnormal(
                 abnormal_selection_loader,
 
@@ -2722,7 +3464,7 @@ def main():
             )
         )
 
-        cascade_evaluation = (
+        cascade_metrics = (
             evaluate_cascade(
                 selection_loader,
 
@@ -2738,30 +3480,16 @@ def main():
             )
         )
 
-        backbone_lr = (
-            abnormal_optimizer
-            .param_groups[0]["lr"]
-        )
-
-        head_lr = (
-            abnormal_optimizer
-            .param_groups[1]["lr"]
-        )
-
-        if optimizer_steps > 0:
-
-            abnormal_scheduler.step()
-
         if (
-            cascade_evaluation[
+            cascade_metrics[
                 "FOUR_SCORE"
             ]
             > best_four_score
             + 1e-9
         ):
 
-            best_four_score = (
-                cascade_evaluation[
+            best_four_score = float(
+                cascade_metrics[
                     "FOUR_SCORE"
                 ]
             )
@@ -2785,10 +3513,9 @@ def main():
                 abnormal_head,
 
                 abnormal_optimizer,
-                abnormal_scheduler,
 
-                cascade_evaluation,
-                abnormal_evaluation,
+                cascade_metrics,
+                abnormal_metrics,
 
                 cfg,
             )
@@ -2796,6 +3523,7 @@ def main():
         else:
 
             bad_epochs += 1
+
             marker = "-"
 
         save_stage2(
@@ -2807,10 +3535,9 @@ def main():
             abnormal_head,
 
             abnormal_optimizer,
-            abnormal_scheduler,
 
-            cascade_evaluation,
-            abnormal_evaluation,
+            cascade_metrics,
+            abnormal_metrics,
 
             cfg,
         )
@@ -2828,47 +3555,49 @@ def main():
             f"{train_loss:.4f} | "
 
             f"Abn-Acc "
-            f"{abnormal_evaluation['ABNORMAL_ACC']:.4f} | "
+            f"{abnormal_metrics['ABNORMAL_ACC']:.4f} | "
 
             f"Abn-F1 "
-            f"{abnormal_evaluation['ABNORMAL_F1']:.4f} | "
+            f"{abnormal_metrics['ABNORMAL_F1']:.4f} | "
 
             f"Abn-Recall "
-            f"{np.round(abnormal_evaluation['ABNORMAL_RECALL'], 3).tolist()} | "
+            f"{np.round(abnormal_metrics['ABNORMAL_RECALL'], 3).tolist()} | "
 
             f"4-Score "
-            f"{cascade_evaluation['FOUR_SCORE']:.4f} | "
+            f"{cascade_metrics['FOUR_SCORE']:.4f} | "
 
             f"4-SP "
-            f"{cascade_evaluation['FOUR_SP']:.4f} | "
+            f"{cascade_metrics['FOUR_SP']:.4f} | "
 
             f"4-SE "
-            f"{cascade_evaluation['FOUR_SE']:.4f} | "
+            f"{cascade_metrics['FOUR_SE']:.4f} | "
 
             f"Binary-Score "
-            f"{cascade_evaluation['BINARY_SCORE']:.4f} | "
+            f"{cascade_metrics['BINARY_SCORE']:.4f} | "
 
             f"B-LR "
-            f"{backbone_lr:.8f} | "
+            f"{current_lrs[0]:.8f} | "
 
             f"H-LR "
-            f"{head_lr:.8f} | "
+            f"{current_lrs[1]:.8f} | "
 
             f"{time.time() - start_time:.1f}s"
         )
 
         print(
             "    Recall[0,1,2,3]="
-            f"{np.round(cascade_evaluation['RECALL'], 3).tolist()} | "
+            f"{np.round(cascade_metrics['RECALL'], 3).tolist()} | "
             f"PredCount="
-            f"{cascade_evaluation['PRED_COUNTS'].tolist()}"
+            f"{cascade_metrics['PRED_COUNTS'].tolist()}"
         )
 
         if (
             bad_epochs
-            >= cfg[
-                "STAGE2_PATIENCE"
-            ]
+            >= int(
+                cfg[
+                    "STAGE2_PATIENCE"
+                ]
+            )
         ):
 
             print(
@@ -2881,14 +3610,12 @@ def main():
 
             break
 
-    # ========================================================
+    # --------------------------------------------------------
     # 加载最佳 Stage 2
-    # ========================================================
-    abnormal_checkpoint = (
-        torch.load(
-            best_abnormal_path,
-            map_location=device,
-        )
+    # --------------------------------------------------------
+    abnormal_checkpoint = torch.load(
+        best_abnormal_path,
+        map_location=device,
     )
 
     abnormal_backbone.load_state_dict(
@@ -2911,9 +3638,9 @@ def main():
         f"{abnormal_checkpoint['epoch']}"
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 最终测试
-    # ========================================================
+    # --------------------------------------------------------
     final_metrics = (
         evaluate_cascade(
             test_loader,
@@ -2938,11 +3665,7 @@ def main():
 
     print(
         "Best binary checkpoint:",
-        (
-            previous_binary_path
-            if reuse_stage1
-            else best_binary_path
-        ),
+        best_binary_path,
     )
 
     print(
