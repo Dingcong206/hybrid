@@ -39,9 +39,9 @@ CONFIG = {
     # 训练参数
     # 第一次运行先设为 1，确认没有报错后再改成 30 或 50
     # --------------------------------------------------------
-    "EPOCHS": 1,
-    "BATCH_SIZE": 2,
-    "ACCUM_STEPS": 8,
+    "EPOCHS": 50,
+    "BATCH_SIZE": 4,
+    "ACCUM_STEPS": 4,
 
     "LR": 1e-5,
     "WEIGHT_DECAY": 1e-2,
@@ -103,7 +103,7 @@ CONFIG = {
     "TWO_CLS_EVAL": False,
 
     # 是否使用类别加权交叉熵
-    "WEIGHTED_LOSS": False,
+    "WEIGHTED_LOSS": True,
 
     # 若真实 Mamba 没有成功导入，是否直接停止
     "REQUIRE_MAMBA": True,
