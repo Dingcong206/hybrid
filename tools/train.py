@@ -8,6 +8,7 @@ import time
 
 from copy import deepcopy
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,9 @@ from torch.utils.data import (
 # ============================================================
 CONFIG = {
     # 数据目录
+    # 包含：
+    #   train_index.csv
+    #   test_index.csv
     "ROOT": (
         "/data/dingcong/hybrid/"
         "icbhi_official_ast_patch_tokens"
@@ -54,15 +58,18 @@ CONFIG = {
     "AMP": True,
     "REQUIRE_MAMBA": True,
 
-    "PATIENCE": 12,
+    # 只根据 Score 早停
+    "PATIENCE": 15,
 
-    # 保存目录
+    # 新目录，避免覆盖以前结果
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_serial_256_attnmax_sampler"
+        "checkpoints_serial_256_score_only"
     ),
 
+    # ========================================================
     # 模型参数
+    # ========================================================
     "INPUT_DIM": 768,
     "D_MODEL": 256,
 
@@ -77,27 +84,41 @@ CONFIG = {
     "DROPOUT": 0.15,
     "CLASSIFIER_DROPOUT": 0.20,
 
-    # 使用温和过采样
+    # ========================================================
+    # 类别不平衡
+    #
+    # 使用温和过采样：
+    # sample weight = 1 / class_count^0.5
+    #
+    # 不再同时使用类别加权损失
+    # ========================================================
     "USE_WEIGHTED_SAMPLER": True,
     "SAMPLER_POWER": 0.5,
 
-    # 使用采样器后不再使用类别加权 CE
     "LABEL_SMOOTHING": 0.0,
 
-    # 第一轮先关闭增强
+    # ========================================================
+    # 数据增强
+    #
+    # 第一轮先关闭
+    # ========================================================
     "SPEC_AUG": False,
 
     "MAX_MASK_T": 4,
     "MAX_MASK_F": 1,
     "NUM_MASKS": 1,
 
-    # False：严格四分类
-    # True：Normal / Abnormal 二分类式统计
+    # ========================================================
+    # 评价方式
+    #
+    # False：
+    # 严格四分类。
+    # 预测的具体类别必须正确，才计入 SE。
+    #
+    # True：
+    # Normal / Abnormal 二分类式统计。
+    # ========================================================
     "TWO_CLS_EVAL": False,
-
-    # 最佳模型组合指标
-    "SELECTION_SCORE_WEIGHT": 0.5,
-    "SELECTION_F1_WEIGHT": 0.5,
 }
 
 
@@ -124,8 +145,9 @@ from mymodels.model import (
 # 随机种子
 # ============================================================
 def set_seed(
-    seed,
-):
+    seed: int,
+) -> None:
+
     random.seed(seed)
     np.random.seed(seed)
 
@@ -140,16 +162,16 @@ def set_seed(
 # Patch 级 SpecAugment
 # ============================================================
 def apply_patch_augment(
-    x,
-    freq_patches,
-    time_patches,
-    max_mask_t,
-    max_mask_f,
-    num_masks,
-):
+    x: torch.Tensor,
+    freq_patches: int,
+    time_patches: int,
+    max_mask_t: int,
+    max_mask_f: int,
+    num_masks: int,
+) -> torch.Tensor:
+
     expected_tokens = (
-        freq_patches
-        * time_patches
+        freq_patches * time_patches
     )
 
     if (
@@ -164,17 +186,18 @@ def apply_patch_augment(
 
     feature_dim = x.shape[1]
 
+    # [948, 768]
+    #       ↓
+    # [12, 79, 768]
     x_aug = x.reshape(
         freq_patches,
         time_patches,
         feature_dim,
     ).clone()
 
-    for _ in range(
-        num_masks
-    ):
+    for _ in range(num_masks):
 
-        # 时间遮挡
+        # 时间 Patch 遮挡
         t_width = random.randint(
             0,
             min(
@@ -195,7 +218,7 @@ def apply_patch_augment(
                 :
             ] = 0
 
-        # 频率遮挡
+        # 频率 Patch 遮挡
         f_width = random.randint(
             0,
             min(
@@ -231,16 +254,16 @@ class TokenNPY4ClsDataset(
 
     def __init__(
         self,
-        csv_path,
-        is_train,
-        specaug,
-        freq_patches,
-        time_patches,
-        input_dim,
-        max_mask_t,
-        max_mask_f,
-        num_masks,
-    ):
+        csv_path: str,
+        is_train: bool,
+        specaug: bool,
+        freq_patches: int,
+        time_patches: int,
+        input_dim: int,
+        max_mask_t: int,
+        max_mask_f: int,
+        num_masks: int,
+    ) -> None:
         super().__init__()
 
         self.csv_path = Path(
@@ -318,7 +341,7 @@ class TokenNPY4ClsDataset(
 
         if len(invalid_labels) > 0:
             raise ValueError(
-                "标签必须是 0、1、2、3；"
+                "标签必须为 0、1、2、3；"
                 f"发现无效标签："
                 f"{invalid_labels.tolist()}。"
             )
@@ -349,15 +372,16 @@ class TokenNPY4ClsDataset(
 
     def __len__(
         self,
-    ):
+    ) -> int:
         return len(
             self.df
         )
 
     def _resolve_path(
         self,
-        raw_path,
-    ):
+        raw_path: str,
+    ) -> Path:
+
         token_path = Path(
             raw_path
         )
@@ -380,8 +404,12 @@ class TokenNPY4ClsDataset(
 
     def __getitem__(
         self,
-        index,
-    ):
+        index: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+
         row = self.df.iloc[
             index
         ]
@@ -462,8 +490,17 @@ class TokenNPY4ClsDataset(
 # 固定形状 Collate
 # ============================================================
 def collate_fixed(
-    batch,
-):
+    batch: List[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+]:
+
     xs, ys = zip(
         *batch
     )
@@ -488,12 +525,13 @@ def collate_fixed(
 # 温和 WeightedRandomSampler
 # ============================================================
 def build_weighted_sampler(
-    labels,
-    class_counts,
-    power,
-):
+    labels: np.ndarray,
+    class_counts: np.ndarray,
+    power: float,
+) -> WeightedRandomSampler:
+
     # 类别采样权重：
-    # 1 / count^0.5
+    # 1 / count^power
     class_sample_weights = (
         1.0
         / np.power(
@@ -548,14 +586,22 @@ def build_weighted_sampler(
 
 
 # ============================================================
-# ICBHI Score
+# Score
+#
+# Score = (SP + SE) / 2
 # ============================================================
-def get_icbhi_score(
-    hits,
-    counts,
-):
+def get_score_from_hits_counts(
+    hits: List[float],
+    counts: List[float],
+) -> Tuple[
+    float,
+    float,
+    float,
+]:
+
     eps = 1e-10
 
+    # Specificity：Normal 类正确率
     sp = (
         100.0
         * hits[0]
@@ -565,6 +611,7 @@ def get_icbhi_score(
         )
     )
 
+    # Sensitivity：三个异常类别的整体正确率
     abnormal_hits = (
         hits[1]
         + hits[2]
@@ -602,12 +649,13 @@ def get_icbhi_score(
 # ============================================================
 @torch.no_grad()
 def evaluate(
-    loader,
-    backbone,
-    classifier,
-    device,
-    two_cls_eval,
-):
+    loader: DataLoader,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    device: torch.device,
+    two_cls_eval: bool,
+) -> Dict[str, object]:
+
     backbone.eval()
     classifier.eval()
 
@@ -695,6 +743,7 @@ def evaluate(
             counts[gt] += 1.0
 
             if two_cls_eval:
+
                 if (
                     gt == 0
                     and pr == 0
@@ -711,7 +760,7 @@ def evaluate(
                 hits[gt] += 1.0
 
     sp, se, score = (
-        get_icbhi_score(
+        get_score_from_hits_counts(
             hits,
             counts,
         )
@@ -810,7 +859,7 @@ def evaluate(
 # AMP GradScaler
 # ============================================================
 def create_grad_scaler(
-    use_amp,
+    use_amp: bool,
 ):
     try:
         return torch.amp.GradScaler(
@@ -831,21 +880,25 @@ def create_grad_scaler(
 # 训练一个 Epoch
 # ============================================================
 def train_one_epoch(
-    loader,
-    backbone,
-    classifier,
-    optimizer,
-    device,
-    use_amp,
+    loader: DataLoader,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    use_amp: bool,
     scaler,
-    accum_steps,
-    label_smoothing,
-):
+    accum_steps: int,
+    label_smoothing: float,
+) -> Tuple[
+    float,
+    int,
+]:
+
     backbone.train()
     classifier.train()
 
     # 使用 WeightedRandomSampler 后，
-    # 不再额外加入类别权重
+    # 不再叠加类别权重。
     criterion = nn.CrossEntropyLoss(
         label_smoothing=(
             label_smoothing
@@ -978,16 +1031,17 @@ def train_one_epoch(
 
 
 # ============================================================
-# 形状检查
+# 模型形状检查
 # ============================================================
 @torch.no_grad()
 def run_shape_test(
-    loader,
-    backbone,
-    classifier,
-    device,
-    expected_dim,
-):
+    loader: DataLoader,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    device: torch.device,
+    expected_dim: int,
+) -> None:
+
     backbone.eval()
     classifier.eval()
 
@@ -1055,33 +1109,43 @@ def run_shape_test(
 
 
 # ============================================================
-# 保存 Checkpoint
+# 将 numpy 转换成可以保存的类型
 # ============================================================
-def save_checkpoint(
-    path,
-    epoch,
-    backbone,
-    classifier,
-    optimizer,
-    scheduler,
-    metrics,
-    mix_metric,
-    config,
-):
-    stored_metrics = {}
+def serializable_metrics(
+    metrics: Dict[str, object],
+) -> Dict[str, object]:
+
+    result = {}
 
     for key, value in metrics.items():
+
         if isinstance(
             value,
             np.ndarray,
         ):
-            stored_metrics[key] = (
+            result[key] = (
                 value.tolist()
             )
+
         else:
-            stored_metrics[key] = (
-                value
-            )
+            result[key] = value
+
+    return result
+
+
+# ============================================================
+# 保存 Checkpoint
+# ============================================================
+def save_checkpoint(
+    path: str,
+    epoch: int,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    metrics: Dict[str, object],
+    config: Dict[str, object],
+) -> None:
 
     torch.save(
         {
@@ -1104,11 +1168,13 @@ def save_checkpoint(
             ),
 
             "metrics": (
-                stored_metrics
+                serializable_metrics(
+                    metrics
+                )
             ),
 
-            "mix_metric": (
-                mix_metric
+            "score": float(
+                metrics["ICBHI"]
             ),
 
             "config": deepcopy(
@@ -1120,17 +1186,17 @@ def save_checkpoint(
 
 
 # ============================================================
-# 加载并评价 Checkpoint
+# 加载并评价最佳 Score 模型
 # ============================================================
 def report_checkpoint(
-    path,
-    name,
-    backbone,
-    classifier,
-    loader,
-    device,
-    two_cls_eval,
-):
+    path: str,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    two_cls_eval: bool,
+) -> None:
+
     checkpoint = torch.load(
         path,
         map_location=device,
@@ -1158,7 +1224,7 @@ def report_checkpoint(
 
     print()
     print(
-        f"[{name}]"
+        "[BEST SCORE CHECKPOINT]"
     )
 
     print(
@@ -1220,14 +1286,19 @@ def report_checkpoint(
 # ============================================================
 # 主函数
 # ============================================================
-def main():
+def main() -> None:
 
     cfg = CONFIG
 
     set_seed(
-        cfg["SEED"]
+        int(
+            cfg["SEED"]
+        )
     )
 
+    # ========================================================
+    # Device
+    # ========================================================
     device = torch.device(
         "cuda"
         if (
@@ -1261,6 +1332,9 @@ def main():
             ),
         )
 
+    # ========================================================
+    # 检查 Mamba
+    # ========================================================
     print(
         f"[INFO] HAS_MAMBA = "
         f"{HAS_MAMBA}"
@@ -1287,43 +1361,19 @@ def main():
         / "train_index.csv"
     )
 
-    val_csv = (
-        root
-        / "val_index.csv"
-    )
-
     test_csv = (
         root
         / "test_index.csv"
     )
 
-    if not train_csv.exists():
+    if (
+        not train_csv.exists()
+        or not test_csv.exists()
+    ):
         raise FileNotFoundError(
-            train_csv
-        )
-
-    # 优先使用独立验证集
-    if val_csv.exists():
-
-        eval_csv = val_csv
-
-        print(
-            "[INFO] 使用验证集：",
-            eval_csv,
-        )
-
-    else:
-
-        if not test_csv.exists():
-            raise FileNotFoundError(
-                test_csv
-            )
-
-        eval_csv = test_csv
-
-        print(
-            "[WARNING] 未找到 val_index.csv，"
-            "当前每轮使用 test_index.csv 评价。"
+            f"找不到数据索引文件：\n"
+            f"{train_csv}\n"
+            f"{test_csv}"
         )
 
     # ========================================================
@@ -1339,16 +1389,6 @@ def main():
         "best_score.pth",
     )
 
-    best_f1_path = os.path.join(
-        cfg["SAVE_DIR"],
-        "best_f1.pth",
-    )
-
-    best_mix_path = os.path.join(
-        cfg["SAVE_DIR"],
-        "best_mix.pth",
-    )
-
     last_path = os.path.join(
         cfg["SAVE_DIR"],
         "last.pth",
@@ -1358,27 +1398,27 @@ def main():
     # Dataset
     # ========================================================
     dataset_args = {
-        "freq_patches": (
+        "freq_patches": int(
             cfg["FREQ_PATCHES"]
         ),
 
-        "time_patches": (
+        "time_patches": int(
             cfg["TIME_PATCHES"]
         ),
 
-        "input_dim": (
+        "input_dim": int(
             cfg["INPUT_DIM"]
         ),
 
-        "max_mask_t": (
+        "max_mask_t": int(
             cfg["MAX_MASK_T"]
         ),
 
-        "max_mask_f": (
+        "max_mask_f": int(
             cfg["MAX_MASK_F"]
         ),
 
-        "num_masks": (
+        "num_masks": int(
             cfg["NUM_MASKS"]
         ),
     }
@@ -1391,7 +1431,7 @@ def main():
 
             is_train=True,
 
-            specaug=(
+            specaug=bool(
                 cfg["SPEC_AUG"]
             ),
 
@@ -1399,10 +1439,10 @@ def main():
         )
     )
 
-    eval_dataset = (
+    test_dataset = (
         TokenNPY4ClsDataset(
             csv_path=str(
-                eval_csv
+                test_csv
             ),
 
             is_train=False,
@@ -1434,7 +1474,7 @@ def main():
                     .class_counts_4
                 ),
 
-                power=(
+                power=float(
                     cfg[
                         "SAMPLER_POWER"
                     ]
@@ -1448,11 +1488,11 @@ def main():
     # DataLoader
     # ========================================================
     loader_args = {
-        "batch_size": (
+        "batch_size": int(
             cfg["BATCH_SIZE"]
         ),
 
-        "num_workers": (
+        "num_workers": int(
             cfg["NUM_WORKERS"]
         ),
 
@@ -1467,7 +1507,10 @@ def main():
         "drop_last": False,
 
         "persistent_workers": (
-            cfg["NUM_WORKERS"] > 0
+            int(
+                cfg["NUM_WORKERS"]
+            )
+            > 0
         ),
     }
 
@@ -1478,8 +1521,8 @@ def main():
         **loader_args,
     )
 
-    eval_loader = DataLoader(
-        eval_dataset,
+    test_loader = DataLoader(
+        test_dataset,
         shuffle=False,
         **loader_args,
     )
@@ -1488,35 +1531,35 @@ def main():
     # Backbone
     # ========================================================
     backbone = TimeFrequencyEncoder(
-        input_dim=(
+        input_dim=int(
             cfg["INPUT_DIM"]
         ),
 
-        d_model=(
+        d_model=int(
             cfg["D_MODEL"]
         ),
 
-        freq_patches=(
+        freq_patches=int(
             cfg["FREQ_PATCHES"]
         ),
 
-        time_patches=(
+        time_patches=int(
             cfg["TIME_PATCHES"]
         ),
 
-        time_depth=(
+        time_depth=int(
             cfg["TIME_DEPTH"]
         ),
 
-        freq_depth=(
+        freq_depth=int(
             cfg["FREQ_DEPTH"]
         ),
 
-        num_heads=(
+        num_heads=int(
             cfg["NHEAD"]
         ),
 
-        dropout=(
+        dropout=float(
             cfg["DROPOUT"]
         ),
     ).to(device)
@@ -1526,13 +1569,17 @@ def main():
     # ========================================================
     classifier = nn.Sequential(
         nn.Dropout(
-            cfg[
-                "CLASSIFIER_DROPOUT"
-            ]
+            float(
+                cfg[
+                    "CLASSIFIER_DROPOUT"
+                ]
+            )
         ),
 
         nn.Linear(
-            cfg["D_MODEL"],
+            int(
+                cfg["D_MODEL"]
+            ),
             4,
         ),
     ).to(device)
@@ -1560,7 +1607,7 @@ def main():
         backbone=backbone,
         classifier=classifier,
         device=device,
-        expected_dim=(
+        expected_dim=int(
             cfg["D_MODEL"]
         ),
     )
@@ -1591,9 +1638,11 @@ def main():
     optimizer = torch.optim.AdamW(
         parameters,
 
-        lr=cfg["LR"],
+        lr=float(
+            cfg["LR"]
+        ),
 
-        weight_decay=(
+        weight_decay=float(
             cfg["WEIGHT_DECAY"]
         ),
 
@@ -1609,7 +1658,7 @@ def main():
         .CosineAnnealingLR(
             optimizer,
 
-            T_max=(
+            T_max=int(
                 cfg["EPOCHS"]
             ),
 
@@ -1620,7 +1669,7 @@ def main():
     # ========================================================
     # AMP
     # ========================================================
-    use_amp = (
+    use_amp = bool(
         cfg["AMP"]
         and device.type == "cuda"
     )
@@ -1635,15 +1684,10 @@ def main():
     )
 
     # ========================================================
-    # 最佳结果
+    # 只记录最佳 Score
     # ========================================================
     best_score = -1.0
-    best_f1 = -1.0
-    best_mix = -1.0
-
     best_score_epoch = -1
-    best_f1_epoch = -1
-    best_mix_epoch = -1
 
     bad_epochs = 0
 
@@ -1654,7 +1698,8 @@ def main():
 
     print(
         "Start training: "
-        "Serial 256D Time-Mamba "
+        "Score-only Serial 256D "
+        "Time-Mamba "
         "-> Frequency-Attention"
     )
 
@@ -1668,7 +1713,9 @@ def main():
     # ========================================================
     for epoch in range(
         1,
-        cfg["EPOCHS"] + 1,
+        int(
+            cfg["EPOCHS"]
+        ) + 1,
     ):
 
         start_time = time.time()
@@ -1682,12 +1729,12 @@ def main():
                 device=device,
                 use_amp=use_amp,
                 scaler=scaler,
-                accum_steps=(
+                accum_steps=int(
                     cfg[
                         "ACCUM_STEPS"
                     ]
                 ),
-                label_smoothing=(
+                label_smoothing=float(
                     cfg[
                         "LABEL_SMOOTHING"
                     ]
@@ -1696,12 +1743,14 @@ def main():
         )
 
         metrics = evaluate(
-            loader=eval_loader,
+            loader=test_loader,
             backbone=backbone,
             classifier=classifier,
             device=device,
-            two_cls_eval=(
-                cfg["TWO_CLS_EVAL"]
+            two_cls_eval=bool(
+                cfg[
+                    "TWO_CLS_EVAL"
+                ]
             ),
         )
 
@@ -1710,6 +1759,7 @@ def main():
             .param_groups[0]["lr"]
         )
 
+        # 每个 Epoch 更新一次 Scheduler
         if optimizer_steps > 0:
             scheduler.step()
 
@@ -1717,33 +1767,21 @@ def main():
             metrics["ICBHI"]
         )
 
-        macro_f1 = float(
-            metrics["F1"]
-        )
-
-        mix_metric = (
-            cfg[
-                "SELECTION_SCORE_WEIGHT"
-            ]
-            * (
-                score / 100.0
-            )
-            +
-            cfg[
-                "SELECTION_F1_WEIGHT"
-            ]
-            * macro_f1
-        )
-
-        markers = []
-
-        # Best ICBHI Score
-        if (
+        # ====================================================
+        # 只根据 Score 判断最佳模型
+        # ====================================================
+        score_improved = (
             score
             > best_score + 1e-9
-        ):
+        )
+
+        if score_improved:
+
             best_score = score
             best_score_epoch = epoch
+
+            bad_epochs = 0
+            marker = "BEST-SCORE"
 
             save_checkpoint(
                 path=best_score_path,
@@ -1753,68 +1791,15 @@ def main():
                 optimizer=optimizer,
                 scheduler=scheduler,
                 metrics=metrics,
-                mix_metric=mix_metric,
                 config=cfg,
-            )
-
-            markers.append(
-                "BEST-SCORE"
-            )
-
-        # Best Macro-F1
-        if (
-            macro_f1
-            > best_f1 + 1e-9
-        ):
-            best_f1 = macro_f1
-            best_f1_epoch = epoch
-
-            save_checkpoint(
-                path=best_f1_path,
-                epoch=epoch,
-                backbone=backbone,
-                classifier=classifier,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                metrics=metrics,
-                mix_metric=mix_metric,
-                config=cfg,
-            )
-
-            markers.append(
-                "BEST-F1"
-            )
-
-        # Best Mixed Metric
-        if (
-            mix_metric
-            > best_mix + 1e-9
-        ):
-            best_mix = mix_metric
-            best_mix_epoch = epoch
-
-            bad_epochs = 0
-
-            save_checkpoint(
-                path=best_mix_path,
-                epoch=epoch,
-                backbone=backbone,
-                classifier=classifier,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                metrics=metrics,
-                mix_metric=mix_metric,
-                config=cfg,
-            )
-
-            markers.append(
-                "BEST-MIX"
             )
 
         else:
-            bad_epochs += 1
 
-        # Last checkpoint
+            bad_epochs += 1
+            marker = "-"
+
+        # 保存最后一轮
         save_checkpoint(
             path=last_path,
             epoch=epoch,
@@ -1823,7 +1808,6 @@ def main():
             optimizer=optimizer,
             scheduler=scheduler,
             metrics=metrics,
-            mix_metric=mix_metric,
             config=cfg,
         )
 
@@ -1840,19 +1824,13 @@ def main():
             ].tolist()
         )
 
-        marker_text = (
-            ",".join(markers)
-            if markers
-            else "-"
-        )
-
         elapsed_time = (
             time.time()
             - start_time
         )
 
         print(
-            f"[{marker_text}] "
+            f"[{marker}] "
             f"Epoch {epoch:03d}/"
             f"{cfg['EPOCHS']} | "
 
@@ -1875,10 +1853,7 @@ def main():
             f"{metrics['ACC']:.4f} | "
 
             f"F1 "
-            f"{macro_f1:.4f} | "
-
-            f"Mix "
-            f"{mix_metric:.4f} | "
+            f"{metrics['F1']:.4f} | "
 
             f"LR "
             f"{current_lr:.8f} | "
@@ -1893,16 +1868,29 @@ def main():
             f"{predicted_counts}"
         )
 
-        # Early stopping 根据组合指标
+        # ====================================================
+        # Early Stopping 只根据 Score
+        # ====================================================
         if (
             bad_epochs
-            >= cfg["PATIENCE"]
+            >= int(
+                cfg["PATIENCE"]
+            )
         ):
+
             print(
                 "[EARLY STOP] "
-                f"Mix 连续 "
+                f"Score 连续 "
                 f"{cfg['PATIENCE']} "
                 "个 Epoch 没有提升。"
+            )
+
+            print(
+                f"[EARLY STOP] "
+                f"Best Score = "
+                f"{best_score:.4f}, "
+                f"Epoch = "
+                f"{best_score_epoch}"
             )
 
             break
@@ -1923,17 +1911,8 @@ def main():
     )
 
     print(
-        f"Best Macro-F1: "
-        f"{best_f1:.4f} "
-        f"at Epoch "
-        f"{best_f1_epoch}"
-    )
-
-    print(
-        f"Best Mix: "
-        f"{best_mix:.4f} "
-        f"at Epoch "
-        f"{best_mix_epoch}"
+        f"Best checkpoint: "
+        f"{best_score_path}"
     )
 
     print(
@@ -1941,40 +1920,15 @@ def main():
     )
 
     # ========================================================
-    # 分别评价三个最佳模型
+    # 最后只加载最佳 Score 模型
     # ========================================================
     report_checkpoint(
-        path=best_mix_path,
-        name="BEST MIX",
-        backbone=backbone,
-        classifier=classifier,
-        loader=eval_loader,
-        device=device,
-        two_cls_eval=(
-            cfg["TWO_CLS_EVAL"]
-        ),
-    )
-
-    report_checkpoint(
         path=best_score_path,
-        name="BEST SCORE",
         backbone=backbone,
         classifier=classifier,
-        loader=eval_loader,
+        loader=test_loader,
         device=device,
-        two_cls_eval=(
-            cfg["TWO_CLS_EVAL"]
-        ),
-    )
-
-    report_checkpoint(
-        path=best_f1_path,
-        name="BEST F1",
-        backbone=backbone,
-        classifier=classifier,
-        loader=eval_loader,
-        device=device,
-        two_cls_eval=(
+        two_cls_eval=bool(
             cfg["TWO_CLS_EVAL"]
         ),
     )

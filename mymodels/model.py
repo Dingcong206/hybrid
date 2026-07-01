@@ -17,7 +17,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int | None = None,
         dropout: float = 0.15,
-    ):
+    ) -> None:
         super().__init__()
 
         hidden_dim = hidden_dim or dim * 2
@@ -36,10 +36,10 @@ class FeedForward(nn.Module):
 
 class TimeMambaBlock(nn.Module):
     """
+    对每一个频率 Patch，沿时间轴进行 Mamba 建模。
+
     输入和输出：
         [B * Fp, Tp, D]
-
-    对每一个频率 Patch，沿时间轴进行 Mamba 建模。
     """
 
     def __init__(
@@ -49,7 +49,7 @@ class TimeMambaBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         dropout: float = 0.15,
-    ):
+    ) -> None:
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
@@ -64,7 +64,7 @@ class TimeMambaBlock(nn.Module):
             self.use_mamba = True
 
         else:
-            # 仅用于没有安装 Mamba 时进行形状测试。
+            # 仅用于没有安装 mamba_ssm 时进行形状检查。
             # 正式训练时 train.py 会阻止使用该分支。
             self.sequence_model = nn.GRU(
                 input_size=dim,
@@ -85,27 +85,17 @@ class TimeMambaBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Mamba + Residual
         residual = x
         x_norm = self.norm1(x)
 
         if self.use_mamba:
-            x_out = self.sequence_model(
-                x_norm
-            )
+            x_out = self.sequence_model(x_norm)
         else:
-            x_out, _ = self.sequence_model(
-                x_norm
-            )
+            x_out, _ = self.sequence_model(x_norm)
 
-        x = residual + self.dropout(
-            x_out
-        )
+        x = residual + self.dropout(x_out)
 
         # FFN + Residual
         x = x + self.ffn(
@@ -117,10 +107,10 @@ class TimeMambaBlock(nn.Module):
 
 class FrequencyAttentionBlock(nn.Module):
     """
+    对每一个时间 Patch，沿频率轴进行多头注意力建模。
+
     输入和输出：
         [B * Tp, Fp, D]
-
-    对每一个时间 Patch，沿频率轴进行多头注意力建模。
     """
 
     def __init__(
@@ -128,7 +118,7 @@ class FrequencyAttentionBlock(nn.Module):
         dim: int,
         num_heads: int = 8,
         dropout: float = 0.15,
-    ):
+    ) -> None:
         super().__init__()
 
         if dim % num_heads != 0:
@@ -137,9 +127,7 @@ class FrequencyAttentionBlock(nn.Module):
                 f"num_heads={num_heads} 整除。"
             )
 
-        self.norm1 = nn.LayerNorm(
-            dim
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
@@ -148,13 +136,9 @@ class FrequencyAttentionBlock(nn.Module):
             batch_first=True,
         )
 
-        self.dropout = nn.Dropout(
-            dropout
-        )
+        self.dropout = nn.Dropout(dropout)
 
-        self.norm2 = nn.LayerNorm(
-            dim
-        )
+        self.norm2 = nn.LayerNorm(dim)
 
         self.ffn = FeedForward(
             dim=dim,
@@ -162,19 +146,15 @@ class FrequencyAttentionBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Frequency Attention + Residual
         residual = x
         x_norm = self.norm1(x)
 
         attn_out, _ = self.attn(
-            x_norm,
-            x_norm,
-            x_norm,
+            query=x_norm,
+            key=x_norm,
+            value=x_norm,
             need_weights=False,
         )
 
@@ -192,7 +172,7 @@ class FrequencyAttentionBlock(nn.Module):
 
 class TimeFrequencyEncoder(nn.Module):
     """
-    串联式时频模型：
+    串联式时频编码器：
 
         AST Tokens
         [B, 948, 768]
@@ -229,46 +209,33 @@ class TimeFrequencyEncoder(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-    ):
+    ) -> None:
         super().__init__()
 
         self.input_dim = input_dim
         self.d_model = d_model
 
-        self.freq_patches = (
-            freq_patches
-        )
-
-        self.time_patches = (
-            time_patches
-        )
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
 
         self.num_tokens = (
-            freq_patches
-            * time_patches
+            freq_patches * time_patches
         )
 
-        # 外部分类器使用
-        self.final_feat_dim = (
-            d_model
-        )
+        # 外部分类器读取该属性
+        self.final_feat_dim = d_model
 
         # ====================================================
-        # 输入投影：768 -> 256
+        # 输入投影：768 → 256
         # ====================================================
         self.input_proj = nn.Sequential(
             nn.LayerNorm(input_dim),
-
             nn.Linear(
                 input_dim,
                 d_model,
             ),
-
             nn.GELU(),
-
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
         )
 
         # ====================================================
@@ -307,9 +274,7 @@ class TimeFrequencyEncoder(nn.Module):
                 expand=expand,
                 dropout=dropout,
             )
-            for _ in range(
-                time_depth
-            )
+            for _ in range(time_depth)
         ])
 
         # ====================================================
@@ -321,9 +286,7 @@ class TimeFrequencyEncoder(nn.Module):
                 num_heads=num_heads,
                 dropout=dropout,
             )
-            for _ in range(
-                freq_depth
-            )
+            for _ in range(freq_depth)
         ])
 
         # ====================================================
@@ -335,9 +298,7 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         self.pool_score = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
+            nn.LayerNorm(d_model),
 
             nn.Linear(
                 d_model,
@@ -391,7 +352,7 @@ class TimeFrequencyEncoder(nn.Module):
 
         if x.ndim != 3:
             raise ValueError(
-                "输入必须为三维张量 [B, N, D]，"
+                "输入必须是三维张量 [B, N, D]，"
                 f"当前形状为 {tuple(x.shape)}。"
             )
 
@@ -451,13 +412,13 @@ class TimeFrequencyEncoder(nn.Module):
         # ====================================================
         # Time-Mamba
         #
-        # 每一个频率位置独立沿时间轴建模
+        # 固定频率位置，沿时间轴建模
         # ====================================================
         for block in self.time_blocks:
 
             # [B, Fp, Tp, D]
             #       ↓
-            # [B*Fp, Tp, D]
+            # [B × Fp, Tp, D]
             time_seq = x.reshape(
                 batch_size
                 * self.freq_patches,
@@ -471,7 +432,7 @@ class TimeFrequencyEncoder(nn.Module):
                 time_seq
             )
 
-            # [B*Fp, Tp, D]
+            # [B × Fp, Tp, D]
             #       ↓
             # [B, Fp, Tp, D]
             x = time_seq.reshape(
@@ -484,7 +445,7 @@ class TimeFrequencyEncoder(nn.Module):
         # ====================================================
         # Frequency-Attention
         #
-        # 使用 Time-Mamba 的输出进行频率建模
+        # 接收 Time-Mamba 的输出
         # ====================================================
         for block in self.freq_blocks:
 
@@ -500,7 +461,7 @@ class TimeFrequencyEncoder(nn.Module):
 
             # [B, Tp, Fp, D]
             #       ↓
-            # [B*Tp, Fp, D]
+            # [B × Tp, Fp, D]
             freq_seq = freq_seq.reshape(
                 batch_size
                 * self.time_patches,
@@ -514,7 +475,7 @@ class TimeFrequencyEncoder(nn.Module):
                 freq_seq
             )
 
-            # [B*Tp, Fp, D]
+            # [B × Tp, Fp, D]
             #       ↓
             # [B, Tp, Fp, D]
             freq_seq = freq_seq.reshape(
@@ -579,7 +540,7 @@ class TimeFrequencyEncoder(nn.Module):
             dim=-1,
         )
 
-        # [B, 512] -> [B, 256]
+        # [B, 512] → [B, 256]
         feature = self.pool_fusion(
             feature
         )
