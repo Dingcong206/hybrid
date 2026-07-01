@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
 import os
 import random
 import sys
@@ -12,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
@@ -23,23 +21,14 @@ from torch.utils.data import DataLoader, Dataset
 # 1. 配置
 # ============================================================
 CONFIG = {
-    # --------------------------------------------------------
     # 数据目录
     # 目录中需要包含：
     #   train_index.csv
     #   test_index.csv
-    #
-    # CSV 至少包含：
-    #   tokens_path
-    #   label
-    # --------------------------------------------------------
     "ROOT": "/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
 
-    # --------------------------------------------------------
     # 训练参数
-    # 第一次运行先设为 1，确认没有报错后再改成 30 或 50
-    # --------------------------------------------------------
-    "EPOCHS": 50,
+    "EPOCHS": 30,
     "BATCH_SIZE": 4,
     "ACCUM_STEPS": 4,
 
@@ -49,22 +38,16 @@ CONFIG = {
     "SEED": 42,
     "DEVICE": "cuda",
 
-    # 新目录，避免覆盖原来的并行模型
+    # 使用新目录，避免覆盖上一轮结果
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_serial_tmamba_fattention"
+        "checkpoints_serial_tmamba_fattention_v2"
     ),
 
-    "PATIENCE": 10,
+    "PATIENCE": 8,
 
-    # --------------------------------------------------------
     # 模型参数
-    #
-    # AST patch token:
-    #   [948, 768]
-    #
     # 948 = 12 × 79
-    # --------------------------------------------------------
     "TOKEN_DIM": 768,
     "FREQ_PATCHES": 12,
     "TIME_PATCHES": 79,
@@ -72,46 +55,39 @@ CONFIG = {
     "TIME_DEPTH": 2,
     "FREQ_DEPTH": 2,
     "NHEAD": 8,
-    "DROPOUT": 0.1,
 
-    # --------------------------------------------------------
+    # 模型内部 Dropout
+    "DROPOUT": 0.2,
+
+    # 分类头 Dropout
+    "CLASSIFIER_DROPOUT": 0.2,
+
     # 数据增强
-    #
-    # 当前先关闭，保证与原模型进行公平比较
-    # --------------------------------------------------------
+    # 这一轮继续关闭，避免同时改变过多变量
     "SPEC_AUG": False,
     "MAX_MASK_T": 8,
     "MAX_MASK_F": 2,
     "NUM_MASKS": 2,
 
-    # --------------------------------------------------------
-    # AMP 混合精度
-    # --------------------------------------------------------
-    "AMP": True,
-
-    # --------------------------------------------------------
-    # ICBHI 评价方式
-    #
-    # False:
-    #   严格四分类。
-    #   异常样本只有预测类别完全正确才计入 SE。
-    #
-    # True:
-    #   二分类式评价。
-    #   只要异常样本被预测为任意异常类别就计入 SE。
-    # --------------------------------------------------------
-    "TWO_CLS_EVAL": False,
-
-    # 是否使用类别加权交叉熵
+    # 损失函数
     "WEIGHTED_LOSS": True,
+    "LABEL_SMOOTHING": 0.05,
 
-    # 若真实 Mamba 没有成功导入，是否直接停止
+    # AMP
+    "AMP": True,
     "REQUIRE_MAMBA": True,
+
+    # False：
+    # 严格四分类评价，异常类别必须预测正确才计入 SE
+    #
+    # True：
+    # Normal / Abnormal 二分类式评价
+    "TWO_CLS_EVAL": False,
 }
 
 
 # ============================================================
-# 2. 导入项目中的模型
+# 2. 导入项目模型
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -122,7 +98,7 @@ from mymodels.model import HAS_MAMBA, TimeFrequencyEncoder
 
 
 # ============================================================
-# 3. 随机种子
+# 3. 设置随机种子
 # ============================================================
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -140,13 +116,13 @@ def set_seed(seed: int) -> None:
 # 4. Patch 级 SpecAugment
 #
 # 输入：
-#   x: [948, 768]
+#   [948, 768]
 #
 # 恢复为：
 #   [12, 79, 768]
 #
-# 频率遮挡作用于 12 个频率 patch
-# 时间遮挡作用于 79 个时间 patch
+# 时间遮挡作用于 79 个时间 Patch
+# 频率遮挡作用于 12 个频率 Patch
 # ============================================================
 def apply_patch_augment(
     x: torch.Tensor,
@@ -161,7 +137,7 @@ def apply_patch_augment(
 
     if x.ndim != 2:
         raise ValueError(
-            "SpecAugment 输入必须为 [N, D]，"
+            f"SpecAugment 输入必须是 [N, D]，"
             f"当前形状为 {tuple(x.shape)}"
         )
 
@@ -177,23 +153,21 @@ def apply_patch_augment(
     x_aug = x.reshape(
         freq_patches,
         time_patches,
-        feature_dim
+        feature_dim,
     ).clone()
 
     for _ in range(num_masks):
 
-        # ----------------------------------------------------
-        # 时间 patch 遮挡
-        # ----------------------------------------------------
+        # 时间 Patch 遮挡
         t_width = random.randint(
             0,
-            min(max_mask_t, time_patches)
+            min(max_mask_t, time_patches),
         )
 
         if t_width > 0:
             t_start = random.randint(
                 0,
-                time_patches - t_width
+                time_patches - t_width,
             )
 
             x_aug[
@@ -202,18 +176,16 @@ def apply_patch_augment(
                 :
             ] = 0
 
-        # ----------------------------------------------------
-        # 频率 patch 遮挡
-        # ----------------------------------------------------
+        # 频率 Patch 遮挡
         f_width = random.randint(
             0,
-            min(max_mask_f, freq_patches)
+            min(max_mask_f, freq_patches),
         )
 
         if f_width > 0:
             f_start = random.randint(
                 0,
-                freq_patches - f_width
+                freq_patches - f_width,
             )
 
             x_aug[
@@ -224,12 +196,12 @@ def apply_patch_augment(
 
     return x_aug.reshape(
         expected_tokens,
-        feature_dim
+        feature_dim,
     )
 
 
 # ============================================================
-# 5. 数据集
+# 5. Dataset
 # ============================================================
 class TokenNPY4ClsDataset(Dataset):
 
@@ -248,7 +220,9 @@ class TokenNPY4ClsDataset(Dataset):
         super().__init__()
 
         self.csv_path = csv_path
-        self.df = pd.read_csv(csv_path).reset_index(drop=True)
+        self.df = pd.read_csv(
+            csv_path
+        ).reset_index(drop=True)
 
         required_columns = {
             "tokens_path",
@@ -261,9 +235,10 @@ class TokenNPY4ClsDataset(Dataset):
 
         if missing_columns:
             raise ValueError(
-                f"[Dataset] {csv_path} 缺少列："
-                f"{sorted(missing_columns)}。"
-                f"当前列为：{self.df.columns.tolist()}"
+                f"{csv_path} 缺少列："
+                f"{sorted(missing_columns)}；"
+                f"当前列为："
+                f"{self.df.columns.tolist()}"
             )
 
         self.is_train = is_train
@@ -296,23 +271,26 @@ class TokenNPY4ClsDataset(Dataset):
 
         if len(invalid_labels) > 0:
             raise ValueError(
-                "发现无效标签。四分类标签必须为 0、1、2、3，"
-                f"当前无效标签为：{invalid_labels.tolist()}"
+                "四分类标签只能为 0、1、2、3；"
+                f"发现无效标签："
+                f"{invalid_labels.tolist()}"
             )
 
         self.class_counts_4 = np.bincount(
             self.labels,
-            minlength=4
+            minlength=4,
         )
 
         print(
             f"[Dataset] Loaded {len(self.df)} samples "
             f"from {csv_path}"
         )
+
         print(
             f"[Dataset] class counts: "
             f"{self.class_counts_4.tolist()}"
         )
+
         print(
             f"[Dataset] train={self.is_train}, "
             f"specaug={self.specaug}"
@@ -327,21 +305,19 @@ class TokenNPY4ClsDataset(Dataset):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         row = self.df.iloc[index]
-        token_path = str(row["tokens_path"])
+
+        token_path = str(
+            row["tokens_path"]
+        )
 
         if not os.path.exists(token_path):
             raise FileNotFoundError(
                 f"Token 文件不存在：{token_path}"
             )
 
-        tokens_np = np.load(token_path)
-
-        if tokens_np.ndim != 2:
-            raise ValueError(
-                f"Token 文件必须是二维数组 [N, D]："
-                f"{token_path}，"
-                f"当前形状为 {tokens_np.shape}"
-            )
+        tokens_np = np.load(
+            token_path
+        )
 
         expected_shape = (
             self.expected_tokens,
@@ -381,27 +357,29 @@ class TokenNPY4ClsDataset(Dataset):
 
 
 # ============================================================
-# 6. Collate
+# 6. 固定形状 Collate
 #
-# 所有样本形状固定为：
+# 所有输入固定为：
 #   [948, 768]
 #
-# 因此不再进行 padding，也不再生成 mask。
+# 不再进行 Padding，也不再生成 mask
 # ============================================================
 def collate_fixed(
-    batch: List[Tuple[torch.Tensor, torch.Tensor]],
+    batch: List[
+        Tuple[torch.Tensor, torch.Tensor]
+    ],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     xs, ys = zip(*batch)
 
     x_batch = torch.stack(
         xs,
-        dim=0
+        dim=0,
     )
 
     y_batch = torch.stack(
         ys,
-        dim=0
+        dim=0,
     ).view(-1)
 
     return x_batch, y_batch
@@ -419,25 +397,37 @@ def get_score_from_hits_counts(
 
     # Specificity：Normal 类正确率
     sp = 100.0 * (
-        hits[0] / (counts[0] + eps)
+        hits[0]
+        / (counts[0] + eps)
     )
 
-    # Sensitivity：三个异常类整体正确率
+    # Sensitivity：三个异常类别整体正确率
     abnormal_hits = float(
-        hits[1] + hits[2] + hits[3]
+        hits[1]
+        + hits[2]
+        + hits[3]
     )
 
     abnormal_counts = float(
-        counts[1] + counts[2] + counts[3]
+        counts[1]
+        + counts[2]
+        + counts[3]
     )
 
     se = 100.0 * (
-        abnormal_hits / (abnormal_counts + eps)
+        abnormal_hits
+        / (abnormal_counts + eps)
     )
 
-    score = (sp + se) / 2.0
+    score = (
+        sp + se
+    ) / 2.0
 
-    return float(sp), float(se), float(score)
+    return (
+        float(sp),
+        float(se),
+        float(score),
+    )
 
 
 # ============================================================
@@ -455,8 +445,19 @@ def evaluate_like_author(
     backbone.eval()
     classifier.eval()
 
-    hits = [0.0, 0.0, 0.0, 0.0]
-    counts = [0.0, 0.0, 0.0, 0.0]
+    hits = [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+
+    counts = [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
 
     all_true = []
     all_pred = []
@@ -472,42 +473,33 @@ def evaluate_like_author(
 
         x = x.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
         y = y.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
-        batch_size = y.size(0)
-
-        # ----------------------------------------------------
-        # 串联模型
-        #
-        # x:
-        #   [B, 948, 768]
-        #
-        # feat:
-        #   [B, 768]
-        #
-        # logits:
-        #   [B, 4]
-        # ----------------------------------------------------
-        feat = backbone(x)
-        logits = classifier(feat)
+        feature = backbone(x)
+        logits = classifier(feature)
 
         loss = criterion(
             logits,
-            y
+            y,
         )
 
-        loss_sum += float(loss.item())
-        sample_count += int(batch_size)
+        loss_sum += float(
+            loss.item()
+        )
+
+        sample_count += int(
+            y.size(0)
+        )
 
         pred = torch.argmax(
             logits,
-            dim=1
+            dim=1,
         )
 
         all_true.append(
@@ -518,29 +510,37 @@ def evaluate_like_author(
             pred.detach().cpu()
         )
 
-        for i in range(batch_size):
+        for index in range(
+            y.size(0)
+        ):
+            gt = int(
+                y[index].item()
+            )
 
-            gt = int(y[i].item())
-            pr = int(pred[i].item())
+            pr = int(
+                pred[index].item()
+            )
 
             counts[gt] += 1.0
 
             if not two_cls_eval:
-                # 严格四分类评价
+                # 严格四分类
                 if pr == gt:
                     hits[gt] += 1.0
 
             else:
-                # 二分类式评价
+                # Normal / Abnormal 式评价
                 if gt == 0 and pr == 0:
                     hits[gt] += 1.0
 
                 elif gt != 0 and pr > 0:
                     hits[gt] += 1.0
 
-    sp, se, score = get_score_from_hits_counts(
-        hits,
-        counts
+    sp, se, score = (
+        get_score_from_hits_counts(
+            hits,
+            counts,
+        )
     )
 
     y_true = torch.cat(
@@ -554,7 +554,7 @@ def evaluate_like_author(
     accuracy = (
         accuracy_score(
             y_true,
-            y_pred
+            y_pred,
         )
         * 100.0
     )
@@ -579,7 +579,8 @@ def evaluate_like_author(
         "ACC": float(accuracy),
         "F1": float(macro_f1),
         "LOSS": float(
-            loss_sum / max(1, sample_count)
+            loss_sum
+            / max(1, sample_count)
         ),
         "hits": hits,
         "counts": counts,
@@ -599,19 +600,23 @@ def train_one_epoch(
     use_amp: bool,
     scaler,
     accum_steps: int,
-    scheduler=None,
-    class_weights: Optional[torch.Tensor] = None,
-) -> float:
+    class_weights: Optional[
+        torch.Tensor
+    ] = None,
+    label_smoothing: float = 0.0,
+) -> Tuple[float, int]:
 
     backbone.train()
     classifier.train()
 
-    if class_weights is not None:
-        criterion = nn.CrossEntropyLoss(
-            weight=class_weights.to(device)
-        )
-    else:
-        criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(
+        weight=(
+            class_weights.to(device)
+            if class_weights is not None
+            else None
+        ),
+        label_smoothing=label_smoothing,
+    )
 
     optimizer.zero_grad(
         set_to_none=True
@@ -619,38 +624,42 @@ def train_one_epoch(
 
     running_loss = 0.0
     number_of_batches = len(loader)
+    optimizer_steps = 0
 
     parameters = (
         list(backbone.parameters())
         + list(classifier.parameters())
     )
 
-    for batch_index, (x, y) in enumerate(loader):
+    for batch_index, (x, y) in enumerate(
+        loader
+    ):
 
         x = x.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
         y = y.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
         with torch.autocast(
             device_type=device.type,
             enabled=use_amp,
         ):
-            feat = backbone(x)
-            logits = classifier(feat)
+            feature = backbone(x)
+            logits = classifier(feature)
 
             raw_loss = criterion(
                 logits,
-                y
+                y,
             )
 
             loss = (
-                raw_loss / accum_steps
+                raw_loss
+                / accum_steps
             )
 
         scaler.scale(
@@ -661,10 +670,16 @@ def train_one_epoch(
             raw_loss.detach().item()
         )
 
+        is_last_batch = (
+            batch_index + 1
+            == number_of_batches
+        )
+
         should_step = (
-            (batch_index + 1) % accum_steps == 0
-            or
-            (batch_index + 1) == number_of_batches
+            (batch_index + 1)
+            % accum_steps
+            == 0
+            or is_last_batch
         )
 
         if should_step:
@@ -678,27 +693,38 @@ def train_one_epoch(
                 max_norm=5.0,
             )
 
+            old_scale = scaler.get_scale()
+
             scaler.step(
                 optimizer
             )
 
             scaler.update()
 
+            new_scale = scaler.get_scale()
+
+            # 如果 scale 没有下降，
+            # 说明本次 optimizer.step() 没有因溢出被跳过
+            if new_scale >= old_scale:
+                optimizer_steps += 1
+
             optimizer.zero_grad(
                 set_to_none=True
             )
 
-            if scheduler is not None:
-                scheduler.step()
-
-    return (
+    mean_loss = (
         running_loss
         / max(1, number_of_batches)
     )
 
+    return (
+        mean_loss,
+        optimizer_steps,
+    )
+
 
 # ============================================================
-# 10. AMP Scaler
+# 10. AMP GradScaler
 # ============================================================
 def create_grad_scaler(
     use_amp: bool,
@@ -708,14 +734,18 @@ def create_grad_scaler(
             "cuda",
             enabled=use_amp,
         )
-    except (AttributeError, TypeError):
+
+    except (
+        AttributeError,
+        TypeError,
+    ):
         return torch.cuda.amp.GradScaler(
             enabled=use_amp
         )
 
 
 # ============================================================
-# 11. 模型形状测试
+# 11. 模型形状检查
 # ============================================================
 @torch.no_grad()
 def run_shape_test(
@@ -728,34 +758,36 @@ def run_shape_test(
     backbone.eval()
     classifier.eval()
 
-    x, y = next(
+    x, _ = next(
         iter(loader)
     )
 
-    # 形状测试只取一个样本，减少显存消耗
-    x = x[:1].to(device)
+    # 只使用一个样本，减少显存占用
+    x = x[:1].to(
+        device
+    )
 
     feature = backbone(x)
     logits = classifier(feature)
 
     print(
         "[SHAPE TEST] input:",
-        tuple(x.shape)
+        tuple(x.shape),
     )
 
     print(
         "[SHAPE TEST] feature:",
-        tuple(feature.shape)
+        tuple(feature.shape),
     )
 
     print(
         "[SHAPE TEST] logits:",
-        tuple(logits.shape)
+        tuple(logits.shape),
     )
 
     expected_feature_shape = (
         1,
-        CONFIG["TOKEN_DIM"],
+        int(CONFIG["TOKEN_DIM"]),
     )
 
     expected_logits_shape = (
@@ -765,16 +797,18 @@ def run_shape_test(
 
     if tuple(feature.shape) != expected_feature_shape:
         raise RuntimeError(
-            "Backbone 输出形状错误："
-            f"当前为 {tuple(feature.shape)}，"
-            f"要求为 {expected_feature_shape}"
+            f"Backbone 输出形状错误："
+            f"{tuple(feature.shape)}；"
+            f"要求："
+            f"{expected_feature_shape}"
         )
 
     if tuple(logits.shape) != expected_logits_shape:
         raise RuntimeError(
-            "Classifier 输出形状错误："
-            f"当前为 {tuple(logits.shape)}，"
-            f"要求为 {expected_logits_shape}"
+            f"Classifier 输出形状错误："
+            f"{tuple(logits.shape)}；"
+            f"要求："
+            f"{expected_logits_shape}"
         )
 
     print(
@@ -802,7 +836,9 @@ def main() -> None:
     )
 
     device = torch.device(
-        "cuda" if use_cuda else "cpu"
+        "cuda"
+        if use_cuda
+        else "cpu"
     )
 
     print(
@@ -812,26 +848,27 @@ def main() -> None:
     if device.type == "cuda":
         print(
             "[INFO] CUDA device count:",
-            torch.cuda.device_count()
+            torch.cuda.device_count(),
         )
 
         print(
             "[INFO] CUDA current device:",
-            torch.cuda.current_device()
+            torch.cuda.current_device(),
         )
 
         print(
             "[INFO] CUDA device name:",
             torch.cuda.get_device_name(
                 torch.cuda.current_device()
-            )
+            ),
         )
 
     # --------------------------------------------------------
     # 检查 Mamba
     # --------------------------------------------------------
     print(
-        f"[INFO] HAS_MAMBA = {HAS_MAMBA}"
+        f"[INFO] HAS_MAMBA = "
+        f"{HAS_MAMBA}"
     )
 
     if (
@@ -840,40 +877,41 @@ def main() -> None:
     ):
         raise RuntimeError(
             "mamba_ssm 没有成功导入。"
-            "当前 model.py 会退化为 GRU，"
-            "为防止误训练，程序已经停止。\n"
-            "请先运行：\n"
-            "python -c \"from mamba_ssm import Mamba; "
-            "print('Mamba import success')\""
+            "请先确认当前 Conda 环境和 "
+            "mamba_ssm 安装是否正确。"
         )
 
     # --------------------------------------------------------
-    # CSV 路径
+    # 数据文件
     # --------------------------------------------------------
     root = Path(
         cfg["ROOT"]
     )
 
     train_csv = (
-        root / "train_index.csv"
+        root
+        / "train_index.csv"
     )
 
     test_csv = (
-        root / "test_index.csv"
+        root
+        / "test_index.csv"
     )
 
     if not train_csv.exists():
         raise FileNotFoundError(
-            f"找不到训练 CSV：{train_csv}"
+            f"找不到训练 CSV："
+            f"{train_csv}"
         )
 
     if not test_csv.exists():
         raise FileNotFoundError(
-            f"找不到测试 CSV：{test_csv}"
+            f"找不到测试 CSV："
+            f"{test_csv}"
         )
 
     # --------------------------------------------------------
-    # 保存路径
+    # 保存目录
     # --------------------------------------------------------
     os.makedirs(
         cfg["SAVE_DIR"],
@@ -894,9 +932,13 @@ def main() -> None:
     # Dataset
     # --------------------------------------------------------
     train_dataset = TokenNPY4ClsDataset(
-        csv_path=str(train_csv),
+        csv_path=str(
+            train_csv
+        ),
         is_train=True,
-        specaug=bool(cfg["SPEC_AUG"]),
+        specaug=bool(
+            cfg["SPEC_AUG"]
+        ),
         freq_patches=int(
             cfg["FREQ_PATCHES"]
         ),
@@ -918,7 +960,9 @@ def main() -> None:
     )
 
     validation_dataset = TokenNPY4ClsDataset(
-        csv_path=str(test_csv),
+        csv_path=str(
+            test_csv
+        ),
         is_train=False,
         specaug=False,
         freq_patches=int(
@@ -999,19 +1043,28 @@ def main() -> None:
         ),
     ).to(device)
 
-    # Backbone 输出 [B, TOKEN_DIM]
-    classifier = nn.Linear(
-        int(cfg["TOKEN_DIM"]),
-        4,
+    # 分类器
+    classifier = nn.Sequential(
+        nn.Dropout(
+            float(
+                cfg["CLASSIFIER_DROPOUT"]
+            )
+        ),
+        nn.Linear(
+            int(cfg["TOKEN_DIM"]),
+            4,
+        ),
     ).to(device)
 
     print(
         "[MODEL] Serial structure:"
     )
+
     print(
         "[MODEL] Time-Mamba "
         "-> Frequency-Attention "
         "-> Mean Pooling "
+        "-> Dropout "
         "-> Linear Classifier"
     )
 
@@ -1023,7 +1076,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # 形状测试
+    # 形状检查
     # --------------------------------------------------------
     run_shape_test(
         loader=train_loader,
@@ -1034,6 +1087,11 @@ def main() -> None:
 
     # --------------------------------------------------------
     # 类别权重
+    #
+    # 使用平方根反频率权重：
+    #   1 / sqrt(class_count)
+    #
+    # 比直接使用 1 / class_count 更温和
     # --------------------------------------------------------
     class_weights = None
 
@@ -1045,15 +1103,20 @@ def main() -> None:
             .astype(np.float32)
         )
 
-        weights = 1.0 / np.maximum(
-            class_counts,
+        weights = (
             1.0
+            / np.sqrt(
+                np.maximum(
+                    class_counts,
+                    1.0,
+                )
+            )
         )
 
+        # 平均权重归一化为 1
         weights = (
             weights
-            / weights.sum()
-            * 4.0
+            / weights.mean()
         )
 
         class_weights = torch.tensor(
@@ -1067,12 +1130,19 @@ def main() -> None:
 
         print(
             "[INFO] Class counts:",
-            class_counts.tolist()
+            class_counts.tolist(),
         )
 
         print(
             "[INFO] Class weights:",
-            weights.tolist()
+            weights.tolist(),
+        )
+
+        print(
+            "[INFO] Label smoothing:",
+            float(
+                cfg["LABEL_SMOOTHING"]
+            ),
         )
 
     # --------------------------------------------------------
@@ -1085,40 +1155,32 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(
         trainable_parameters,
-        lr=float(cfg["LR"]),
+        lr=float(
+            cfg["LR"]
+        ),
         weight_decay=float(
             cfg["WEIGHT_DECAY"]
         ),
-        betas=(0.9, 0.999),
+        betas=(
+            0.9,
+            0.999,
+        ),
     )
 
     # --------------------------------------------------------
     # Scheduler
     #
-    # 按实际 optimizer.step() 数量计算
+    # 每个 Epoch 更新一次，而不是每个 Batch 更新
+    # 可以避免 AMP 跳过 optimizer.step 时产生顺序警告
     # --------------------------------------------------------
-    accumulation_steps = int(
-        cfg["ACCUM_STEPS"]
-    )
-
-    optimizer_steps_per_epoch = math.ceil(
-        len(train_loader)
-        / accumulation_steps
-    )
-
-    total_optimizer_steps = (
-        optimizer_steps_per_epoch
-        * int(cfg["EPOCHS"])
-    )
-
     scheduler = (
         torch.optim.lr_scheduler
         .CosineAnnealingLR(
             optimizer,
-            T_max=max(
-                1,
-                total_optimizer_steps
+            T_max=int(
+                cfg["EPOCHS"]
             ),
+            eta_min=1e-6,
         )
     )
 
@@ -1135,7 +1197,8 @@ def main() -> None:
     )
 
     print(
-        f"[INFO] AMP enabled: {use_amp}"
+        f"[INFO] AMP enabled: "
+        f"{use_amp}"
     )
 
     # --------------------------------------------------------
@@ -1146,25 +1209,32 @@ def main() -> None:
     bad_epochs = 0
 
     print()
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
     print(
         "Start training: "
         "Serial Time-Mamba "
         "-> Frequency-Attention"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
     print()
 
     # --------------------------------------------------------
-    # Epoch
+    # Epoch Loop
     # --------------------------------------------------------
     for epoch in range(
         1,
         int(cfg["EPOCHS"]) + 1,
     ):
+
         start_time = time.time()
 
-        train_loss = train_one_epoch(
+        train_loss, optimizer_steps = train_one_epoch(
             loader=train_loader,
             backbone=backbone,
             classifier=classifier,
@@ -1172,9 +1242,13 @@ def main() -> None:
             device=device,
             use_amp=use_amp,
             scaler=scaler,
-            accum_steps=accumulation_steps,
-            scheduler=scheduler,
+            accum_steps=int(
+                cfg["ACCUM_STEPS"]
+            ),
             class_weights=class_weights,
+            label_smoothing=float(
+                cfg["LABEL_SMOOTHING"]
+            ),
         )
 
         validation_metrics = evaluate_like_author(
@@ -1186,6 +1260,24 @@ def main() -> None:
                 cfg["TWO_CLS_EVAL"]
             ),
         )
+
+        # 当前 Epoch 实际使用的学习率
+        current_lr = (
+            optimizer
+            .param_groups[0]["lr"]
+        )
+
+        # 每个 Epoch 更新一次 Scheduler
+        if optimizer_steps > 0:
+            scheduler.step()
+
+        else:
+            print(
+                "[AMP WARNING] "
+                "本 Epoch 没有完成有效的 "
+                "optimizer.step()，"
+                "scheduler 未更新。"
+            )
 
         current_score = float(
             validation_metrics["ICBHI"]
@@ -1200,9 +1292,11 @@ def main() -> None:
         # 保存最佳模型
         # ----------------------------------------------------
         if improved:
+
             best_score = current_score
             best_epoch = epoch
             bad_epochs = 0
+            marker = "BEST"
 
             torch.save(
                 {
@@ -1224,8 +1318,6 @@ def main() -> None:
                 },
                 best_checkpoint_path,
             )
-
-            marker = "BEST"
 
         else:
             bad_epochs += 1
@@ -1256,12 +1348,9 @@ def main() -> None:
         )
 
         elapsed_time = (
-            time.time() - start_time
+            time.time()
+            - start_time
         )
-
-        current_lr = optimizer.param_groups[0][
-            "lr"
-        ]
 
         print(
             f"[{marker}] "
@@ -1283,24 +1372,26 @@ def main() -> None:
             f"{validation_metrics['F1']:.4f} | "
             f"LR "
             f"{current_lr:.8f} | "
+            f"OptSteps "
+            f"{optimizer_steps} | "
             f"{elapsed_time:.1f}s"
         )
 
         # ----------------------------------------------------
-        # Early stopping
+        # Early Stopping
         # ----------------------------------------------------
         if bad_epochs >= int(
             cfg["PATIENCE"]
         ):
             print(
-                "[EARLY STOP] "
+                f"[EARLY STOP] "
                 f"连续 {cfg['PATIENCE']} 个 Epoch "
                 "Score 没有提升。"
             )
 
             print(
-                f"[EARLY STOP] best epoch = "
-                f"{best_epoch}, "
+                f"[EARLY STOP] "
+                f"best epoch = {best_epoch}, "
                 f"best score = "
                 f"{best_score:.4f}"
             )
@@ -1308,20 +1399,29 @@ def main() -> None:
             break
 
     # --------------------------------------------------------
-    # 最佳结果
+    # 训练结束
     # --------------------------------------------------------
     print()
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
     print(
         f"Training completed. "
-        f"Best Score = {best_score:.4f}, "
-        f"Best Epoch = {best_epoch}"
+        f"Best Score = "
+        f"{best_score:.4f}, "
+        f"Best Epoch = "
+        f"{best_epoch}"
     )
+
     print(
         f"Best checkpoint: "
         f"{best_checkpoint_path}"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
 
     # --------------------------------------------------------
     # 加载最佳模型并最终评价
@@ -1332,11 +1432,15 @@ def main() -> None:
     )
 
     backbone.load_state_dict(
-        checkpoint["backbone_state"]
+        checkpoint[
+            "backbone_state"
+        ]
     )
 
     classifier.load_state_dict(
-        checkpoint["classifier_state"]
+        checkpoint[
+            "classifier_state"
+        ]
     )
 
     final_metrics = evaluate_like_author(
@@ -1350,23 +1454,30 @@ def main() -> None:
     )
 
     print()
-    print("[FINAL RESULT]")
+    print(
+        "[FINAL RESULT]"
+    )
+
     print(
         f"Score: "
         f"{final_metrics['ICBHI']:.4f}"
     )
+
     print(
         f"SP: "
         f"{final_metrics['SP']:.4f}"
     )
+
     print(
         f"SE: "
         f"{final_metrics['SE']:.4f}"
     )
+
     print(
         f"Accuracy: "
         f"{final_metrics['ACC']:.4f}"
     )
+
     print(
         f"Macro-F1: "
         f"{final_metrics['F1']:.4f}"
@@ -1376,12 +1487,15 @@ def main() -> None:
     print(
         "[FINAL] Confusion Matrix"
     )
+
     print(
         "Rows = true labels 0/1/2/3"
     )
+
     print(
         "Columns = predicted labels 0/1/2/3"
     )
+
     print(
         final_metrics["cm"]
     )
