@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import math
 import os
+import random
 import sys
 import time
-import math
-import random
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from torch.utils.data import DataLoader, Dataset
 
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
 # ============================================================
-# ✅ 你的参数：全部写死在这里（直接 python 运行）
+# 1. 配置
 # ============================================================
 CONFIG = {
-    # data
-    "ROOT": "/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",  # 含 train_index.csv / test_index.csv
+    # --------------------------------------------------------
+    # 数据目录
+    # 目录中需要包含：
+    #   train_index.csv
+    #   test_index.csv
+    #
+    # CSV 至少包含：
+    #   tokens_path
+    #   label
+    # --------------------------------------------------------
+    "ROOT": "/data/dingcong/hybrid/icbhi_official_ast_patch_tokens",
 
-    # train
-    "EPOCHS": 30,
+    # --------------------------------------------------------
+    # 训练参数
+    # 第一次运行先设为 1，确认没有报错后再改成 30 或 50
+    # --------------------------------------------------------
+    "EPOCHS": 1,
     "BATCH_SIZE": 2,
     "ACCUM_STEPS": 8,
 
@@ -37,157 +49,400 @@ CONFIG = {
     "SEED": 42,
     "DEVICE": "cuda",
 
-    "SAVE_DIR": "/data/dingcong/hybrid/checkpoints_icbhi_4cls_like_author",  # 你可改回你自己的目录
+    # 新目录，避免覆盖原来的并行模型
+    "SAVE_DIR": (
+        "/data/dingcong/hybrid/"
+        "checkpoints_serial_tmamba_fattention"
+    ),
+
     "PATIENCE": 10,
 
-    # model
-    "IN_DIM": 768,
-    "D_MODEL": 512,
-    "N_LAYERS": 8,
-    "NHEAD": 8,
-    "DROPOUT": 0.3,
-    "MAX_LEN": 1024,
+    # --------------------------------------------------------
+    # 模型参数
+    #
+    # AST patch token:
+    #   [948, 768]
+    #
+    # 948 = 12 × 79
+    # --------------------------------------------------------
+    "TOKEN_DIM": 768,
+    "FREQ_PATCHES": 12,
+    "TIME_PATCHES": 79,
 
-    # aug (默认关闭，与你现在一致)
+    "TIME_DEPTH": 2,
+    "FREQ_DEPTH": 2,
+    "NHEAD": 8,
+    "DROPOUT": 0.1,
+
+    # --------------------------------------------------------
+    # 数据增强
+    #
+    # 当前先关闭，保证与原模型进行公平比较
+    # --------------------------------------------------------
     "SPEC_AUG": False,
-    "MAX_MASK_T": 10,
-    "MAX_MASK_F": 4,
+    "MAX_MASK_T": 8,
+    "MAX_MASK_F": 2,
     "NUM_MASKS": 2,
 
-    # amp
+    # --------------------------------------------------------
+    # AMP 混合精度
+    # --------------------------------------------------------
     "AMP": True,
 
-    # eval mode (作者代码里 two_cls_eval 的效果)
-    # False: 严格四分类命中（pred==gt 才算对）
-    # True : gt!=0 且 pred>0 算对（“二分类式命中统计”，但仍走 get_score）
+    # --------------------------------------------------------
+    # ICBHI 评价方式
+    #
+    # False:
+    #   严格四分类。
+    #   异常样本只有预测类别完全正确才计入 SE。
+    #
+    # True:
+    #   二分类式评价。
+    #   只要异常样本被预测为任意异常类别就计入 SE。
+    # --------------------------------------------------------
     "TWO_CLS_EVAL": False,
 
-    # weighted CE（你想开就改 True）
+    # 是否使用类别加权交叉熵
     "WEIGHTED_LOSS": False,
+
+    # 若真实 Mamba 没有成功导入，是否直接停止
+    "REQUIRE_MAMBA": True,
 }
 
+
 # ============================================================
-# Path / import your backbone
+# 2. 导入项目中的模型
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-from mymodels import build_model  # 你的 SSA backbone：输出 (B, feat_dim)
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from mymodels.model import HAS_MAMBA, TimeFrequencyEncoder
 
 
 # ============================================================
-# 1) Seed
+# 3. 随机种子
 # ============================================================
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # ============================================================
-# 2) SpecAugment（tokens 维度遮挡）
+# 4. Patch 级 SpecAugment
+#
+# 输入：
+#   x: [948, 768]
+#
+# 恢复为：
+#   [12, 79, 768]
+#
+# 频率遮挡作用于 12 个频率 patch
+# 时间遮挡作用于 79 个时间 patch
 # ============================================================
-def apply_spec_augment(x, max_mask_t=10, max_mask_f=4, num_masks=2):
-    T, D = x.shape
-    x_aug = x.clone()
+def apply_patch_augment(
+    x: torch.Tensor,
+    freq_patches: int,
+    time_patches: int,
+    max_mask_t: int = 8,
+    max_mask_f: int = 2,
+    num_masks: int = 2,
+) -> torch.Tensor:
+
+    expected_tokens = freq_patches * time_patches
+
+    if x.ndim != 2:
+        raise ValueError(
+            "SpecAugment 输入必须为 [N, D]，"
+            f"当前形状为 {tuple(x.shape)}"
+        )
+
+    if x.shape[0] != expected_tokens:
+        raise ValueError(
+            f"Token 数量错误：当前为 {x.shape[0]}，"
+            f"要求为 {expected_tokens}"
+        )
+
+    feature_dim = x.shape[-1]
+
+    # [948, 768] -> [12, 79, 768]
+    x_aug = x.reshape(
+        freq_patches,
+        time_patches,
+        feature_dim
+    ).clone()
 
     for _ in range(num_masks):
-        t_width = random.randint(0, max_mask_t)
-        t_start = random.randint(0, max(0, T - t_width))
+
+        # ----------------------------------------------------
+        # 时间 patch 遮挡
+        # ----------------------------------------------------
+        t_width = random.randint(
+            0,
+            min(max_mask_t, time_patches)
+        )
+
         if t_width > 0:
-            x_aug[t_start:t_start + t_width, :] = 0
+            t_start = random.randint(
+                0,
+                time_patches - t_width
+            )
 
-        f_width = random.randint(0, max_mask_f)
-        f_start = random.randint(0, max(0, D - f_width))
+            x_aug[
+                :,
+                t_start:t_start + t_width,
+                :
+            ] = 0
+
+        # ----------------------------------------------------
+        # 频率 patch 遮挡
+        # ----------------------------------------------------
+        f_width = random.randint(
+            0,
+            min(max_mask_f, freq_patches)
+        )
+
         if f_width > 0:
-            x_aug[:, f_start:f_start + f_width] = 0
+            f_start = random.randint(
+                0,
+                freq_patches - f_width
+            )
 
-    return x_aug
+            x_aug[
+                f_start:f_start + f_width,
+                :,
+                :
+            ] = 0
+
+    return x_aug.reshape(
+        expected_tokens,
+        feature_dim
+    )
 
 
 # ============================================================
-# 3) Dataset：读 tokens.npy（四分类 label 0/1/2/3）
+# 5. 数据集
 # ============================================================
 class TokenNPY4ClsDataset(Dataset):
+
     def __init__(
         self,
         csv_path: str,
         is_train: bool,
         specaug: bool,
+        freq_patches: int,
+        time_patches: int,
+        token_dim: int,
         max_mask_t: int,
         max_mask_f: int,
         num_masks: int,
     ):
+        super().__init__()
+
+        self.csv_path = csv_path
         self.df = pd.read_csv(csv_path).reset_index(drop=True)
-        if "tokens_path" not in self.df.columns or "label" not in self.df.columns:
-            raise ValueError(f"[Dataset] CSV 必须包含 tokens_path / label 两列。当前列={self.df.columns.tolist()}")
+
+        required_columns = {
+            "tokens_path",
+            "label",
+        }
+
+        missing_columns = (
+            required_columns - set(self.df.columns)
+        )
+
+        if missing_columns:
+            raise ValueError(
+                f"[Dataset] {csv_path} 缺少列："
+                f"{sorted(missing_columns)}。"
+                f"当前列为：{self.df.columns.tolist()}"
+            )
 
         self.is_train = is_train
         self.specaug = specaug
+
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
+        self.token_dim = token_dim
+
+        self.expected_tokens = (
+            freq_patches * time_patches
+        )
+
         self.max_mask_t = max_mask_t
         self.max_mask_f = max_mask_f
         self.num_masks = num_masks
 
-        self.y4 = self.df["label"].astype(int).values
-        self.class_counts_4 = np.bincount(self.y4, minlength=4)
-
-        print(
-            f"[Dataset] Loaded {len(self.df)} samples from {csv_path} | "
-            f"counts4={self.class_counts_4.tolist()} | "
-            f"train={self.is_train} specaug={self.specaug}"
+        self.labels = (
+            self.df["label"]
+            .astype(int)
+            .to_numpy()
         )
 
-    def __len__(self):
+        invalid_labels = np.unique(
+            self.labels[
+                (self.labels < 0)
+                | (self.labels > 3)
+            ]
+        )
+
+        if len(invalid_labels) > 0:
+            raise ValueError(
+                "发现无效标签。四分类标签必须为 0、1、2、3，"
+                f"当前无效标签为：{invalid_labels.tolist()}"
+            )
+
+        self.class_counts_4 = np.bincount(
+            self.labels,
+            minlength=4
+        )
+
+        print(
+            f"[Dataset] Loaded {len(self.df)} samples "
+            f"from {csv_path}"
+        )
+        print(
+            f"[Dataset] class counts: "
+            f"{self.class_counts_4.tolist()}"
+        )
+        print(
+            f"[Dataset] train={self.is_train}, "
+            f"specaug={self.specaug}"
+        )
+
+    def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        x = np.load(row["tokens_path"])
-        x = torch.from_numpy(x).float()  # (T, D)
+    def __getitem__(
+        self,
+        index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        y4 = int(self.y4[idx])
+        row = self.df.iloc[index]
+        token_path = str(row["tokens_path"])
+
+        if not os.path.exists(token_path):
+            raise FileNotFoundError(
+                f"Token 文件不存在：{token_path}"
+            )
+
+        tokens_np = np.load(token_path)
+
+        if tokens_np.ndim != 2:
+            raise ValueError(
+                f"Token 文件必须是二维数组 [N, D]："
+                f"{token_path}，"
+                f"当前形状为 {tokens_np.shape}"
+            )
+
+        expected_shape = (
+            self.expected_tokens,
+            self.token_dim,
+        )
+
+        if tuple(tokens_np.shape) != expected_shape:
+            raise ValueError(
+                f"Token shape error：{token_path}\n"
+                f"当前形状：{tuple(tokens_np.shape)}\n"
+                f"要求形状：{expected_shape}\n"
+                f"其中 {self.expected_tokens} = "
+                f"{self.freq_patches} × "
+                f"{self.time_patches}"
+            )
+
+        x = torch.from_numpy(
+            tokens_np
+        ).float()
 
         if self.is_train and self.specaug:
-            x = apply_spec_augment(x, self.max_mask_t, self.max_mask_f, self.num_masks)
+            x = apply_patch_augment(
+                x=x,
+                freq_patches=self.freq_patches,
+                time_patches=self.time_patches,
+                max_mask_t=self.max_mask_t,
+                max_mask_f=self.max_mask_f,
+                num_masks=self.num_masks,
+            )
 
-        return x, torch.tensor(y4, dtype=torch.long)
+        label = torch.tensor(
+            int(self.labels[index]),
+            dtype=torch.long,
+        )
+
+        return x, label
 
 
 # ============================================================
-# 4) collate：pad + mask
+# 6. Collate
+#
+# 所有样本形状固定为：
+#   [948, 768]
+#
+# 因此不再进行 padding，也不再生成 mask。
 # ============================================================
-def collate_pad(batch):
+def collate_fixed(
+    batch: List[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
     xs, ys = zip(*batch)
-    lens = [x.shape[0] for x in xs]
-    D = xs[0].shape[1]
-    T_max = max(lens)
-    B = len(xs)
 
-    x_pad = torch.zeros(B, T_max, D, dtype=torch.float32)
-    mask = torch.ones(B, T_max, dtype=torch.bool)  # True=PAD
+    x_batch = torch.stack(
+        xs,
+        dim=0
+    )
 
-    for i, x in enumerate(xs):
-        T = x.shape[0]
-        x_pad[i, :T] = x
-        mask[i, :T] = False
+    y_batch = torch.stack(
+        ys,
+        dim=0
+    ).view(-1)
 
-    y = torch.stack(ys).view(-1)
-    return x_pad, mask, y
+    return x_batch, y_batch
 
 
 # ============================================================
-# 5) 作者式 get_score：hits/counts -> SP/SE/Score
+# 7. ICBHI Score
 # ============================================================
-def get_score_from_hits_counts(hits: List[float], counts: List[float]) -> Tuple[float, float, float]:
+def get_score_from_hits_counts(
+    hits: List[float],
+    counts: List[float],
+) -> Tuple[float, float, float]:
+
     eps = 1e-10
-    sp = 100.0 * (hits[0] / (counts[0] + eps))
-    abn_hits = float(hits[1] + hits[2] + hits[3])
-    abn_counts = float(counts[1] + counts[2] + counts[3])
-    se = 100.0 * (abn_hits / (abn_counts + eps))
+
+    # Specificity：Normal 类正确率
+    sp = 100.0 * (
+        hits[0] / (counts[0] + eps)
+    )
+
+    # Sensitivity：三个异常类整体正确率
+    abnormal_hits = float(
+        hits[1] + hits[2] + hits[3]
+    )
+
+    abnormal_counts = float(
+        counts[1] + counts[2] + counts[3]
+    )
+
+    se = 100.0 * (
+        abnormal_hits / (abnormal_counts + eps)
+    )
+
     score = (sp + se) / 2.0
+
     return float(sp), float(se), float(score)
 
 
+# ============================================================
+# 8. 验证
+# ============================================================
 @torch.no_grad()
 def evaluate_like_author(
     loader: DataLoader,
@@ -195,71 +450,145 @@ def evaluate_like_author(
     classifier: nn.Module,
     device: torch.device,
     two_cls_eval: bool,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
+
     backbone.eval()
     classifier.eval()
 
-    hits = [0.0] * 4
-    counts = [0.0] * 4
+    hits = [0.0, 0.0, 0.0, 0.0]
+    counts = [0.0, 0.0, 0.0, 0.0]
 
-    all_true, all_pred = [], []
-    ce_sum = 0.0
-    n_sum = 0
+    all_true = []
+    all_pred = []
 
-    ce = nn.CrossEntropyLoss(reduction="sum").to(device)
+    loss_sum = 0.0
+    sample_count = 0
 
-    for x, mask, y in loader:
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        bsz = y.size(0)
+    criterion = nn.CrossEntropyLoss(
+        reduction="sum"
+    ).to(device)
 
-        feat = backbone(x, mask=mask)         # (B, feat_dim)
-        out = classifier(feat)               # (B, 4)
-        loss = ce(out, y)
+    for x, y in loader:
 
-        ce_sum += float(loss.item())
-        n_sum += int(bsz)
+        x = x.to(
+            device,
+            non_blocking=True
+        )
 
-        pred = torch.argmax(out, dim=1)
+        y = y.to(
+            device,
+            non_blocking=True
+        )
 
-        all_true.append(y.detach().cpu())
-        all_pred.append(pred.detach().cpu())
+        batch_size = y.size(0)
 
-        for i in range(bsz):
+        # ----------------------------------------------------
+        # 串联模型
+        #
+        # x:
+        #   [B, 948, 768]
+        #
+        # feat:
+        #   [B, 768]
+        #
+        # logits:
+        #   [B, 4]
+        # ----------------------------------------------------
+        feat = backbone(x)
+        logits = classifier(feat)
+
+        loss = criterion(
+            logits,
+            y
+        )
+
+        loss_sum += float(loss.item())
+        sample_count += int(batch_size)
+
+        pred = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        all_true.append(
+            y.detach().cpu()
+        )
+
+        all_pred.append(
+            pred.detach().cpu()
+        )
+
+        for i in range(batch_size):
+
             gt = int(y[i].item())
             pr = int(pred[i].item())
+
             counts[gt] += 1.0
 
             if not two_cls_eval:
+                # 严格四分类评价
                 if pr == gt:
                     hits[gt] += 1.0
+
             else:
+                # 二分类式评价
                 if gt == 0 and pr == 0:
                     hits[gt] += 1.0
+
                 elif gt != 0 and pr > 0:
                     hits[gt] += 1.0
 
-    sp, se, sc = get_score_from_hits_counts(hits, counts)
+    sp, se, score = get_score_from_hits_counts(
+        hits,
+        counts
+    )
 
-    y_true = torch.cat(all_true).numpy()
-    y_pred = torch.cat(all_pred).numpy()
+    y_true = torch.cat(
+        all_true
+    ).numpy()
 
-    acc = accuracy_score(y_true, y_pred) * 100.0
-    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
+    y_pred = torch.cat(
+        all_pred
+    ).numpy()
+
+    accuracy = (
+        accuracy_score(
+            y_true,
+            y_pred
+        )
+        * 100.0
+    )
+
+    macro_f1 = f1_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[0, 1, 2, 3],
+    )
 
     return {
-        "SP": sp, "SE": se, "ICBHI": sc,
-        "ACC": float(acc), "F1": float(f1),
-        "LOSS": float(ce_sum / max(1, n_sum)),
-        "hits": hits, "counts": counts,
+        "SP": float(sp),
+        "SE": float(se),
+        "ICBHI": float(score),
+        "ACC": float(accuracy),
+        "F1": float(macro_f1),
+        "LOSS": float(
+            loss_sum / max(1, sample_count)
+        ),
+        "hits": hits,
+        "counts": counts,
         "cm": cm,
     }
 
 
 # ============================================================
-# 6) Train one epoch
+# 9. 训练一个 Epoch
 # ============================================================
 def train_one_epoch(
     loader: DataLoader,
@@ -268,257 +597,794 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     use_amp: bool,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler,
     accum_steps: int,
     scheduler=None,
-    class_weights: torch.Tensor = None,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> float:
+
     backbone.train()
     classifier.train()
 
     if class_weights is not None:
-        ce = nn.CrossEntropyLoss(weight=class_weights.to(device))
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights.to(device)
+        )
     else:
-        ce = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss()
 
-    running = 0.0
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(
+        set_to_none=True
+    )
 
-    for i, (x, mask, y) in enumerate(loader):
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    running_loss = 0.0
+    number_of_batches = len(loader)
 
-        with torch.autocast(device_type=device.type, enabled=use_amp):
-            feat = backbone(x, mask=mask)
-            out = classifier(feat)
-            loss = ce(out, y) / accum_steps
+    parameters = (
+        list(backbone.parameters())
+        + list(classifier.parameters())
+    )
 
-        scaler.scale(loss).backward()
-        running += float(loss.item() * accum_steps)
+    for batch_index, (x, y) in enumerate(loader):
 
-        if (i + 1) % accum_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(classifier.parameters()), 5.0)
-            scaler.step(optimizer)
+        x = x.to(
+            device,
+            non_blocking=True
+        )
+
+        y = y.to(
+            device,
+            non_blocking=True
+        )
+
+        with torch.autocast(
+            device_type=device.type,
+            enabled=use_amp,
+        ):
+            feat = backbone(x)
+            logits = classifier(feat)
+
+            raw_loss = criterion(
+                logits,
+                y
+            )
+
+            loss = (
+                raw_loss / accum_steps
+            )
+
+        scaler.scale(
+            loss
+        ).backward()
+
+        running_loss += float(
+            raw_loss.detach().item()
+        )
+
+        should_step = (
+            (batch_index + 1) % accum_steps == 0
+            or
+            (batch_index + 1) == number_of_batches
+        )
+
+        if should_step:
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                parameters,
+                max_norm=5.0,
+            )
+
+            scaler.step(
+                optimizer
+            )
+
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
             if scheduler is not None:
                 scheduler.step()
 
-    # tail
-    if len(loader) % accum_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(classifier.parameters()), 5.0)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        if scheduler is not None:
-            scheduler.step()
-
-    return running / max(1, len(loader))
-
-
-# ============================================================
-# 7) Main
-# ============================================================
-def main():
-    cfg = CONFIG
-    set_seed(cfg["SEED"])
-
-    device = torch.device("cuda" if (cfg["DEVICE"] == "cuda" and torch.cuda.is_available()) else "cpu")
-    print(f"[INFO] device: {device}")
-    if device.type == "cuda":
-        print("[DEBUG] device_count:", torch.cuda.device_count())
-        print("[DEBUG] current_device:", torch.cuda.current_device())
-        print("[DEBUG] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
-
-    root = Path(cfg["ROOT"])
-    train_csv = root / "train_index.csv"
-    test_csv = root / "test_index.csv"
-    if not train_csv.exists() or not test_csv.exists():
-        raise FileNotFoundError(f"找不到：\n{train_csv}\n{test_csv}")
-
-    os.makedirs(cfg["SAVE_DIR"], exist_ok=True)
-    ckpt_best = os.path.join(cfg["SAVE_DIR"], "best.pth")
-    ckpt_last = os.path.join(cfg["SAVE_DIR"], "last.pth")
-
-    # ✅ 作者式：train 用 train_index.csv，val/test 用 test_index.csv
-    train_ds = TokenNPY4ClsDataset(
-        str(train_csv),
-        is_train=True,
-        specaug=cfg["SPEC_AUG"],
-        max_mask_t=cfg["MAX_MASK_T"],
-        max_mask_f=cfg["MAX_MASK_F"],
-        num_masks=cfg["NUM_MASKS"],
+    return (
+        running_loss
+        / max(1, number_of_batches)
     )
-    val_ds = TokenNPY4ClsDataset(
-        str(test_csv),
+
+
+# ============================================================
+# 10. AMP Scaler
+# ============================================================
+def create_grad_scaler(
+    use_amp: bool,
+):
+    try:
+        return torch.amp.GradScaler(
+            "cuda",
+            enabled=use_amp,
+        )
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(
+            enabled=use_amp
+        )
+
+
+# ============================================================
+# 11. 模型形状测试
+# ============================================================
+@torch.no_grad()
+def run_shape_test(
+    loader: DataLoader,
+    backbone: nn.Module,
+    classifier: nn.Module,
+    device: torch.device,
+) -> None:
+
+    backbone.eval()
+    classifier.eval()
+
+    x, y = next(
+        iter(loader)
+    )
+
+    # 形状测试只取一个样本，减少显存消耗
+    x = x[:1].to(device)
+
+    feature = backbone(x)
+    logits = classifier(feature)
+
+    print(
+        "[SHAPE TEST] input:",
+        tuple(x.shape)
+    )
+
+    print(
+        "[SHAPE TEST] feature:",
+        tuple(feature.shape)
+    )
+
+    print(
+        "[SHAPE TEST] logits:",
+        tuple(logits.shape)
+    )
+
+    expected_feature_shape = (
+        1,
+        CONFIG["TOKEN_DIM"],
+    )
+
+    expected_logits_shape = (
+        1,
+        4,
+    )
+
+    if tuple(feature.shape) != expected_feature_shape:
+        raise RuntimeError(
+            "Backbone 输出形状错误："
+            f"当前为 {tuple(feature.shape)}，"
+            f"要求为 {expected_feature_shape}"
+        )
+
+    if tuple(logits.shape) != expected_logits_shape:
+        raise RuntimeError(
+            "Classifier 输出形状错误："
+            f"当前为 {tuple(logits.shape)}，"
+            f"要求为 {expected_logits_shape}"
+        )
+
+    print(
+        "[SHAPE TEST] Passed."
+    )
+
+
+# ============================================================
+# 12. 主函数
+# ============================================================
+def main() -> None:
+
+    cfg = CONFIG
+
+    set_seed(
+        int(cfg["SEED"])
+    )
+
+    # --------------------------------------------------------
+    # 设备
+    # --------------------------------------------------------
+    use_cuda = (
+        cfg["DEVICE"] == "cuda"
+        and torch.cuda.is_available()
+    )
+
+    device = torch.device(
+        "cuda" if use_cuda else "cpu"
+    )
+
+    print(
+        f"[INFO] device: {device}"
+    )
+
+    if device.type == "cuda":
+        print(
+            "[INFO] CUDA device count:",
+            torch.cuda.device_count()
+        )
+
+        print(
+            "[INFO] CUDA current device:",
+            torch.cuda.current_device()
+        )
+
+        print(
+            "[INFO] CUDA device name:",
+            torch.cuda.get_device_name(
+                torch.cuda.current_device()
+            )
+        )
+
+    # --------------------------------------------------------
+    # 检查 Mamba
+    # --------------------------------------------------------
+    print(
+        f"[INFO] HAS_MAMBA = {HAS_MAMBA}"
+    )
+
+    if (
+        cfg["REQUIRE_MAMBA"]
+        and not HAS_MAMBA
+    ):
+        raise RuntimeError(
+            "mamba_ssm 没有成功导入。"
+            "当前 model.py 会退化为 GRU，"
+            "为防止误训练，程序已经停止。\n"
+            "请先运行：\n"
+            "python -c \"from mamba_ssm import Mamba; "
+            "print('Mamba import success')\""
+        )
+
+    # --------------------------------------------------------
+    # CSV 路径
+    # --------------------------------------------------------
+    root = Path(
+        cfg["ROOT"]
+    )
+
+    train_csv = (
+        root / "train_index.csv"
+    )
+
+    test_csv = (
+        root / "test_index.csv"
+    )
+
+    if not train_csv.exists():
+        raise FileNotFoundError(
+            f"找不到训练 CSV：{train_csv}"
+        )
+
+    if not test_csv.exists():
+        raise FileNotFoundError(
+            f"找不到测试 CSV：{test_csv}"
+        )
+
+    # --------------------------------------------------------
+    # 保存路径
+    # --------------------------------------------------------
+    os.makedirs(
+        cfg["SAVE_DIR"],
+        exist_ok=True,
+    )
+
+    best_checkpoint_path = os.path.join(
+        cfg["SAVE_DIR"],
+        "best.pth",
+    )
+
+    last_checkpoint_path = os.path.join(
+        cfg["SAVE_DIR"],
+        "last.pth",
+    )
+
+    # --------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------
+    train_dataset = TokenNPY4ClsDataset(
+        csv_path=str(train_csv),
+        is_train=True,
+        specaug=bool(cfg["SPEC_AUG"]),
+        freq_patches=int(
+            cfg["FREQ_PATCHES"]
+        ),
+        time_patches=int(
+            cfg["TIME_PATCHES"]
+        ),
+        token_dim=int(
+            cfg["TOKEN_DIM"]
+        ),
+        max_mask_t=int(
+            cfg["MAX_MASK_T"]
+        ),
+        max_mask_f=int(
+            cfg["MAX_MASK_F"]
+        ),
+        num_masks=int(
+            cfg["NUM_MASKS"]
+        ),
+    )
+
+    validation_dataset = TokenNPY4ClsDataset(
+        csv_path=str(test_csv),
         is_train=False,
         specaug=False,
+        freq_patches=int(
+            cfg["FREQ_PATCHES"]
+        ),
+        time_patches=int(
+            cfg["TIME_PATCHES"]
+        ),
+        token_dim=int(
+            cfg["TOKEN_DIM"]
+        ),
         max_mask_t=0,
         max_mask_f=0,
         num_masks=0,
     )
 
-    dl_train = DataLoader(
-        train_ds,
-        batch_size=cfg["BATCH_SIZE"],
-        shuffle=True,
-        num_workers=cfg["NUM_WORKERS"],
-        pin_memory=True,
-        collate_fn=collate_pad,
-        drop_last=True,
+    # --------------------------------------------------------
+    # DataLoader
+    # --------------------------------------------------------
+    pin_memory = (
+        device.type == "cuda"
     )
-    dl_val = DataLoader(
-        val_ds,
-        batch_size=cfg["BATCH_SIZE"],
-        shuffle=False,
-        num_workers=cfg["NUM_WORKERS"],
-        pin_memory=True,
-        collate_fn=collate_pad,
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=int(
+            cfg["BATCH_SIZE"]
+        ),
+        shuffle=True,
+        num_workers=int(
+            cfg["NUM_WORKERS"]
+        ),
+        pin_memory=pin_memory,
+        collate_fn=collate_fixed,
         drop_last=False,
     )
 
-    # build backbone
-    backbone = build_model(
-        in_dim=cfg["IN_DIM"],
-        d_model=cfg["D_MODEL"],
-        n_layers=cfg["N_LAYERS"],
-        nhead=cfg["NHEAD"],
-        dropout=cfg["DROPOUT"],
-        max_len=cfg["MAX_LEN"],
-        num_classes=4,
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=int(
+            cfg["BATCH_SIZE"]
+        ),
+        shuffle=False,
+        num_workers=int(
+            cfg["NUM_WORKERS"]
+        ),
+        pin_memory=pin_memory,
+        collate_fn=collate_fixed,
+        drop_last=False,
+    )
+
+    # --------------------------------------------------------
+    # Backbone
+    #
+    # Time-Mamba -> Frequency-Attention
+    # --------------------------------------------------------
+    backbone = TimeFrequencyEncoder(
+        token_dim=int(
+            cfg["TOKEN_DIM"]
+        ),
+        freq_patches=int(
+            cfg["FREQ_PATCHES"]
+        ),
+        time_patches=int(
+            cfg["TIME_PATCHES"]
+        ),
+        time_depth=int(
+            cfg["TIME_DEPTH"]
+        ),
+        freq_depth=int(
+            cfg["FREQ_DEPTH"]
+        ),
+        num_heads=int(
+            cfg["NHEAD"]
+        ),
+        dropout=float(
+            cfg["DROPOUT"]
+        ),
     ).to(device)
 
-    if not hasattr(backbone, "final_feat_dim"):
-        raise RuntimeError("你的 build_model 返回的 backbone 没有 final_feat_dim，无法外接分类头。")
+    # Backbone 输出 [B, TOKEN_DIM]
+    classifier = nn.Linear(
+        int(cfg["TOKEN_DIM"]),
+        4,
+    ).to(device)
 
-    # 4-class head
-    classifier = nn.Linear(backbone.final_feat_dim, 4).to(device)
+    print(
+        "[MODEL] Serial structure:"
+    )
+    print(
+        "[MODEL] Time-Mamba "
+        "-> Frequency-Attention "
+        "-> Mean Pooling "
+        "-> Linear Classifier"
+    )
 
-    # weighted CE（可选）
+    print(
+        "[MODEL] Input shape: "
+        f"[B, "
+        f"{cfg['FREQ_PATCHES'] * cfg['TIME_PATCHES']}, "
+        f"{cfg['TOKEN_DIM']}]"
+    )
+
+    # --------------------------------------------------------
+    # 形状测试
+    # --------------------------------------------------------
+    run_shape_test(
+        loader=train_loader,
+        backbone=backbone,
+        classifier=classifier,
+        device=device,
+    )
+
+    # --------------------------------------------------------
+    # 类别权重
+    # --------------------------------------------------------
     class_weights = None
+
     if cfg["WEIGHTED_LOSS"]:
-        counts = train_ds.class_counts_4.astype(np.float32)
-        w = 1.0 / np.maximum(counts, 1.0)
-        w = w / w.sum() * 4.0
-        class_weights = torch.tensor(w, dtype=torch.float32)
-        print(f"[INFO] weighted_loss ON. class_counts={counts.tolist()} weights={w.tolist()}")
 
-    # optimizer
-    params = list(backbone.parameters()) + list(classifier.parameters())
-    optimizer = torch.optim.AdamW(params, lr=cfg["LR"], weight_decay=cfg["WEIGHT_DECAY"], betas=(0.9, 0.999))
+        class_counts = (
+            train_dataset
+            .class_counts_4
+            .astype(np.float32)
+        )
 
-    # scheduler：按真实 optimizer step 数（考虑 accum）
-    accum_steps = int(cfg["ACCUM_STEPS"])
-    opt_steps_per_epoch = math.ceil(len(dl_train) / accum_steps)
-    total_opt_steps = opt_steps_per_epoch * int(cfg["EPOCHS"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_opt_steps))
+        weights = 1.0 / np.maximum(
+            class_counts,
+            1.0
+        )
 
+        weights = (
+            weights
+            / weights.sum()
+            * 4.0
+        )
+
+        class_weights = torch.tensor(
+            weights,
+            dtype=torch.float32,
+        )
+
+        print(
+            "[INFO] Weighted loss enabled."
+        )
+
+        print(
+            "[INFO] Class counts:",
+            class_counts.tolist()
+        )
+
+        print(
+            "[INFO] Class weights:",
+            weights.tolist()
+        )
+
+    # --------------------------------------------------------
+    # Optimizer
+    # --------------------------------------------------------
+    trainable_parameters = (
+        list(backbone.parameters())
+        + list(classifier.parameters())
+    )
+
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=float(cfg["LR"]),
+        weight_decay=float(
+            cfg["WEIGHT_DECAY"]
+        ),
+        betas=(0.9, 0.999),
+    )
+
+    # --------------------------------------------------------
+    # Scheduler
+    #
+    # 按实际 optimizer.step() 数量计算
+    # --------------------------------------------------------
+    accumulation_steps = int(
+        cfg["ACCUM_STEPS"]
+    )
+
+    optimizer_steps_per_epoch = math.ceil(
+        len(train_loader)
+        / accumulation_steps
+    )
+
+    total_optimizer_steps = (
+        optimizer_steps_per_epoch
+        * int(cfg["EPOCHS"])
+    )
+
+    scheduler = (
+        torch.optim.lr_scheduler
+        .CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                total_optimizer_steps
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
     # AMP
-    use_amp = bool(cfg["AMP"] and device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # --------------------------------------------------------
+    use_amp = bool(
+        cfg["AMP"]
+        and device.type == "cuda"
+    )
 
+    scaler = create_grad_scaler(
+        use_amp
+    )
+
+    print(
+        f"[INFO] AMP enabled: {use_amp}"
+    )
+
+    # --------------------------------------------------------
+    # 训练状态
+    # --------------------------------------------------------
     best_score = -1.0
     best_epoch = -1
     bad_epochs = 0
 
-    print("\n🚀 Start training (4-class CE + author-style get_score)\n")
+    print()
+    print("=" * 70)
+    print(
+        "Start training: "
+        "Serial Time-Mamba "
+        "-> Frequency-Attention"
+    )
+    print("=" * 70)
+    print()
 
-    for epoch in range(1, int(cfg["EPOCHS"]) + 1):
-        t0 = time.time()
+    # --------------------------------------------------------
+    # Epoch
+    # --------------------------------------------------------
+    for epoch in range(
+        1,
+        int(cfg["EPOCHS"]) + 1,
+    ):
+        start_time = time.time()
 
         train_loss = train_one_epoch(
-            loader=dl_train,
+            loader=train_loader,
             backbone=backbone,
             classifier=classifier,
             optimizer=optimizer,
             device=device,
             use_amp=use_amp,
             scaler=scaler,
-            accum_steps=accum_steps,
+            accum_steps=accumulation_steps,
             scheduler=scheduler,
             class_weights=class_weights,
         )
 
-        val_m = evaluate_like_author(
-            loader=dl_val,
+        validation_metrics = evaluate_like_author(
+            loader=validation_loader,
             backbone=backbone,
             classifier=classifier,
             device=device,
-            two_cls_eval=bool(cfg["TWO_CLS_EVAL"]),
+            two_cls_eval=bool(
+                cfg["TWO_CLS_EVAL"]
+            ),
         )
 
-        score = val_m["ICBHI"]
-        improved = score > best_score + 1e-9
+        current_score = float(
+            validation_metrics["ICBHI"]
+        )
 
+        improved = (
+            current_score
+            > best_score + 1e-9
+        )
+
+        # ----------------------------------------------------
+        # 保存最佳模型
+        # ----------------------------------------------------
         if improved:
-            best_score = score
+            best_score = current_score
             best_epoch = epoch
             bad_epochs = 0
+
             torch.save(
                 {
                     "epoch": epoch,
-                    "backbone_state": backbone.state_dict(),
-                    "classifier_state": classifier.state_dict(),
+                    "backbone_state": (
+                        backbone.state_dict()
+                    ),
+                    "classifier_state": (
+                        classifier.state_dict()
+                    ),
+                    "optimizer_state": (
+                        optimizer.state_dict()
+                    ),
+                    "scheduler_state": (
+                        scheduler.state_dict()
+                    ),
                     "best_score": best_score,
                     "config": deepcopy(cfg),
                 },
-                ckpt_best
+                best_checkpoint_path,
             )
-            star = "⭐"
+
+            marker = "BEST"
+
         else:
             bad_epochs += 1
-            star = " "
+            marker = "    "
 
-        # save last
+        # ----------------------------------------------------
+        # 保存最后一个 Epoch
+        # ----------------------------------------------------
         torch.save(
             {
                 "epoch": epoch,
-                "backbone_state": backbone.state_dict(),
-                "classifier_state": classifier.state_dict(),
+                "backbone_state": (
+                    backbone.state_dict()
+                ),
+                "classifier_state": (
+                    classifier.state_dict()
+                ),
+                "optimizer_state": (
+                    optimizer.state_dict()
+                ),
+                "scheduler_state": (
+                    scheduler.state_dict()
+                ),
                 "best_score": best_score,
                 "config": deepcopy(cfg),
             },
-            ckpt_last
+            last_checkpoint_path,
         )
 
-        dt = time.time() - t0
+        elapsed_time = (
+            time.time() - start_time
+        )
+
+        current_lr = optimizer.param_groups[0][
+            "lr"
+        ]
+
         print(
-            f"{star} Epoch {epoch:03d}/{cfg['EPOCHS']} | "
-            f"train_loss {train_loss:.4f} | "
-            f"VAL Score {val_m['ICBHI']:.4f} SP {val_m['SP']:.4f} SE {val_m['SE']:.4f} | "
-            f"ACC {val_m['ACC']:.4f} F1 {val_m['F1']:.4f} | "
-            f"{dt:.1f}s"
+            f"[{marker}] "
+            f"Epoch {epoch:03d}/"
+            f"{cfg['EPOCHS']} | "
+            f"train_loss "
+            f"{train_loss:.4f} | "
+            f"val_loss "
+            f"{validation_metrics['LOSS']:.4f} | "
+            f"Score "
+            f"{validation_metrics['ICBHI']:.4f} | "
+            f"SP "
+            f"{validation_metrics['SP']:.4f} | "
+            f"SE "
+            f"{validation_metrics['SE']:.4f} | "
+            f"ACC "
+            f"{validation_metrics['ACC']:.4f} | "
+            f"Macro-F1 "
+            f"{validation_metrics['F1']:.4f} | "
+            f"LR "
+            f"{current_lr:.8f} | "
+            f"{elapsed_time:.1f}s"
         )
 
-        if bad_epochs >= int(cfg["PATIENCE"]):
-            print(f"[EARLY STOP] Score 连续 {cfg['PATIENCE']} 轮无提升，停止于 epoch {epoch}（best@{best_epoch} Score={best_score:.4f}）")
+        # ----------------------------------------------------
+        # Early stopping
+        # ----------------------------------------------------
+        if bad_epochs >= int(
+            cfg["PATIENCE"]
+        ):
+            print(
+                "[EARLY STOP] "
+                f"连续 {cfg['PATIENCE']} 个 Epoch "
+                "Score 没有提升。"
+            )
+
+            print(
+                f"[EARLY STOP] best epoch = "
+                f"{best_epoch}, "
+                f"best score = "
+                f"{best_score:.4f}"
+            )
+
             break
 
-    print(f"\n✅ DONE. Best Score={best_score:.4f} @ epoch {best_epoch}")
-    print(f"[SAVED] best checkpoint: {ckpt_best}")
+    # --------------------------------------------------------
+    # 最佳结果
+    # --------------------------------------------------------
+    print()
+    print("=" * 70)
+    print(
+        f"Training completed. "
+        f"Best Score = {best_score:.4f}, "
+        f"Best Epoch = {best_epoch}"
+    )
+    print(
+        f"Best checkpoint: "
+        f"{best_checkpoint_path}"
+    )
+    print("=" * 70)
 
-    # final eval from best
-    print("\n🚀 Final evaluation from best checkpoint (same author-style get_score)\n")
-    ckpt = torch.load(ckpt_best, map_location=device)
-    backbone.load_state_dict(ckpt["backbone_state"])
-    classifier.load_state_dict(ckpt["classifier_state"])
+    # --------------------------------------------------------
+    # 加载最佳模型并最终评价
+    # --------------------------------------------------------
+    checkpoint = torch.load(
+        best_checkpoint_path,
+        map_location=device,
+    )
 
-    final_m = evaluate_like_author(
-        loader=dl_val,
+    backbone.load_state_dict(
+        checkpoint["backbone_state"]
+    )
+
+    classifier.load_state_dict(
+        checkpoint["classifier_state"]
+    )
+
+    final_metrics = evaluate_like_author(
+        loader=validation_loader,
         backbone=backbone,
         classifier=classifier,
         device=device,
-        two_cls_eval=bool(cfg["TWO_CLS_EVAL"]),
+        two_cls_eval=bool(
+            cfg["TWO_CLS_EVAL"]
+        ),
+    )
+
+    print()
+    print("[FINAL RESULT]")
+    print(
+        f"Score: "
+        f"{final_metrics['ICBHI']:.4f}"
     )
     print(
-        f"[FINAL] Score {final_m['ICBHI']:.4f} SP {final_m['SP']:.4f} SE {final_m['SE']:.4f} | "
-        f"ACC {final_m['ACC']:.4f} F1 {final_m['F1']:.4f}"
+        f"SP: "
+        f"{final_metrics['SP']:.4f}"
     )
-    print("[FINAL] Confusion Matrix (rows=true 0/1/2/3, cols=pred 0/1/2/3):")
-    print(final_m["cm"])
+    print(
+        f"SE: "
+        f"{final_metrics['SE']:.4f}"
+    )
+    print(
+        f"Accuracy: "
+        f"{final_metrics['ACC']:.4f}"
+    )
+    print(
+        f"Macro-F1: "
+        f"{final_metrics['F1']:.4f}"
+    )
+
+    print()
+    print(
+        "[FINAL] Confusion Matrix"
+    )
+    print(
+        "Rows = true labels 0/1/2/3"
+    )
+    print(
+        "Columns = predicted labels 0/1/2/3"
+    )
+    print(
+        final_metrics["cm"]
+    )
 
 
 if __name__ == "__main__":
