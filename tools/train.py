@@ -54,17 +54,17 @@ CONFIG = {
     "AMP": True,
     "REQUIRE_MAMBA": True,
 
-    # 只根据 Score 执行 Early Stopping
+    # Early Stopping 只根据严格四分类 Score
     "PATIENCE": 15,
 
-    # 新目录，避免覆盖之前模型
+    # 保存目录
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_serial_256_no_sampler_threshold"
+        "checkpoints_hierarchical_dual_score"
     ),
 
     # --------------------------------------------------------
-    # 模型参数
+    # Backbone 参数
     # --------------------------------------------------------
     "INPUT_DIM": 768,
     "D_MODEL": 256,
@@ -76,29 +76,34 @@ CONFIG = {
     "FREQ_DEPTH": 1,
 
     "NHEAD": 8,
-
     "DROPOUT": 0.15,
-    "CLASSIFIER_DROPOUT": 0.20,
 
     # --------------------------------------------------------
-    # 损失函数
-    #
-    # 不使用 WeightedRandomSampler
-    # 不使用类别权重
-    # 不使用 Label Smoothing
+    # 分类头参数
     # --------------------------------------------------------
+    "HEAD_DROPOUT": 0.20,
+
+    # 总损失：
+    # binary_loss + ABNORMAL_LOSS_WEIGHT * abnormal_loss
+    "ABNORMAL_LOSS_WEIGHT": 1.0,
+
+    # 异常三分类权重：
+    # weight = 1 / count^power
+    "ABNORMAL_WEIGHT_POWER": 0.5,
+
     "LABEL_SMOOTHING": 0.0,
 
     # --------------------------------------------------------
-    # Normal 阈值搜索
+    # Binary Head 阈值搜索
     #
-    # 若 P(Normal) >= threshold，则预测 Normal；
-    # 否则在 Crackle、Wheeze、Both 中选择最大概率类别。
+    # P(Abnormal) >= threshold：
+    #     判定为异常，再由异常三分类头预测 1/2/3
+    #
+    # P(Abnormal) < threshold：
+    #     判定为 Normal
     # --------------------------------------------------------
-    "SEARCH_THRESHOLD": True,
-
-    "THRESHOLD_MIN": 0.20,
-    "THRESHOLD_MAX": 0.80,
+    "THRESHOLD_MIN": 0.05,
+    "THRESHOLD_MAX": 0.95,
     "THRESHOLD_STEP": 0.01,
 }
 
@@ -121,7 +126,7 @@ from mymodels.model import (
 
 
 # ============================================================
-# 3. 随机种子
+# 3. 设置随机种子
 # ============================================================
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -178,7 +183,8 @@ class TokenNPY4ClsDataset(Dataset):
             raise ValueError(
                 f"{csv_path} 缺少列："
                 f"{sorted(missing_columns)}；"
-                f"当前列：{self.df.columns.tolist()}"
+                f"当前列为："
+                f"{self.df.columns.tolist()}"
             )
 
         self.freq_patches = freq_patches
@@ -292,7 +298,7 @@ class TokenNPY4ClsDataset(Dataset):
 
 
 # ============================================================
-# 5. 固定形状 Collate
+# 5. Collate
 # ============================================================
 def collate_fixed(
     batch: List[
@@ -322,38 +328,80 @@ def collate_fixed(
 
 
 # ============================================================
-# 6. 根据 Normal 阈值生成四分类预测
+# 6. 构建异常三分类权重
+#
+# 类别：
+# 1 = Crackle
+# 2 = Wheeze
+# 3 = Both
 # ============================================================
-def predict_with_normal_threshold(
-    probabilities: np.ndarray,
+def build_abnormal_class_weights(
+    class_counts: np.ndarray,
+    power: float,
+) -> torch.Tensor:
+
+    abnormal_counts = (
+        class_counts[1:4]
+        .astype(np.float64)
+    )
+
+    weights = (
+        1.0
+        / np.power(
+            np.maximum(
+                abnormal_counts,
+                1.0,
+            ),
+            power,
+        )
+    )
+
+    # 平均权重归一化为 1
+    weights = (
+        weights
+        / weights.mean()
+    )
+
+    print(
+        "[Loss] Abnormal class counts:",
+        abnormal_counts.tolist(),
+    )
+
+    print(
+        "[Loss] Abnormal class weights:",
+        weights.tolist(),
+    )
+
+    return torch.tensor(
+        weights,
+        dtype=torch.float32,
+    )
+
+
+# ============================================================
+# 7. 分层预测
+# ============================================================
+def hierarchical_predict(
+    abnormal_probability: np.ndarray,
+    abnormal_class_prediction: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
     """
-    probabilities:
-        [N, 4]
+    abnormal_probability:
+        Binary Head 的 P(Abnormal)，形状 [N]
 
-    规则：
-        P(Normal) >= threshold
-            -> 类别 0
+    abnormal_class_prediction:
+        Abnormal Head 输出的最终异常类别，取值为 1、2、3
 
-        P(Normal) < threshold
-            -> 在类别 1、2、3 中取最大概率类别
+    threshold:
+        当 P(Abnormal) >= threshold 时预测异常；
+        否则预测 Normal。
     """
 
-    normal_probability = probabilities[:, 0]
-
-    abnormal_prediction = (
-        np.argmax(
-            probabilities[:, 1:],
-            axis=1,
-        )
-        + 1
-    )
-
     prediction = np.where(
-        normal_probability >= threshold,
+        abnormal_probability >= threshold,
+        abnormal_class_prediction,
         0,
-        abnormal_prediction,
     )
 
     return prediction.astype(
@@ -362,63 +410,112 @@ def predict_with_normal_threshold(
 
 
 # ============================================================
-# 7. 计算严格四分类 Score
-#
-# SP：
-#   Normal 类正确率
-#
-# SE：
-#   Crackle、Wheeze、Both 三个异常类别中，
-#   具体类别预测正确的总体比例
-#
-# Score：
-#   (SP + SE) / 2
+# 8. 同时计算二分类和严格四分类指标
 # ============================================================
 def calculate_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> Dict[str, object]:
 
-    cm = confusion_matrix(
+    # ========================================================
+    # A. 严格四分类
+    #
+    # 0 = Normal
+    # 1 = Crackle
+    # 2 = Wheeze
+    # 3 = Both
+    # ========================================================
+    four_cm = confusion_matrix(
         y_true,
         y_pred,
         labels=[0, 1, 2, 3],
     )
 
     normal_total = float(
-        cm[0, :].sum()
+        four_cm[0, :].sum()
     )
 
     abnormal_total = float(
-        cm[1:, :].sum()
+        four_cm[1:, :].sum()
     )
 
-    normal_correct = float(
-        cm[0, 0]
-    )
-
-    abnormal_correct = float(
-        cm[1, 1]
-        + cm[2, 2]
-        + cm[3, 3]
-    )
-
-    sp = (
+    # 四分类 SP：
+    # Normal 必须预测为 Normal
+    four_sp = (
         100.0
-        * normal_correct
+        * float(four_cm[0, 0])
         / max(normal_total, 1.0)
     )
 
-    se = (
+    # 四分类 SE：
+    # 每个异常类别必须预测为正确的具体类别
+    four_abnormal_correct = float(
+        four_cm[1, 1]
+        + four_cm[2, 2]
+        + four_cm[3, 3]
+    )
+
+    four_se = (
         100.0
-        * abnormal_correct
+        * four_abnormal_correct
         / max(abnormal_total, 1.0)
     )
 
-    score = (
-        sp + se
+    four_score = (
+        four_sp + four_se
     ) / 2.0
 
+    # ========================================================
+    # B. Normal / Abnormal 二分类
+    #
+    # 0       -> Normal
+    # 1/2/3   -> Abnormal
+    # ========================================================
+    y_true_binary = (
+        y_true > 0
+    ).astype(np.int64)
+
+    y_pred_binary = (
+        y_pred > 0
+    ).astype(np.int64)
+
+    binary_cm = confusion_matrix(
+        y_true_binary,
+        y_pred_binary,
+        labels=[0, 1],
+    )
+
+    binary_normal_total = float(
+        binary_cm[0, :].sum()
+    )
+
+    binary_abnormal_total = float(
+        binary_cm[1, :].sum()
+    )
+
+    # 二分类 SP：
+    # Normal 正确识别为 Normal
+    binary_sp = (
+        100.0
+        * float(binary_cm[0, 0])
+        / max(binary_normal_total, 1.0)
+    )
+
+    # 二分类 SE：
+    # 任意异常类别预测为任意异常类别
+    binary_se = (
+        100.0
+        * float(binary_cm[1, 1])
+        / max(binary_abnormal_total, 1.0)
+    )
+
+    binary_score = (
+        binary_sp + binary_se
+    ) / 2.0
+
+    # ========================================================
+    # C. 辅助指标
+    # ========================================================
     accuracy = (
         accuracy_score(
             y_true,
@@ -448,23 +545,42 @@ def calculate_metrics(
     )
 
     return {
-        "SP": float(sp),
-        "SE": float(se),
-        "ICBHI": float(score),
+        # 严格四分类指标
+        "FOUR_SP": float(four_sp),
+        "FOUR_SE": float(four_se),
+        "FOUR_SCORE": float(four_score),
+
+        # 二分类指标
+        "BINARY_SP": float(binary_sp),
+        "BINARY_SE": float(binary_se),
+        "BINARY_SCORE": float(binary_score),
+
+        # 兼容原来的变量名
+        # ICBHI 表示用于选择最佳模型的严格四分类 Score
+        "SP": float(four_sp),
+        "SE": float(four_se),
+        "ICBHI": float(four_score),
+
+        # 辅助指标
         "ACC": float(accuracy),
         "F1": float(macro_f1),
 
         "class_recall": class_recall,
         "pred_counts": predicted_counts,
-        "cm": cm,
+
+        "cm": four_cm,
+        "binary_cm": binary_cm,
     }
 
 
 # ============================================================
-# 8. 搜索最佳 Normal 阈值
+# 9. 搜索最佳 Binary 阈值
+#
+# 最佳阈值只按照严格四分类 Score 选择
 # ============================================================
 def search_best_threshold(
-    probabilities: np.ndarray,
+    abnormal_probability: np.ndarray,
+    abnormal_class_prediction: np.ndarray,
     y_true: np.ndarray,
     threshold_min: float,
     threshold_max: float,
@@ -473,19 +589,32 @@ def search_best_threshold(
 
     thresholds = np.arange(
         threshold_min,
-        threshold_max + threshold_step / 2.0,
+        threshold_max
+        + threshold_step / 2.0,
         threshold_step,
     )
 
     best_metrics = None
     best_threshold = None
-    best_balance_difference = float("inf")
+
+    best_balance_difference = float(
+        "inf"
+    )
 
     for threshold in thresholds:
 
-        y_pred = predict_with_normal_threshold(
-            probabilities=probabilities,
-            threshold=float(threshold),
+        y_pred = hierarchical_predict(
+            abnormal_probability=(
+                abnormal_probability
+            ),
+
+            abnormal_class_prediction=(
+                abnormal_class_prediction
+            ),
+
+            threshold=float(
+                threshold
+            ),
         )
 
         metrics = calculate_metrics(
@@ -493,13 +622,14 @@ def search_best_threshold(
             y_pred=y_pred,
         )
 
-        score = float(
-            metrics["ICBHI"]
+        # 只根据严格四分类 Score 选阈值
+        current_score = float(
+            metrics["FOUR_SCORE"]
         )
 
         balance_difference = abs(
-            float(metrics["SP"])
-            - float(metrics["SE"])
+            float(metrics["FOUR_SP"])
+            - float(metrics["FOUR_SE"])
         )
 
         if best_metrics is None:
@@ -507,29 +637,43 @@ def search_best_threshold(
 
         else:
             best_score = float(
-                best_metrics["ICBHI"]
+                best_metrics["FOUR_SCORE"]
             )
 
             improved = (
-                score > best_score + 1e-12
+                current_score
+                > best_score + 1e-12
             )
 
-            # Score 相同时，选择 SP 与 SE 更接近的阈值
+            # Score 完全相同时，
+            # 选择 SP 和 SE 更接近的阈值
             if (
                 not improved
-                and abs(score - best_score) <= 1e-12
+                and abs(
+                    current_score
+                    - best_score
+                ) <= 1e-12
                 and balance_difference
                 < best_balance_difference
             ):
                 improved = True
 
         if improved:
+
             best_metrics = metrics
-            best_threshold = float(threshold)
+
+            best_threshold = float(
+                threshold
+            )
 
             best_balance_difference = (
                 balance_difference
             )
+
+    if best_metrics is None:
+        raise RuntimeError(
+            "阈值搜索失败，没有产生有效结果。"
+        )
 
     best_metrics["threshold"] = (
         best_threshold
@@ -539,32 +683,50 @@ def search_best_threshold(
 
 
 # ============================================================
-# 9. 收集验证集概率
+# 10. 收集模型输出
 # ============================================================
 @torch.no_grad()
-def collect_probabilities(
+def collect_outputs(
     loader: DataLoader,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     device: torch.device,
+    abnormal_class_weights: torch.Tensor,
+    abnormal_loss_weight: float,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    float,
+    float,
     float,
 ]:
 
     backbone.eval()
-    classifier.eval()
+    binary_head.eval()
+    abnormal_head.eval()
 
-    all_probabilities = []
+    all_abnormal_probability = []
+    all_abnormal_prediction = []
     all_labels = []
 
-    total_loss = 0.0
-    total_samples = 0
+    total_binary_loss = 0.0
+    total_abnormal_loss = 0.0
 
-    criterion = nn.CrossEntropyLoss(
+    total_samples = 0
+    total_abnormal_samples = 0
+
+    binary_criterion = nn.CrossEntropyLoss(
         reduction="sum"
     ).to(device)
+
+    abnormal_criterion = nn.CrossEntropyLoss(
+        weight=abnormal_class_weights.to(
+            device
+        ),
+        reduction="sum",
+    )
 
     for x, y in loader:
 
@@ -578,40 +740,107 @@ def collect_probabilities(
             non_blocking=True,
         )
 
-        feature = backbone(x)
+        feature = backbone(
+            x
+        )
 
-        logits = classifier(
+        binary_logits = binary_head(
             feature
         )
 
-        loss = criterion(
-            logits,
-            y,
+        abnormal_logits = abnormal_head(
+            feature
         )
 
-        probabilities = torch.softmax(
-            logits,
+        # 二分类标签：
+        # Normal=0，Abnormal=1
+        binary_target = (
+            y > 0
+        ).long()
+
+        binary_loss = binary_criterion(
+            binary_logits,
+            binary_target,
+        )
+
+        total_binary_loss += float(
+            binary_loss.item()
+        )
+
+        abnormal_mask = (
+            y > 0
+        )
+
+        if abnormal_mask.any():
+
+            # 原标签 1/2/3
+            # 转成异常头标签 0/1/2
+            abnormal_target = (
+                y[abnormal_mask] - 1
+            )
+
+            abnormal_loss = abnormal_criterion(
+                abnormal_logits[
+                    abnormal_mask
+                ],
+                abnormal_target,
+            )
+
+            total_abnormal_loss += float(
+                abnormal_loss.item()
+            )
+
+            total_abnormal_samples += int(
+                abnormal_mask.sum().item()
+            )
+
+        binary_probability = torch.softmax(
+            binary_logits,
             dim=1,
         )
 
-        total_loss += float(
-            loss.item()
+        # P(Abnormal)
+        abnormal_probability = (
+            binary_probability[:, 1]
         )
 
-        total_samples += int(
-            y.size(0)
+        # 异常三分类结果：
+        # 0/1/2 -> 最终类别 1/2/3
+        abnormal_prediction = (
+            torch.argmax(
+                abnormal_logits,
+                dim=1,
+            )
+            + 1
         )
 
-        all_probabilities.append(
-            probabilities.detach().cpu()
+        all_abnormal_probability.append(
+            abnormal_probability
+            .detach()
+            .cpu()
+        )
+
+        all_abnormal_prediction.append(
+            abnormal_prediction
+            .detach()
+            .cpu()
         )
 
         all_labels.append(
             y.detach().cpu()
         )
 
-    probabilities_np = torch.cat(
-        all_probabilities,
+        total_samples += int(
+            y.size(0)
+        )
+
+    abnormal_probability_np = torch.cat(
+        all_abnormal_probability,
+        dim=0,
+    ).numpy()
+
+    abnormal_prediction_np = torch.cat(
+        all_abnormal_prediction,
         dim=0,
     ).numpy()
 
@@ -620,81 +849,152 @@ def collect_probabilities(
         dim=0,
     ).numpy()
 
-    mean_loss = (
-        total_loss
+    mean_binary_loss = (
+        total_binary_loss
         / max(total_samples, 1)
     )
 
+    mean_abnormal_loss = (
+        total_abnormal_loss
+        / max(
+            total_abnormal_samples,
+            1,
+        )
+    )
+
+    mean_total_loss = (
+        mean_binary_loss
+        + abnormal_loss_weight
+        * mean_abnormal_loss
+    )
+
     return (
-        probabilities_np,
+        abnormal_probability_np,
+        abnormal_prediction_np,
         labels_np,
-        float(mean_loss),
+
+        float(mean_total_loss),
+        float(mean_binary_loss),
+        float(mean_abnormal_loss),
     )
 
 
 # ============================================================
-# 10. 验证并搜索最佳阈值
+# 11. 搜索最佳阈值并评价
 # ============================================================
 @torch.no_grad()
 def evaluate_with_threshold_search(
     loader: DataLoader,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     device: torch.device,
+    abnormal_class_weights: torch.Tensor,
+    abnormal_loss_weight: float,
     threshold_min: float,
     threshold_max: float,
     threshold_step: float,
 ) -> Dict[str, object]:
 
     (
-        probabilities,
+        abnormal_probability,
+        abnormal_prediction,
         y_true,
-        mean_loss,
-    ) = collect_probabilities(
+
+        total_loss,
+        binary_loss,
+        abnormal_loss,
+    ) = collect_outputs(
         loader=loader,
+
         backbone=backbone,
-        classifier=classifier,
+        binary_head=binary_head,
+        abnormal_head=abnormal_head,
+
         device=device,
+
+        abnormal_class_weights=(
+            abnormal_class_weights
+        ),
+
+        abnormal_loss_weight=(
+            abnormal_loss_weight
+        ),
     )
 
     metrics = search_best_threshold(
-        probabilities=probabilities,
+        abnormal_probability=(
+            abnormal_probability
+        ),
+
+        abnormal_class_prediction=(
+            abnormal_prediction
+        ),
+
         y_true=y_true,
+
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         threshold_step=threshold_step,
     )
 
-    metrics["LOSS"] = mean_loss
+    metrics["LOSS"] = total_loss
+    metrics["BINARY_LOSS"] = binary_loss
+    metrics["ABNORMAL_LOSS"] = abnormal_loss
 
     return metrics
 
 
 # ============================================================
-# 11. 使用固定阈值评价
+# 12. 使用固定阈值评价
 # ============================================================
 @torch.no_grad()
 def evaluate_with_fixed_threshold(
     loader: DataLoader,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     device: torch.device,
+    abnormal_class_weights: torch.Tensor,
+    abnormal_loss_weight: float,
     threshold: float,
 ) -> Dict[str, object]:
 
     (
-        probabilities,
+        abnormal_probability,
+        abnormal_prediction,
         y_true,
-        mean_loss,
-    ) = collect_probabilities(
+
+        total_loss,
+        binary_loss,
+        abnormal_loss,
+    ) = collect_outputs(
         loader=loader,
+
         backbone=backbone,
-        classifier=classifier,
+        binary_head=binary_head,
+        abnormal_head=abnormal_head,
+
         device=device,
+
+        abnormal_class_weights=(
+            abnormal_class_weights
+        ),
+
+        abnormal_loss_weight=(
+            abnormal_loss_weight
+        ),
     )
 
-    y_pred = predict_with_normal_threshold(
-        probabilities=probabilities,
+    y_pred = hierarchical_predict(
+        abnormal_probability=(
+            abnormal_probability
+        ),
+
+        abnormal_class_prediction=(
+            abnormal_prediction
+        ),
+
         threshold=threshold,
     )
 
@@ -703,7 +1003,10 @@ def evaluate_with_fixed_threshold(
         y_pred=y_pred,
     )
 
-    metrics["LOSS"] = mean_loss
+    metrics["LOSS"] = total_loss
+    metrics["BINARY_LOSS"] = binary_loss
+    metrics["ABNORMAL_LOSS"] = abnormal_loss
+
     metrics["threshold"] = float(
         threshold
     )
@@ -712,7 +1015,7 @@ def evaluate_with_fixed_threshold(
 
 
 # ============================================================
-# 12. AMP GradScaler
+# 13. AMP GradScaler
 # ============================================================
 def create_grad_scaler(
     use_amp: bool,
@@ -733,48 +1036,62 @@ def create_grad_scaler(
 
 
 # ============================================================
-# 13. 训练一个 Epoch
+# 14. 训练一个 Epoch
 # ============================================================
 def train_one_epoch(
     loader: DataLoader,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     use_amp: bool,
     scaler,
     accum_steps: int,
+    abnormal_class_weights: torch.Tensor,
+    abnormal_loss_weight: float,
     label_smoothing: float,
 ) -> Tuple[
+    float,
+    float,
     float,
     int,
 ]:
 
     backbone.train()
-    classifier.train()
+    binary_head.train()
+    abnormal_head.train()
 
-    # 普通交叉熵：
-    # 不使用类别权重
-    # 不使用 WeightedRandomSampler
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=label_smoothing
+    # Normal 与全部 Abnormal 数量近似平衡，
+    # 二分类损失不使用类别权重
+    binary_criterion = nn.CrossEntropyLoss(
+        label_smoothing=label_smoothing,
+    )
+
+    # 异常三分类使用温和类别权重
+    abnormal_criterion = nn.CrossEntropyLoss(
+        weight=abnormal_class_weights.to(
+            device
+        ),
+        label_smoothing=label_smoothing,
     )
 
     parameters = (
         list(backbone.parameters())
-        + list(classifier.parameters())
+        + list(binary_head.parameters())
+        + list(abnormal_head.parameters())
     )
 
     optimizer.zero_grad(
         set_to_none=True
     )
 
-    total_loss = 0.0
-    optimizer_steps = 0
+    total_loss_sum = 0.0
+    binary_loss_sum = 0.0
+    abnormal_loss_sum = 0.0
 
-    number_of_batches = len(
-        loader
-    )
+    optimizer_steps = 0
+    number_of_batches = len(loader)
 
     for batch_index, (x, y) in enumerate(
         loader
@@ -799,13 +1116,55 @@ def train_one_epoch(
                 x
             )
 
-            logits = classifier(
+            binary_logits = binary_head(
                 feature
             )
 
-            raw_loss = criterion(
-                logits,
-                y,
+            abnormal_logits = abnormal_head(
+                feature
+            )
+
+            # 0 = Normal
+            # 1 = Abnormal
+            binary_target = (
+                y > 0
+            ).long()
+
+            binary_loss = binary_criterion(
+                binary_logits,
+                binary_target,
+            )
+
+            abnormal_mask = (
+                y > 0
+            )
+
+            if abnormal_mask.any():
+
+                # 标签 1/2/3 转为 0/1/2
+                abnormal_target = (
+                    y[abnormal_mask] - 1
+                )
+
+                abnormal_loss = abnormal_criterion(
+                    abnormal_logits[
+                        abnormal_mask
+                    ],
+                    abnormal_target,
+                )
+
+            else:
+
+                abnormal_loss = torch.zeros(
+                    (),
+                    device=device,
+                    dtype=binary_loss.dtype,
+                )
+
+            raw_loss = (
+                binary_loss
+                + abnormal_loss_weight
+                * abnormal_loss
             )
 
             loss = (
@@ -817,8 +1176,16 @@ def train_one_epoch(
             loss
         ).backward()
 
-        total_loss += float(
+        total_loss_sum += float(
             raw_loss.detach().item()
+        )
+
+        binary_loss_sum += float(
+            binary_loss.detach().item()
+        )
+
+        abnormal_loss_sum += float(
+            abnormal_loss.detach().item()
         )
 
         should_step = (
@@ -861,6 +1228,7 @@ def train_one_epoch(
                 scaler.get_scale()
             )
 
+            # Scale 没有下降，说明参数更新没有被跳过
             if new_scale >= old_scale:
                 optimizer_steps += 1
 
@@ -868,31 +1236,50 @@ def train_one_epoch(
                 set_to_none=True
             )
 
-    mean_loss = (
-        total_loss
-        / max(number_of_batches, 1)
+    denominator = max(
+        number_of_batches,
+        1,
+    )
+
+    mean_total_loss = (
+        total_loss_sum
+        / denominator
+    )
+
+    mean_binary_loss = (
+        binary_loss_sum
+        / denominator
+    )
+
+    mean_abnormal_loss = (
+        abnormal_loss_sum
+        / denominator
     )
 
     return (
-        mean_loss,
+        float(mean_total_loss),
+        float(mean_binary_loss),
+        float(mean_abnormal_loss),
         optimizer_steps,
     )
 
 
 # ============================================================
-# 14. 模型形状检查
+# 15. 模型形状检查
 # ============================================================
 @torch.no_grad()
 def run_shape_test(
     loader: DataLoader,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     device: torch.device,
     expected_dim: int,
 ) -> None:
 
     backbone.eval()
-    classifier.eval()
+    binary_head.eval()
+    abnormal_head.eval()
 
     x, _ = next(
         iter(loader)
@@ -906,7 +1293,11 @@ def run_shape_test(
         x
     )
 
-    logits = classifier(
+    binary_logits = binary_head(
+        feature
+    )
+
+    abnormal_logits = abnormal_head(
         feature
     )
 
@@ -921,8 +1312,13 @@ def run_shape_test(
     )
 
     print(
-        "[SHAPE TEST] logits:",
-        tuple(logits.shape),
+        "[SHAPE TEST] binary logits:",
+        tuple(binary_logits.shape),
+    )
+
+    print(
+        "[SHAPE TEST] abnormal logits:",
+        tuple(abnormal_logits.shape),
     )
 
     if tuple(feature.shape) != (
@@ -935,14 +1331,24 @@ def run_shape_test(
             f"要求为 (1, {expected_dim})"
         )
 
-    if tuple(logits.shape) != (
+    if tuple(binary_logits.shape) != (
         1,
-        4,
+        2,
     ):
         raise RuntimeError(
-            f"Classifier 输出为 "
-            f"{tuple(logits.shape)}，"
-            "要求为 (1, 4)"
+            f"Binary Head 输出为 "
+            f"{tuple(binary_logits.shape)}，"
+            "要求为 (1, 2)"
+        )
+
+    if tuple(abnormal_logits.shape) != (
+        1,
+        3,
+    ):
+        raise RuntimeError(
+            f"Abnormal Head 输出为 "
+            f"{tuple(abnormal_logits.shape)}，"
+            "要求为 (1, 3)"
         )
 
     print(
@@ -951,7 +1357,7 @@ def run_shape_test(
 
 
 # ============================================================
-# 15. 将指标转换为可保存类型
+# 16. 转换为可保存类型
 # ============================================================
 def serializable_metrics(
     metrics: Dict[str, object],
@@ -965,9 +1371,8 @@ def serializable_metrics(
             value,
             np.ndarray,
         ):
-            result[key] = (
-                value.tolist()
-            )
+            result[key] = value.tolist()
+
         else:
             result[key] = value
 
@@ -975,16 +1380,18 @@ def serializable_metrics(
 
 
 # ============================================================
-# 16. 保存模型
+# 17. 保存 Checkpoint
 # ============================================================
 def save_checkpoint(
     path: str,
     epoch: int,
     backbone: nn.Module,
-    classifier: nn.Module,
+    binary_head: nn.Module,
+    abnormal_head: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     metrics: Dict[str, object],
+    abnormal_class_weights: torch.Tensor,
     config: Dict[str, object],
 ) -> None:
 
@@ -996,8 +1403,12 @@ def save_checkpoint(
                 backbone.state_dict()
             ),
 
-            "classifier_state": (
-                classifier.state_dict()
+            "binary_head_state": (
+                binary_head.state_dict()
+            ),
+
+            "abnormal_head_state": (
+                abnormal_head.state_dict()
             ),
 
             "optimizer_state": (
@@ -1014,12 +1425,28 @@ def save_checkpoint(
                 )
             ),
 
+            # 用于选模型的严格四分类 Score
             "score": float(
-                metrics["ICBHI"]
+                metrics["FOUR_SCORE"]
+            ),
+
+            "four_score": float(
+                metrics["FOUR_SCORE"]
+            ),
+
+            "binary_score": float(
+                metrics["BINARY_SCORE"]
             ),
 
             "threshold": float(
                 metrics["threshold"]
+            ),
+
+            "abnormal_class_weights": (
+                abnormal_class_weights
+                .detach()
+                .cpu()
+                .tolist()
             ),
 
             "config": deepcopy(
@@ -1031,7 +1458,7 @@ def save_checkpoint(
 
 
 # ============================================================
-# 17. 输出结果
+# 18. 打印最终结果
 # ============================================================
 def print_metrics(
     title: str,
@@ -1039,28 +1466,58 @@ def print_metrics(
 ) -> None:
 
     print()
-    print(
-        f"[{title}]"
-    )
+    print("=" * 76)
+    print(f"[{title}]")
+    print("=" * 76)
 
     print(
         f"Threshold: "
         f"{metrics['threshold']:.4f}"
     )
 
+    print()
     print(
-        f"Score: "
-        f"{metrics['ICBHI']:.4f}"
+        "----- Strict Four-Class Evaluation -----"
     )
 
     print(
-        f"SP: "
-        f"{metrics['SP']:.4f}"
+        f"4-Class Score: "
+        f"{metrics['FOUR_SCORE']:.4f}"
     )
 
     print(
-        f"SE: "
-        f"{metrics['SE']:.4f}"
+        f"4-Class SP: "
+        f"{metrics['FOUR_SP']:.4f}"
+    )
+
+    print(
+        f"4-Class SE: "
+        f"{metrics['FOUR_SE']:.4f}"
+    )
+
+    print()
+    print(
+        "----- Normal / Abnormal Binary Evaluation -----"
+    )
+
+    print(
+        f"Binary Score: "
+        f"{metrics['BINARY_SCORE']:.4f}"
+    )
+
+    print(
+        f"Binary SP: "
+        f"{metrics['BINARY_SP']:.4f}"
+    )
+
+    print(
+        f"Binary SE: "
+        f"{metrics['BINARY_SE']:.4f}"
+    )
+
+    print()
+    print(
+        "----- Auxiliary Metrics -----"
     )
 
     print(
@@ -1071,6 +1528,21 @@ def print_metrics(
     print(
         f"Macro-F1: "
         f"{metrics['F1']:.4f}"
+    )
+
+    print(
+        f"Total loss: "
+        f"{metrics['LOSS']:.4f}"
+    )
+
+    print(
+        f"Binary loss: "
+        f"{metrics['BINARY_LOSS']:.4f}"
+    )
+
+    print(
+        f"Abnormal loss: "
+        f"{metrics['ABNORMAL_LOSS']:.4f}"
     )
 
     print(
@@ -1088,17 +1560,36 @@ def print_metrics(
         ].tolist(),
     )
 
+    print()
     print(
-        "Confusion Matrix:"
+        "Four-Class Confusion Matrix:"
+    )
+
+    print(
+        "Rows/Columns = "
+        "Normal, Crackle, Wheeze, Both"
     )
 
     print(
         metrics["cm"]
     )
 
+    print()
+    print(
+        "Binary Confusion Matrix:"
+    )
+
+    print(
+        "Rows/Columns = Normal, Abnormal"
+    )
+
+    print(
+        metrics["binary_cm"]
+    )
+
 
 # ============================================================
-# 18. 主函数
+# 19. 主函数
 # ============================================================
 def main() -> None:
 
@@ -1189,13 +1680,14 @@ def main() -> None:
             f"找不到：{test_csv}"
         )
 
+    # 优先使用独立验证集选择 Epoch 和阈值
     if val_csv.exists():
 
         selection_csv = val_csv
 
         print(
             "[INFO] 使用 val_index.csv "
-            "选择 Epoch 和阈值：",
+            "选择最佳 Epoch 和阈值：",
             selection_csv,
         )
 
@@ -1208,17 +1700,17 @@ def main() -> None:
         )
 
         print(
-            "[WARNING] 当前将使用 test_index.csv "
-            "搜索阈值和选择模型。"
+            "[WARNING] 当前使用 test_index.csv "
+            "选择最佳 Epoch 和阈值。"
         )
 
         print(
-            "[WARNING] 正式论文实验建议从官方训练集 "
-            "划出独立验证集。"
+            "[WARNING] 正式论文实验应使用独立验证集，"
+            "官方测试集只评价一次。"
         )
 
     # --------------------------------------------------------
-    # 保存目录
+    # 保存路径
     # --------------------------------------------------------
     os.makedirs(
         cfg["SAVE_DIR"],
@@ -1227,7 +1719,7 @@ def main() -> None:
 
     best_score_path = os.path.join(
         cfg["SAVE_DIR"],
-        "best_score.pth",
+        "best_four_class_score.pth",
     )
 
     last_path = os.path.join(
@@ -1268,9 +1760,24 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # 异常三分类权重
+    # --------------------------------------------------------
+    abnormal_class_weights = (
+        build_abnormal_class_weights(
+            class_counts=(
+                train_dataset.class_counts
+            ),
+
+            power=float(
+                cfg[
+                    "ABNORMAL_WEIGHT_POWER"
+                ]
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
     # DataLoader
-    #
-    # 不使用 WeightedRandomSampler
     # --------------------------------------------------------
     loader_args = {
         "batch_size": int(
@@ -1353,40 +1860,61 @@ def main() -> None:
     ).to(device)
 
     # --------------------------------------------------------
-    # Classifier
+    # Binary Head
+    #
+    # 0 = Normal
+    # 1 = Abnormal
     # --------------------------------------------------------
-    classifier = nn.Sequential(
+    binary_head = nn.Sequential(
         nn.Dropout(
             float(
-                cfg[
-                    "CLASSIFIER_DROPOUT"
-                ]
+                cfg["HEAD_DROPOUT"]
             )
         ),
 
         nn.Linear(
-            int(
-                cfg["D_MODEL"]
-            ),
-            4,
+            int(cfg["D_MODEL"]),
+            2,
+        ),
+    ).to(device)
+
+    # --------------------------------------------------------
+    # Abnormal Head
+    #
+    # 0 = Crackle -> 最终类别 1
+    # 1 = Wheeze  -> 最终类别 2
+    # 2 = Both    -> 最终类别 3
+    # --------------------------------------------------------
+    abnormal_head = nn.Sequential(
+        nn.Dropout(
+            float(
+                cfg["HEAD_DROPOUT"]
+            )
+        ),
+
+        nn.Linear(
+            int(cfg["D_MODEL"]),
+            3,
         ),
     ).to(device)
 
     print(
-        "[MODEL] 768 -> 256 Projection"
+        "[MODEL] Hierarchical classification"
     )
 
     print(
-        "[MODEL] Time-Mamba "
-        "-> Frequency-Attention"
+        "[MODEL] Binary Head: "
+        "Normal / Abnormal"
     )
 
     print(
-        "[MODEL] No WeightedRandomSampler"
+        "[MODEL] Abnormal Head: "
+        "Crackle / Wheeze / Both"
     )
 
     print(
-        "[MODEL] Normal threshold search enabled"
+        "[MODEL] Best checkpoint selected by "
+        "strict 4-Class Score"
     )
 
     # --------------------------------------------------------
@@ -1394,9 +1922,13 @@ def main() -> None:
     # --------------------------------------------------------
     run_shape_test(
         loader=train_loader,
+
         backbone=backbone,
-        classifier=classifier,
+        binary_head=binary_head,
+        abnormal_head=abnormal_head,
+
         device=device,
+
         expected_dim=int(
             cfg["D_MODEL"]
         ),
@@ -1404,7 +1936,8 @@ def main() -> None:
 
     parameters = (
         list(backbone.parameters())
-        + list(classifier.parameters())
+        + list(binary_head.parameters())
+        + list(abnormal_head.parameters())
     )
 
     trainable_count = sum(
@@ -1471,8 +2004,12 @@ def main() -> None:
 
     # --------------------------------------------------------
     # 最佳结果
+    #
+    # 只使用严格四分类 Score 选模型
     # --------------------------------------------------------
-    best_score = -1.0
+    best_four_score = -1.0
+    best_binary_score = -1.0
+
     best_score_epoch = -1
     best_threshold = 0.5
 
@@ -1480,16 +2017,17 @@ def main() -> None:
 
     print()
     print(
-        "=" * 76
+        "=" * 100
     )
 
     print(
         "Start training: "
-        "No Sampler + Normal Threshold Search"
+        "Hierarchical Classification "
+        "+ Binary and Four-Class Scores"
     )
 
     print(
-        "=" * 76
+        "=" * 100
     )
     print()
 
@@ -1503,36 +2041,61 @@ def main() -> None:
 
         start_time = time.time()
 
-        train_loss, optimizer_steps = (
-            train_one_epoch(
-                loader=train_loader,
-                backbone=backbone,
-                classifier=classifier,
-                optimizer=optimizer,
-                device=device,
-                use_amp=use_amp,
-                scaler=scaler,
+        (
+            train_total_loss,
+            train_binary_loss,
+            train_abnormal_loss,
+            optimizer_steps,
+        ) = train_one_epoch(
+            loader=train_loader,
 
-                accum_steps=int(
-                    cfg[
-                        "ACCUM_STEPS"
-                    ]
-                ),
+            backbone=backbone,
+            binary_head=binary_head,
+            abnormal_head=abnormal_head,
 
-                label_smoothing=float(
-                    cfg[
-                        "LABEL_SMOOTHING"
-                    ]
-                ),
-            )
+            optimizer=optimizer,
+            device=device,
+
+            use_amp=use_amp,
+            scaler=scaler,
+
+            accum_steps=int(
+                cfg["ACCUM_STEPS"]
+            ),
+
+            abnormal_class_weights=(
+                abnormal_class_weights
+            ),
+
+            abnormal_loss_weight=float(
+                cfg[
+                    "ABNORMAL_LOSS_WEIGHT"
+                ]
+            ),
+
+            label_smoothing=float(
+                cfg["LABEL_SMOOTHING"]
+            ),
         )
 
-        # 每一轮在验证集上搜索最佳 Normal 阈值
         metrics = evaluate_with_threshold_search(
             loader=selection_loader,
+
             backbone=backbone,
-            classifier=classifier,
+            binary_head=binary_head,
+            abnormal_head=abnormal_head,
+
             device=device,
+
+            abnormal_class_weights=(
+                abnormal_class_weights
+            ),
+
+            abnormal_loss_weight=float(
+                cfg[
+                    "ABNORMAL_LOSS_WEIGHT"
+                ]
+            ),
 
             threshold_min=float(
                 cfg["THRESHOLD_MIN"]
@@ -1555,34 +2118,56 @@ def main() -> None:
         if optimizer_steps > 0:
             scheduler.step()
 
-        score = float(
-            metrics["ICBHI"]
+        four_score = float(
+            metrics["FOUR_SCORE"]
+        )
+
+        binary_score = float(
+            metrics["BINARY_SCORE"]
         )
 
         threshold = float(
             metrics["threshold"]
         )
 
-        # ----------------------------------------------------
-        # 只根据 Score 保存最佳模型
-        # ----------------------------------------------------
-        if score > best_score + 1e-9:
+        # 仅作为记录，不用于选模型
+        best_binary_score = max(
+            best_binary_score,
+            binary_score,
+        )
 
-            best_score = score
+        # ----------------------------------------------------
+        # 最佳模型只根据严格四分类 Score
+        # ----------------------------------------------------
+        if (
+            four_score
+            > best_four_score + 1e-9
+        ):
+
+            best_four_score = four_score
             best_score_epoch = epoch
             best_threshold = threshold
 
             bad_epochs = 0
-            marker = "BEST-SCORE"
+            marker = "BEST-4SCORE"
 
             save_checkpoint(
                 path=best_score_path,
                 epoch=epoch,
+
                 backbone=backbone,
-                classifier=classifier,
+                binary_head=binary_head,
+                abnormal_head=abnormal_head,
+
                 optimizer=optimizer,
                 scheduler=scheduler,
+
                 metrics=metrics,
+
+                abnormal_class_weights=(
+                    abnormal_class_weights
+                ),
+
                 config=cfg,
             )
 
@@ -1591,14 +2176,24 @@ def main() -> None:
             bad_epochs += 1
             marker = "-"
 
+        # 保存最后一轮
         save_checkpoint(
             path=last_path,
             epoch=epoch,
+
             backbone=backbone,
-            classifier=classifier,
+            binary_head=binary_head,
+            abnormal_head=abnormal_head,
+
             optimizer=optimizer,
             scheduler=scheduler,
+
             metrics=metrics,
+
+            abnormal_class_weights=(
+                abnormal_class_weights
+            ),
+
             config=cfg,
         )
 
@@ -1626,21 +2221,33 @@ def main() -> None:
             f"{cfg['EPOCHS']} | "
 
             f"train "
-            f"{train_loss:.4f} | "
+            f"{train_total_loss:.4f} | "
 
-            f"val "
-            f"{metrics['LOSS']:.4f} | "
+            f"bin_loss "
+            f"{train_binary_loss:.4f} | "
 
-            f"Score "
-            f"{score:.4f} | "
+            f"abn_loss "
+            f"{train_abnormal_loss:.4f} | "
 
-            f"SP "
-            f"{metrics['SP']:.4f} | "
+            f"4-Score "
+            f"{metrics['FOUR_SCORE']:.4f} | "
 
-            f"SE "
-            f"{metrics['SE']:.4f} | "
+            f"4-SP "
+            f"{metrics['FOUR_SP']:.4f} | "
 
-            f"Threshold "
+            f"4-SE "
+            f"{metrics['FOUR_SE']:.4f} | "
+
+            f"Binary-Score "
+            f"{metrics['BINARY_SCORE']:.4f} | "
+
+            f"Binary-SP "
+            f"{metrics['BINARY_SP']:.4f} | "
+
+            f"Binary-SE "
+            f"{metrics['BINARY_SE']:.4f} | "
+
+            f"Thr "
             f"{threshold:.2f} | "
 
             f"ACC "
@@ -1663,7 +2270,7 @@ def main() -> None:
         )
 
         # ----------------------------------------------------
-        # Early Stopping 只看 Score
+        # Early Stopping 只根据严格四分类 Score
         # ----------------------------------------------------
         if (
             bad_epochs
@@ -1674,15 +2281,15 @@ def main() -> None:
 
             print(
                 "[EARLY STOP] "
-                f"Score 连续 "
+                f"4-Class Score 连续 "
                 f"{cfg['PATIENCE']} "
                 "个 Epoch 没有提升。"
             )
 
             print(
                 f"[EARLY STOP] "
-                f"Best Score = "
-                f"{best_score:.4f}, "
+                f"Best 4-Class Score = "
+                f"{best_four_score:.4f}, "
                 f"Epoch = "
                 f"{best_score_epoch}, "
                 f"Threshold = "
@@ -1692,7 +2299,7 @@ def main() -> None:
             break
 
     # --------------------------------------------------------
-    # 加载最佳模型
+    # 加载最佳四分类 Score 模型
     # --------------------------------------------------------
     checkpoint = torch.load(
         best_score_path,
@@ -1705,9 +2312,15 @@ def main() -> None:
         ]
     )
 
-    classifier.load_state_dict(
+    binary_head.load_state_dict(
         checkpoint[
-            "classifier_state"
+            "binary_head_state"
+        ]
+    )
+
+    abnormal_head.load_state_dict(
+        checkpoint[
+            "abnormal_head_state"
         ]
     )
 
@@ -1717,12 +2330,17 @@ def main() -> None:
 
     print()
     print(
-        "=" * 76
+        "=" * 100
     )
 
     print(
-        f"Best Score: "
-        f"{best_score:.4f}"
+        f"Best 4-Class Score: "
+        f"{best_four_score:.4f}"
+    )
+
+    print(
+        f"Best observed Binary Score: "
+        f"{best_binary_score:.4f}"
     )
 
     print(
@@ -1741,17 +2359,33 @@ def main() -> None:
     )
 
     print(
-        "=" * 76
+        "=" * 100
     )
 
     # --------------------------------------------------------
-    # 使用最佳阈值在官方测试集评价
+    # 最终测试
+    #
+    # 使用最佳四分类模型和对应固定阈值
     # --------------------------------------------------------
     final_metrics = evaluate_with_fixed_threshold(
         loader=test_loader,
+
         backbone=backbone,
-        classifier=classifier,
+        binary_head=binary_head,
+        abnormal_head=abnormal_head,
+
         device=device,
+
+        abnormal_class_weights=(
+            abnormal_class_weights
+        ),
+
+        abnormal_loss_weight=float(
+            cfg[
+                "ABNORMAL_LOSS_WEIGHT"
+            ]
+        ),
+
         threshold=best_threshold,
     )
 
