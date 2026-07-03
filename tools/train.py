@@ -13,53 +13,39 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     f1_score,
     recall_score,
 )
-
-from torch.utils.data import (
-    DataLoader,
-    Dataset,
-)
+from torch.utils.data import DataLoader, Dataset
 
 
 # ============================================================
 # 1. 配置
 # ============================================================
 CONFIG = {
+    # 数据路径
     "ROOT": (
         "/data/dingcong/hybrid/"
         "icbhi_official_ast_patch_tokens"
     ),
 
+    # 保存路径
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_direct4_consistent_v1"
+        "checkpoints_direct4_calibrated_v2"
     ),
 
-    # --------------------------------------------------------
     # DataLoader
-    # --------------------------------------------------------
     "BATCH_SIZE": 4,
-
-    # Effective batch size = 4 × 8 = 32
     "ACCUM_STEPS": 8,
-
     "NUM_WORKERS": 1,
 
-    # --------------------------------------------------------
-    # Training
-    # --------------------------------------------------------
+    # 训练
     "EPOCHS": 50,
-
-    # 前 20 轮不早停
     "MIN_EPOCHS": 20,
-
-    # 20 轮以后连续 12 轮无提升才停止
     "PATIENCE": 12,
 
     "SEED": 42,
@@ -67,9 +53,7 @@ CONFIG = {
     "AMP": True,
     "REQUIRE_MAMBA": True,
 
-    # --------------------------------------------------------
     # Backbone
-    # --------------------------------------------------------
     "INPUT_DIM": 768,
     "D_MODEL": 256,
 
@@ -82,14 +66,10 @@ CONFIG = {
     "NHEAD": 8,
     "DROPOUT": 0.15,
 
-    # --------------------------------------------------------
-    # Head
-    # --------------------------------------------------------
+    # 分类头
     "HEAD_DROPOUT": 0.20,
 
-    # --------------------------------------------------------
-    # Learning rate
-    # --------------------------------------------------------
+    # 学习率
     "BACKBONE_LR": 1e-5,
     "HEAD_LR": 5e-5,
 
@@ -101,41 +81,42 @@ CONFIG = {
     "WEIGHT_DECAY": 1e-2,
     "GRAD_CLIP": 2.0,
 
-    # --------------------------------------------------------
-    # Loss
-    #
-    # 四分类、二分类和异常子类分类
-    # 全部由同一组 four-class logits 计算。
-    # --------------------------------------------------------
+    # 联合损失
     "FOUR_LOSS_WEIGHT": 1.0,
-    "BINARY_LOSS_WEIGHT": 0.35,
-    "SUBTYPE_LOSS_WEIGHT": 0.40,
 
-    "LABEL_SMOOTHING": 0.02,
+    # 降低二分类影响，避免只学 Normal / Abnormal
+    "BINARY_LOSS_WEIGHT": 0.05,
 
-    # --------------------------------------------------------
-    # 轻度类别权重
-    # --------------------------------------------------------
-    "FOUR_WEIGHT_POWER": 0.25,
-    "FOUR_WEIGHT_MAX": 1.50,
+    # 强化 Crackle / Wheeze / Both 区分
+    "SUBTYPE_LOSS_WEIGHT": 1.0,
 
-    "SUBTYPE_WEIGHT_POWER": 0.25,
-    "SUBTYPE_WEIGHT_MAX": 1.40,
+    "LABEL_SMOOTHING": 0.0,
 
-    # --------------------------------------------------------
-    # 验证集异常偏置搜索
-    #
-    # 给类别 1、2、3 的 logits 同时增加一个 bias，
-    # 只调节 Normal / Abnormal 平衡，
-    # 不改变异常三类之间的排序。
-    # --------------------------------------------------------
+    # 四分类权重
+    "FOUR_WEIGHT_POWER": 0.50,
+    "FOUR_WEIGHT_MAX": 2.20,
+
+    # 异常子类权重
+    "SUBTYPE_WEIGHT_POWER": 0.50,
+    "SUBTYPE_WEIGHT_MAX": 2.00,
+
+    # Normal / Abnormal 偏置搜索
     "BIAS_MIN": -1.50,
     "BIAS_MAX": 1.50,
     "BIAS_STEP": 0.05,
 
-    # 避免全 Normal 或全 Abnormal 模型被选中
+    # 少数类 logit 校准强度
+    "TAU_MIN": 0.0,
+    "TAU_MAX": 1.50,
+    "TAU_STEP": 0.05,
+
+    # 最佳模型约束
     "MIN_VALID_SP": 30.0,
     "MIN_VALID_SE": 30.0,
+
+    # 防止 Wheeze 和 Both 再次完全塌缩
+    "MIN_WHEEZE_RECALL": 0.05,
+    "MIN_BOTH_RECALL": 0.02,
 }
 
 
@@ -147,7 +128,6 @@ PROJECT_ROOT = Path(
 ).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
-
     sys.path.insert(
         0,
         str(PROJECT_ROOT),
@@ -166,7 +146,6 @@ from mymodels.model import (
 def set_seed(
     seed,
 ):
-
     random.seed(
         seed
     )
@@ -183,32 +162,19 @@ def set_seed(
         seed
     )
 
-    torch.backends.cudnn.deterministic = (
-        True
-    )
-
-    torch.backends.cudnn.benchmark = (
-        False
-    )
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     if torch.cuda.is_available():
-
-        torch.backends.cuda.matmul.allow_tf32 = (
-            True
-        )
-
-        torch.backends.cudnn.allow_tf32 = (
-            True
-        )
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     try:
-
         torch.set_float32_matmul_precision(
             "high"
         )
 
     except AttributeError:
-
         pass
 
 
@@ -218,9 +184,7 @@ def set_seed(
 def make_scaler(
     enabled,
 ):
-
     try:
-
         return torch.amp.GradScaler(
             "cuda",
             enabled=enabled,
@@ -230,22 +194,19 @@ def make_scaler(
         AttributeError,
         TypeError,
     ):
-
         return torch.cuda.amp.GradScaler(
             enabled=enabled
         )
 
 
 # ============================================================
-# 5. 加载 checkpoint
+# 5. checkpoint 加载
 # ============================================================
 def safe_load(
     path,
     device,
 ):
-
     try:
-
         return torch.load(
             path,
             map_location=device,
@@ -253,7 +214,6 @@ def safe_load(
         )
 
     except TypeError:
-
         return torch.load(
             path,
             map_location=device,
@@ -261,9 +221,9 @@ def safe_load(
 
 
 # ============================================================
-# 6. Warm-up + Cosine LR
+# 6. Warmup + Cosine 学习率
 # ============================================================
-def set_lrs(
+def set_epoch_lrs(
     optimizer,
     base_lrs,
     min_lrs,
@@ -271,7 +231,6 @@ def set_lrs(
     total_epochs,
     warmup_epochs,
 ):
-
     if epoch <= warmup_epochs:
 
         scale = (
@@ -286,8 +245,8 @@ def set_lrs(
         )
 
         current_lrs = [
-            lr * scale
-            for lr in base_lrs
+            base_lr * scale
+            for base_lr in base_lrs
         ]
 
     else:
@@ -304,7 +263,7 @@ def set_lrs(
             cosine_total,
         )
 
-        ratio = (
+        cosine_ratio = (
             0.5
             * (
                 1.0
@@ -324,26 +283,19 @@ def set_lrs(
                 base_lr
                 - min_lr
             )
-            * ratio
+            * cosine_ratio
 
-            for (
-                base_lr,
-                min_lr,
-            )
+            for base_lr, min_lr
             in zip(
                 base_lrs,
                 min_lrs,
             )
         ]
 
-    for (
-        parameter_group,
-        current_lr,
-    ) in zip(
+    for parameter_group, current_lr in zip(
         optimizer.param_groups,
         current_lrs,
     ):
-
         parameter_group[
             "lr"
         ] = float(
@@ -359,60 +311,43 @@ def set_lrs(
 def make_backbone(
     cfg,
 ):
-
     return TimeFrequencyEncoder(
-        input_dim=(
-            cfg[
-                "INPUT_DIM"
-            ]
-        ),
+        input_dim=cfg[
+            "INPUT_DIM"
+        ],
 
-        d_model=(
-            cfg[
-                "D_MODEL"
-            ]
-        ),
+        d_model=cfg[
+            "D_MODEL"
+        ],
 
-        freq_patches=(
-            cfg[
-                "FREQ_PATCHES"
-            ]
-        ),
+        freq_patches=cfg[
+            "FREQ_PATCHES"
+        ],
 
-        time_patches=(
-            cfg[
-                "TIME_PATCHES"
-            ]
-        ),
+        time_patches=cfg[
+            "TIME_PATCHES"
+        ],
 
-        time_depth=(
-            cfg[
-                "TIME_DEPTH"
-            ]
-        ),
+        time_depth=cfg[
+            "TIME_DEPTH"
+        ],
 
-        freq_depth=(
-            cfg[
-                "FREQ_DEPTH"
-            ]
-        ),
+        freq_depth=cfg[
+            "FREQ_DEPTH"
+        ],
 
-        num_heads=(
-            cfg[
-                "NHEAD"
-            ]
-        ),
+        num_heads=cfg[
+            "NHEAD"
+        ],
 
-        dropout=(
-            cfg[
-                "DROPOUT"
-            ]
-        ),
+        dropout=cfg[
+            "DROPOUT"
+        ],
     )
 
 
 # ============================================================
-# 8. 单头直接四分类模型
+# 8. 直接四分类模型
 # ============================================================
 class DirectFourClassModel(
     nn.Module
@@ -422,7 +357,6 @@ class DirectFourClassModel(
         self,
         cfg,
     ):
-
         super().__init__()
 
         self.backbone = make_backbone(
@@ -454,7 +388,6 @@ class DirectFourClassModel(
         self,
         x,
     ):
-
         feature = self.backbone(
             x
         )
@@ -478,7 +411,6 @@ class TokenDataset(
         csv_path,
         cfg,
     ):
-
         super().__init__()
 
         self.csv_path = Path(
@@ -496,13 +428,17 @@ class TokenDataset(
             "label",
         }
 
-        if not required_columns.issubset(
-            self.df.columns
-        ):
+        missing_columns = (
+            required_columns
+            - set(
+                self.df.columns
+            )
+        )
 
+        if missing_columns:
             raise ValueError(
-                f"{csv_path} 必须包含 "
-                f"tokens_path 和 label"
+                f"{self.csv_path} 缺少列："
+                f"{sorted(missing_columns)}"
             )
 
         self.df[
@@ -538,9 +474,8 @@ class TokenDataset(
         if len(
             invalid_labels
         ) > 0:
-
             raise ValueError(
-                "label 必须为 0、1、2、3，"
+                "标签必须为 0、1、2、3；"
                 f"发现："
                 f"{invalid_labels.tolist()}"
             )
@@ -572,28 +507,25 @@ class TokenDataset(
             f"{len(self.df)} | "
             f"counts="
             f"{self.class_counts.tolist()} | "
-            f"{csv_path}"
+            f"{self.csv_path}"
         )
 
     def __len__(
         self,
     ):
-
         return len(
             self.df
         )
 
-    def resolve_path(
+    def _resolve_path(
         self,
         raw_path,
     ):
-
         token_path = Path(
             raw_path
         )
 
         if token_path.exists():
-
             return token_path
 
         relative_path = (
@@ -602,7 +534,6 @@ class TokenDataset(
         )
 
         if relative_path.exists():
-
             return relative_path
 
         raise FileNotFoundError(
@@ -614,12 +545,11 @@ class TokenDataset(
         self,
         index,
     ):
-
         row = self.df.iloc[
             index
         ]
 
-        token_path = self.resolve_path(
+        token_path = self._resolve_path(
             str(
                 row[
                     "tokens_path"
@@ -634,12 +564,12 @@ class TokenDataset(
         if tuple(
             tokens.shape
         ) != self.expected_shape:
-
             raise ValueError(
-                f"{token_path} "
-                f"shape="
+                f"Token shape 错误："
+                f"{token_path}\n"
+                f"当前="
                 f"{tuple(tokens.shape)}，"
-                f"expected="
+                f"要求="
                 f"{self.expected_shape}"
             )
 
@@ -665,7 +595,6 @@ class TokenDataset(
 def collate_fixed(
     batch,
 ):
-
     xs, ys = zip(
         *batch
     )
@@ -687,7 +616,6 @@ def make_loader(
     device,
     shuffle,
 ):
-
     workers = cfg[
         "NUM_WORKERS"
     ]
@@ -695,11 +623,9 @@ def make_loader(
     return DataLoader(
         dataset,
 
-        batch_size=(
-            cfg[
-                "BATCH_SIZE"
-            ]
-        ),
+        batch_size=cfg[
+            "BATCH_SIZE"
+        ],
 
         shuffle=shuffle,
 
@@ -721,58 +647,38 @@ def make_loader(
 
 
 # ============================================================
-# 11. 类别权重
+# 11. 四分类类别权重
 # ============================================================
-def build_weights(
+def build_four_weights(
     class_counts,
-    power,
-    maximum_weight,
-    abnormal_only=False,
+    cfg,
 ):
-
-    if abnormal_only:
-
-        counts = np.asarray(
-            class_counts[
-                1:4
-            ],
-            dtype=np.float64,
-        )
-
-        reference_count = (
-            counts.max()
-        )
-
-    else:
-
-        counts = np.asarray(
-            class_counts,
-            dtype=np.float64,
-        )
-
-        reference_count = (
-            counts[0]
-        )
+    counts = np.asarray(
+        class_counts,
+        dtype=np.float64,
+    )
 
     weights = np.power(
-        reference_count
+        counts[0]
         /
         np.maximum(
             counts,
             1.0,
         ),
 
-        power,
+        cfg[
+            "FOUR_WEIGHT_POWER"
+        ],
     )
 
-    if not abnormal_only:
-
-        weights[0] = 1.0
+    weights[0] = 1.0
 
     weights = np.clip(
         weights,
         1.0,
-        maximum_weight,
+        cfg[
+            "FOUR_WEIGHT_MAX"
+        ],
     )
 
     return torch.tensor(
@@ -782,40 +688,79 @@ def build_weights(
 
 
 # ============================================================
-# 12. 一致性层级损失
+# 12. 异常子类权重
+# ============================================================
+def build_subtype_weights(
+    class_counts,
+    cfg,
+):
+    counts = np.asarray(
+        class_counts[
+            1:4
+        ],
+        dtype=np.float64,
+    )
+
+    weights = np.power(
+        counts.max()
+        /
+        np.maximum(
+            counts,
+            1.0,
+        ),
+
+        cfg[
+            "SUBTYPE_WEIGHT_POWER"
+        ],
+    )
+
+    weights = np.clip(
+        weights,
+        1.0,
+        cfg[
+            "SUBTYPE_WEIGHT_MAX"
+        ],
+    )
+
+    return torch.tensor(
+        weights,
+        dtype=torch.float32,
+    )
+
+
+# ============================================================
+# 13. 联合损失
 #
-# 只有一组四分类 logits。
-#
-# binary_logits:
-#   Normal = logit[0]
-#   Abnormal = logsumexp(logit[1:4])
-#
-# subtype_logits:
-#   logit[1:4]
+# 所有损失都来自同一组四分类 logits，
+# 不再使用多个相互冲突的分类头。
 # ============================================================
 def calculate_loss(
     logits,
     labels,
-    four_class_weights,
+    four_weights,
     subtype_weights,
     cfg,
 ):
-
+    # --------------------------------------------------------
+    # 主任务：直接四分类
+    # --------------------------------------------------------
     four_loss = F.cross_entropy(
         logits,
         labels,
 
-        weight=(
-            four_class_weights
-        ),
+        weight=four_weights,
 
-        label_smoothing=(
-            cfg[
-                "LABEL_SMOOTHING"
-            ]
-        ),
+        label_smoothing=cfg[
+            "LABEL_SMOOTHING"
+        ],
     )
 
+    # --------------------------------------------------------
+    # 二分类辅助任务
+    #
+    # Normal logit = logits[:, 0]
+    # Abnormal logit = logsumexp(logits[:, 1:4])
+    # --------------------------------------------------------
     binary_logits = torch.stack(
         [
             logits[
@@ -844,6 +789,9 @@ def calculate_loss(
         binary_target,
     )
 
+    # --------------------------------------------------------
+    # 异常子类辅助任务
+    # --------------------------------------------------------
     abnormal_mask = (
         labels > 0
     )
@@ -866,23 +814,19 @@ def calculate_loss(
             subtype_logits,
             subtype_target,
 
-            weight=(
-                subtype_weights
-            ),
+            weight=subtype_weights,
 
-            label_smoothing=(
-                cfg[
-                    "LABEL_SMOOTHING"
-                ]
-            ),
+            label_smoothing=cfg[
+                "LABEL_SMOOTHING"
+            ],
         )
 
     else:
 
         subtype_loss = torch.zeros(
             (),
-            dtype=logits.dtype,
             device=logits.device,
+            dtype=logits.dtype,
         )
 
     total_loss = (
@@ -906,25 +850,25 @@ def calculate_loss(
         * subtype_loss
     )
 
-    return (
-        total_loss,
-        four_loss,
-        binary_loss,
-        subtype_loss,
-    )
+    return {
+        "total": total_loss,
+        "four": four_loss,
+        "binary": binary_loss,
+        "subtype": subtype_loss,
+    }
 
 
 # ============================================================
-# 13. 指标
+# 14. 指标
 # ============================================================
 def calculate_metrics(
     y_true,
     y_pred,
 ):
-
     cm = confusion_matrix(
         y_true,
         y_pred,
+
         labels=[
             0,
             1,
@@ -935,14 +879,18 @@ def calculate_metrics(
 
     normal_total = max(
         int(
-            cm[0].sum()
+            cm[
+                0
+            ].sum()
         ),
         1,
     )
 
     abnormal_total = max(
         int(
-            cm[1:].sum()
+            cm[
+                1:
+            ].sum()
         ),
         1,
     )
@@ -985,6 +933,22 @@ def calculate_metrics(
         sensitivity
     ) / 2.0
 
+    class_recall = recall_score(
+        y_true,
+        y_pred,
+
+        labels=[
+            0,
+            1,
+            2,
+            3,
+        ],
+
+        average=None,
+
+        zero_division=0,
+    )
+
     return {
         "FOUR_SCORE": float(
             score
@@ -1017,21 +981,7 @@ def calculate_metrics(
             )
         ),
 
-        "RECALL": recall_score(
-            y_true,
-            y_pred,
-
-            labels=[
-                0,
-                1,
-                2,
-                3,
-            ],
-
-            average=None,
-
-            zero_division=0,
-        ),
+        "RECALL": class_recall,
 
         "PRED_COUNTS": (
             np.bincount(
@@ -1064,15 +1014,54 @@ def calculate_metrics(
 
 
 # ============================================================
-# 14. 异常偏置
+# 15. Logit 校准
+#
+# tau：
+#   根据训练集类别先验，提高少数类别 logits。
+#
+# abnormal_bias：
+#   同时调整 1、2、3 类，平衡 Normal / Abnormal。
 # ============================================================
-def apply_abnormal_bias(
+def apply_calibration(
     logits,
     abnormal_bias,
+    tau,
+    class_counts,
 ):
+    adjusted_logits = logits.astype(
+        np.float64,
+        copy=True,
+    )
+
+    counts = np.asarray(
+        class_counts,
+        dtype=np.float64,
+    )
+
+    class_prior = (
+        counts
+        /
+        counts.sum()
+    )
+
+    log_prior = np.log(
+        np.clip(
+            class_prior,
+            1e-12,
+            None,
+        )
+    )
 
     adjusted_logits = (
-        logits.copy()
+        adjusted_logits
+        -
+        float(
+            tau
+        )
+        * log_prior.reshape(
+            1,
+            -1,
+        )
     )
 
     adjusted_logits[
@@ -1085,14 +1074,159 @@ def apply_abnormal_bias(
     return adjusted_logits
 
 
-def search_abnormal_bias(
-    logits,
-    labels,
+# ============================================================
+# 16. 校准结果是否合法
+# ============================================================
+def valid_result(
+    result,
     cfg,
 ):
+    recalls = result[
+        "RECALL"
+    ]
 
-    best_result = None
-    fallback_result = None
+    return bool(
+        result[
+            "FOUR_SP"
+        ]
+        >= cfg[
+            "MIN_VALID_SP"
+        ]
+
+        and
+
+        result[
+            "FOUR_SE"
+        ]
+        >= cfg[
+            "MIN_VALID_SE"
+        ]
+
+        and
+
+        recalls[
+            2
+        ]
+        >= cfg[
+            "MIN_WHEEZE_RECALL"
+        ]
+
+        and
+
+        recalls[
+            3
+        ]
+        >= cfg[
+            "MIN_BOTH_RECALL"
+        ]
+    )
+
+
+# ============================================================
+# 17. Score 优先比较
+# ============================================================
+def better_score(
+    current,
+    best,
+):
+    if best is None:
+        return True
+
+    if (
+        current[
+            "FOUR_SCORE"
+        ]
+        >
+        best[
+            "FOUR_SCORE"
+        ]
+        + 1e-12
+    ):
+        return True
+
+    return (
+        abs(
+            current[
+                "FOUR_SCORE"
+            ]
+            -
+            best[
+                "FOUR_SCORE"
+            ]
+        )
+        <= 1e-12
+
+        and
+
+        current[
+            "MACRO_F1"
+        ]
+        >
+        best[
+            "MACRO_F1"
+        ]
+        + 1e-12
+    )
+
+
+# ============================================================
+# 18. F1 优先比较
+# ============================================================
+def better_f1(
+    current,
+    best,
+):
+    if best is None:
+        return True
+
+    if (
+        current[
+            "MACRO_F1"
+        ]
+        >
+        best[
+            "MACRO_F1"
+        ]
+        + 1e-12
+    ):
+        return True
+
+    return (
+        abs(
+            current[
+                "MACRO_F1"
+            ]
+            -
+            best[
+                "MACRO_F1"
+            ]
+        )
+        <= 1e-12
+
+        and
+
+        current[
+            "FOUR_SCORE"
+        ]
+        >
+        best[
+            "FOUR_SCORE"
+        ]
+        + 1e-12
+    )
+
+
+# ============================================================
+# 19. 搜索 Bias 和 Tau
+# ============================================================
+def search_calibration(
+    logits,
+    labels,
+    class_counts,
+    cfg,
+):
+    best_valid_result = None
+    best_fallback_result = None
 
     bias_values = np.arange(
         cfg[
@@ -1113,158 +1247,129 @@ def search_abnormal_bias(
         ],
     )
 
-    for abnormal_bias in bias_values:
+    tau_values = np.arange(
+        cfg[
+            "TAU_MIN"
+        ],
 
-        prediction = np.argmax(
-            apply_abnormal_bias(
+        cfg[
+            "TAU_MAX"
+        ]
+        +
+        cfg[
+            "TAU_STEP"
+        ]
+        / 2.0,
+
+        cfg[
+            "TAU_STEP"
+        ],
+    )
+
+    for tau in tau_values:
+
+        for abnormal_bias in bias_values:
+
+            calibrated_logits = apply_calibration(
                 logits,
                 abnormal_bias,
-            ),
+                tau,
+                class_counts,
+            )
 
-            axis=1,
-        )
+            prediction = np.argmax(
+                calibrated_logits,
+                axis=1,
+            )
 
-        current_result = {
-            **calculate_metrics(
+            current_result = calculate_metrics(
                 labels,
                 prediction,
-            ),
+            )
 
-            "ABNORMAL_BIAS": float(
+            current_result[
+                "ABNORMAL_BIAS"
+            ] = float(
                 abnormal_bias
-            ),
-        }
+            )
 
-        if (
-            fallback_result is None
-            or
             current_result[
-                "MACRO_F1"
-            ]
-            >
-            fallback_result[
-                "MACRO_F1"
-            ]
-            or
-            (
-                current_result[
-                    "MACRO_F1"
-                ]
-                ==
-                fallback_result[
-                    "MACRO_F1"
-                ]
+                "TAU"
+            ] = float(
+                tau
+            )
+
+            # 始终保留 Macro-F1 最优的备用结果
+            if better_f1(
+                current_result,
+                best_fallback_result,
+            ):
+                best_fallback_result = (
+                    current_result
+                )
+
+            # 主结果需要满足所有类别约束
+            if (
+                valid_result(
+                    current_result,
+                    cfg,
+                )
                 and
-                current_result[
-                    "FOUR_SCORE"
-                ]
-                >
-                fallback_result[
-                    "FOUR_SCORE"
-                ]
-            )
-        ):
+                better_score(
+                    current_result,
+                    best_valid_result,
+                )
+            ):
+                best_valid_result = (
+                    current_result
+                )
 
-            fallback_result = (
-                current_result
-            )
+    if best_valid_result is not None:
 
-        valid_candidate = (
-            current_result[
-                "FOUR_SP"
-            ]
-            >=
-            cfg[
-                "MIN_VALID_SP"
-            ]
-            and
-            current_result[
-                "FOUR_SE"
-            ]
-            >=
-            cfg[
-                "MIN_VALID_SE"
-            ]
-        )
-
-        if not valid_candidate:
-
-            continue
-
-        if (
-            best_result is None
-            or
-            current_result[
-                "FOUR_SCORE"
-            ]
-            >
-            best_result[
-                "FOUR_SCORE"
-            ]
-            or
-            (
-                current_result[
-                    "FOUR_SCORE"
-                ]
-                ==
-                best_result[
-                    "FOUR_SCORE"
-                ]
-                and
-                current_result[
-                    "MACRO_F1"
-                ]
-                >
-                best_result[
-                    "MACRO_F1"
-                ]
-            )
-        ):
-
-            best_result = (
-                current_result
-            )
-
-    if best_result is not None:
-
-        best_result[
-            "VALID_BIAS"
+        best_valid_result[
+            "VALID_CALIBRATION"
         ] = True
 
-        return best_result
+        return best_valid_result
 
-    fallback_result[
-        "VALID_BIAS"
+    if best_fallback_result is None:
+        raise RuntimeError(
+            "Calibration search failed."
+        )
+
+    best_fallback_result[
+        "VALID_CALIBRATION"
     ] = False
 
-    return fallback_result
+    return best_fallback_result
 
 
 # ============================================================
-# 15. 训练
+# 20. 训练一个 Epoch
 # ============================================================
-def train_epoch(
+def train_one_epoch(
     loader,
     model,
     optimizer,
     device,
     scaler,
     use_amp,
-    four_class_weights,
+    four_weights,
     subtype_weights,
     cfg,
 ):
-
     model.train()
 
     optimizer.zero_grad(
         set_to_none=True
     )
 
-    total_loss_sum = 0.0
-    four_loss_sum = 0.0
-    binary_loss_sum = 0.0
-    subtype_loss_sum = 0.0
+    loss_sums = {
+        "total": 0.0,
+        "four": 0.0,
+        "binary": 0.0,
+        "subtype": 0.0,
+    }
 
     trainable_parameters = [
         parameter
@@ -1299,21 +1404,18 @@ def train_epoch(
                 x
             )
 
-            (
-                total_loss,
-                four_loss,
-                binary_loss,
-                subtype_loss,
-            ) = calculate_loss(
+            losses = calculate_loss(
                 logits,
                 y,
-                four_class_weights,
+                four_weights,
                 subtype_weights,
                 cfg,
             )
 
             scaled_loss = (
-                total_loss
+                losses[
+                    "total"
+                ]
                 /
                 cfg[
                     "ACCUM_STEPS"
@@ -1324,29 +1426,16 @@ def train_epoch(
             scaled_loss
         ).backward()
 
-        total_loss_sum += float(
-            total_loss
-            .detach()
-            .item()
-        )
-
-        four_loss_sum += float(
-            four_loss
-            .detach()
-            .item()
-        )
-
-        binary_loss_sum += float(
-            binary_loss
-            .detach()
-            .item()
-        )
-
-        subtype_loss_sum += float(
-            subtype_loss
-            .detach()
-            .item()
-        )
+        for key in loss_sums:
+            loss_sums[
+                key
+            ] += float(
+                losses[
+                    key
+                ]
+                .detach()
+                .item()
+            )
 
         should_step = (
             (
@@ -1404,49 +1493,58 @@ def train_epoch(
 
     return {
         "TOTAL": (
-            total_loss_sum
+            loss_sums[
+                "total"
+            ]
             / divisor
         ),
 
         "FOUR": (
-            four_loss_sum
+            loss_sums[
+                "four"
+            ]
             / divisor
         ),
 
         "BINARY": (
-            binary_loss_sum
+            loss_sums[
+                "binary"
+            ]
             / divisor
         ),
 
         "SUBTYPE": (
-            subtype_loss_sum
+            loss_sums[
+                "subtype"
+            ]
             / divisor
         ),
     }
 
 
 # ============================================================
-# 16. 收集预测
+# 21. 收集输出
 # ============================================================
 @torch.no_grad()
 def collect_outputs(
     loader,
     model,
     device,
-    four_class_weights,
+    four_weights,
     subtype_weights,
     cfg,
 ):
-
     model.eval()
 
     all_logits = []
     all_labels = []
 
-    total_loss_sum = 0.0
-    four_loss_sum = 0.0
-    binary_loss_sum = 0.0
-    subtype_loss_sum = 0.0
+    loss_sums = {
+        "total": 0.0,
+        "four": 0.0,
+        "binary": 0.0,
+        "subtype": 0.0,
+    }
 
     for x, y in loader:
 
@@ -1464,15 +1562,10 @@ def collect_outputs(
             x
         )
 
-        (
-            total_loss,
-            four_loss,
-            binary_loss,
-            subtype_loss,
-        ) = calculate_loss(
+        losses = calculate_loss(
             logits,
             y,
-            four_class_weights,
+            four_weights,
             subtype_weights,
             cfg,
         )
@@ -1489,21 +1582,14 @@ def collect_outputs(
             .cpu()
         )
 
-        total_loss_sum += float(
-            total_loss.item()
-        )
-
-        four_loss_sum += float(
-            four_loss.item()
-        )
-
-        binary_loss_sum += float(
-            binary_loss.item()
-        )
-
-        subtype_loss_sum += float(
-            subtype_loss.item()
-        )
+        for key in loss_sums:
+            loss_sums[
+                key
+            ] += float(
+                losses[
+                    key
+                ].item()
+            )
 
     divisor = max(
         len(
@@ -1523,22 +1609,30 @@ def collect_outputs(
 
         {
             "TOTAL": (
-                total_loss_sum
+                loss_sums[
+                    "total"
+                ]
                 / divisor
             ),
 
             "FOUR": (
-                four_loss_sum
+                loss_sums[
+                    "four"
+                ]
                 / divisor
             ),
 
             "BINARY": (
-                binary_loss_sum
+                loss_sums[
+                    "binary"
+                ]
                 / divisor
             ),
 
             "SUBTYPE": (
-                subtype_loss_sum
+                loss_sums[
+                    "subtype"
+                ]
                 / divisor
             ),
         },
@@ -1546,33 +1640,30 @@ def collect_outputs(
 
 
 # ============================================================
-# 17. 验证
+# 22. 验证集搜索校准参数
 # ============================================================
-def evaluate_with_search(
+def evaluate_search(
     loader,
     model,
     device,
-    four_class_weights,
+    four_weights,
     subtype_weights,
+    class_counts,
     cfg,
 ):
-
-    (
-        logits,
-        labels,
-        losses,
-    ) = collect_outputs(
+    logits, labels, losses = collect_outputs(
         loader,
         model,
         device,
-        four_class_weights,
+        four_weights,
         subtype_weights,
         cfg,
     )
 
-    result = search_abnormal_bias(
+    result = search_calibration(
         logits,
         labels,
+        class_counts,
         cfg,
     )
 
@@ -1583,35 +1674,38 @@ def evaluate_with_search(
     return result
 
 
-def evaluate_fixed_bias(
+# ============================================================
+# 23. 使用固定校准参数测试
+# ============================================================
+def evaluate_fixed(
     loader,
     model,
     device,
-    four_class_weights,
+    four_weights,
     subtype_weights,
-    cfg,
+    class_counts,
     abnormal_bias,
+    tau,
+    cfg,
 ):
-
-    (
-        logits,
-        labels,
-        losses,
-    ) = collect_outputs(
+    logits, labels, losses = collect_outputs(
         loader,
         model,
         device,
-        four_class_weights,
+        four_weights,
         subtype_weights,
         cfg,
     )
 
-    prediction = np.argmax(
-        apply_abnormal_bias(
-            logits,
-            abnormal_bias,
-        ),
+    calibrated_logits = apply_calibration(
+        logits,
+        abnormal_bias,
+        tau,
+        class_counts,
+    )
 
+    prediction = np.argmax(
+        calibrated_logits,
         axis=1,
     )
 
@@ -1627,6 +1721,12 @@ def evaluate_fixed_bias(
     )
 
     result[
+        "TAU"
+    ] = float(
+        tau
+    )
+
+    result[
         "LOSSES"
     ] = losses
 
@@ -1634,56 +1734,65 @@ def evaluate_fixed_bias(
 
 
 # ============================================================
-# 18. Checkpoint
+# 24. 转换为可保存类型
 # ============================================================
 def serializable(
-    dictionary,
+    value,
 ):
-
-    result = {}
-
-    for key, value in (
-        dictionary.items()
+    if isinstance(
+        value,
+        np.ndarray,
     ):
+        return value.tolist()
 
-        if isinstance(
-            value,
-            np.ndarray,
-        ):
+    if isinstance(
+        value,
+        np.generic,
+    ):
+        return value.item()
 
-            result[
-                key
-            ] = value.tolist()
-
-        elif isinstance(
-            value,
-            np.bool_,
-        ):
-
-            result[
-                key
-            ] = bool(
-                value
+    if isinstance(
+        value,
+        dict,
+    ):
+        return {
+            key: serializable(
+                item
             )
+            for key, item
+            in value.items()
+        }
 
-        else:
+    if isinstance(
+        value,
+        (
+            list,
+            tuple,
+        ),
+    ):
+        return [
+            serializable(
+                item
+            )
+            for item in value
+        ]
 
-            result[
-                key
-            ] = value
-
-    return result
+    return value
 
 
+# ============================================================
+# 25. 保存 checkpoint
+# ============================================================
 def save_checkpoint(
     path,
     epoch,
     model,
     optimizer,
-    validation_result,
+    result,
+    four_weights,
+    subtype_weights,
     cfg,
 ):
-
     torch.save(
         {
             "epoch": int(
@@ -1699,43 +1808,63 @@ def save_checkpoint(
             ),
 
             "four_score": float(
-                validation_result[
+                result[
                     "FOUR_SCORE"
                 ]
             ),
 
             "four_sp": float(
-                validation_result[
+                result[
                     "FOUR_SP"
                 ]
             ),
 
             "four_se": float(
-                validation_result[
+                result[
                     "FOUR_SE"
                 ]
             ),
 
             "macro_f1": float(
-                validation_result[
+                result[
                     "MACRO_F1"
                 ]
             ),
 
             "abnormal_bias": float(
-                validation_result[
+                result[
                     "ABNORMAL_BIAS"
                 ]
             ),
 
-            "valid_bias": bool(
-                validation_result[
-                    "VALID_BIAS"
+            "tau": float(
+                result[
+                    "TAU"
                 ]
             ),
 
+            "valid_calibration": bool(
+                result[
+                    "VALID_CALIBRATION"
+                ]
+            ),
+
+            "four_weights": (
+                four_weights
+                .detach()
+                .cpu()
+                .tolist()
+            ),
+
+            "subtype_weights": (
+                subtype_weights
+                .detach()
+                .cpu()
+                .tolist()
+            ),
+
             "metrics": serializable(
-                validation_result
+                result
             ),
 
             "config": deepcopy(
@@ -1748,7 +1877,160 @@ def save_checkpoint(
 
 
 # ============================================================
-# 19. 主函数
+# 26. Shape Test
+# ============================================================
+@torch.no_grad()
+def shape_test(
+    loader,
+    model,
+    device,
+):
+    model.eval()
+
+    x, _ = next(
+        iter(
+            loader
+        )
+    )
+
+    logits = model(
+        x[
+            :1
+        ].to(
+            device
+        )
+    )
+
+    print(
+        "[Shape] input:",
+        tuple(
+            x[
+                :1
+            ].shape
+        ),
+    )
+
+    print(
+        "[Shape] logits:",
+        tuple(
+            logits.shape
+        ),
+    )
+
+    if tuple(
+        logits.shape
+    ) != (
+        1,
+        4,
+    ):
+        raise RuntimeError(
+            f"logits shape error："
+            f"{tuple(logits.shape)}"
+        )
+
+
+# ============================================================
+# 27. 最终结果打印
+# ============================================================
+def print_final(
+    result,
+):
+    print()
+
+    print(
+        "=" * 80
+    )
+
+    print(
+        "[FINAL DIRECT FOUR-CLASS TEST]"
+    )
+
+    print(
+        "=" * 80
+    )
+
+    print(
+        f"Bias: "
+        f"{result['ABNORMAL_BIAS']:+.2f}"
+    )
+
+    print(
+        f"Tau: "
+        f"{result['TAU']:.2f}"
+    )
+
+    print(
+        f"4-Class Score: "
+        f"{result['FOUR_SCORE']:.4f}"
+    )
+
+    print(
+        f"4-Class SP: "
+        f"{result['FOUR_SP']:.4f}"
+    )
+
+    print(
+        f"4-Class SE: "
+        f"{result['FOUR_SE']:.4f}"
+    )
+
+    print(
+        f"Accuracy: "
+        f"{result['ACC']:.4f}"
+    )
+
+    print(
+        f"Macro-F1: "
+        f"{result['MACRO_F1']:.4f}"
+    )
+
+    print(
+        "Recall"
+        "[Normal,Crackle,Wheeze,Both]:",
+
+        np.round(
+            result[
+                "RECALL"
+            ],
+            4,
+        ).tolist(),
+    )
+
+    print(
+        "PredCount:",
+
+        result[
+            "PRED_COUNTS"
+        ].tolist(),
+    )
+
+    print()
+
+    print(
+        "Four-class confusion matrix:"
+    )
+
+    print(
+        result[
+            "FOUR_CM"
+        ]
+    )
+
+    print()
+
+    print(
+        "Binary confusion matrix:"
+    )
+
+    print(
+        result[
+            "BINARY_CM"
+        ]
+    )
+
+
+# ============================================================
+# 28. 主函数
 # ============================================================
 def main():
 
@@ -1784,7 +2066,7 @@ def main():
             "[INFO] GPU:",
 
             torch.cuda.get_device_name(
-                0
+                torch.cuda.current_device()
             ),
         )
 
@@ -1800,11 +2082,13 @@ def main():
         and
         not HAS_MAMBA
     ):
-
         raise RuntimeError(
-            "mamba_ssm 导入失败"
+            "mamba_ssm 导入失败。"
         )
 
+    # ========================================================
+    # 数据文件
+    # ========================================================
     root = Path(
         cfg[
             "ROOT"
@@ -1827,13 +2111,11 @@ def main():
     )
 
     if not train_csv.exists():
-
         raise FileNotFoundError(
             train_csv
         )
 
     if not test_csv.exists():
-
         raise FileNotFoundError(
             test_csv
         )
@@ -1845,7 +2127,7 @@ def main():
         )
 
         print(
-            "[INFO] 使用验证集：",
+            "[INFO] Validation file:",
             selection_csv,
         )
 
@@ -1856,15 +2138,19 @@ def main():
         )
 
         print(
-            "[WARNING] 没有 val_index.csv，"
+            "[WARNING] val_index.csv 不存在，"
             "当前使用 test_index.csv "
-            "选择模型和 bias。"
+            "选择模型和校准参数。"
         )
 
         print(
-            "[WARNING] 正式实验必须建立独立验证集。"
+            "[WARNING] 正式实验必须建立独立验证集，"
+            "否则存在测试集泄漏。"
         )
 
+    # ========================================================
+    # 保存目录
+    # ========================================================
     save_dir = Path(
         cfg[
             "SAVE_DIR"
@@ -1878,12 +2164,12 @@ def main():
 
     best_path = (
         save_dir
-        / "best.pth"
+        / "best_valid_score.pth"
     )
 
     fallback_path = (
         save_dir
-        / "fallback_f1.pth"
+        / "best_fallback_f1.pth"
     )
 
     last_path = (
@@ -1891,12 +2177,15 @@ def main():
         / "last.pth"
     )
 
+    # ========================================================
+    # Dataset
+    # ========================================================
     train_set = TokenDataset(
         train_csv,
         cfg,
     )
 
-    validation_set = TokenDataset(
+    selection_set = TokenDataset(
         selection_csv,
         cfg,
     )
@@ -1906,27 +2195,33 @@ def main():
         cfg,
     )
 
+    # ========================================================
+    # DataLoader
+    # ========================================================
     train_loader = make_loader(
         train_set,
         cfg,
         device,
-        shuffle=True,
+        True,
     )
 
-    validation_loader = make_loader(
-        validation_set,
+    selection_loader = make_loader(
+        selection_set,
         cfg,
         device,
-        shuffle=False,
+        False,
     )
 
     test_loader = make_loader(
         test_set,
         cfg,
         device,
-        shuffle=False,
+        False,
     )
 
+    # ========================================================
+    # 模型
+    # ========================================================
     model = DirectFourClassModel(
         cfg
     ).to(
@@ -1934,93 +2229,67 @@ def main():
     )
 
     print(
-        "[INIT] 不加载二分类 checkpoint，"
-        "不冻结 Backbone，"
-        "直接训练四分类。"
+        "[INIT] 从头训练直接四分类模型；"
+        "不加载二分类 checkpoint；"
+        "不冻结 Backbone。"
     )
 
-    with torch.no_grad():
-
-        x, _ = next(
-            iter(
-                train_loader
-            )
-        )
-
-        test_logits = model(
-            x[
-                :1
-            ].to(
-                device
-            )
-        )
-
-        print(
-            "[Shape] logits:",
-            tuple(
-                test_logits.shape
-            ),
-        )
-
-        if tuple(
-            test_logits.shape
-        ) != (
-            1,
-            4,
-        ):
-
-            raise RuntimeError(
-                "Four-class logits shape error"
-            )
-
-    four_class_weights = build_weights(
-        train_set.class_counts,
-
-        cfg[
-            "FOUR_WEIGHT_POWER"
-        ],
-
-        cfg[
-            "FOUR_WEIGHT_MAX"
-        ],
-
-        abnormal_only=False,
-    ).to(
-        device
+    shape_test(
+        train_loader,
+        model,
+        device,
     )
 
-    subtype_weights = build_weights(
-        train_set.class_counts,
+    # ========================================================
+    # 类别权重
+    # ========================================================
+    four_weights = (
+        build_four_weights(
+            train_set.class_counts,
+            cfg,
+        )
+        .to(
+            device
+        )
+    )
 
-        cfg[
-            "SUBTYPE_WEIGHT_POWER"
-        ],
-
-        cfg[
-            "SUBTYPE_WEIGHT_MAX"
-        ],
-
-        abnormal_only=True,
-    ).to(
-        device
+    subtype_weights = (
+        build_subtype_weights(
+            train_set.class_counts,
+            cfg,
+        )
+        .to(
+            device
+        )
     )
 
     print(
         "[Loss] four weights:",
-        four_class_weights
-        .detach()
-        .cpu()
-        .tolist(),
+
+        np.round(
+            four_weights
+            .detach()
+            .cpu()
+            .numpy(),
+            6,
+        ).tolist(),
     )
 
     print(
         "[Loss] subtype weights:",
-        subtype_weights
-        .detach()
-        .cpu()
-        .tolist(),
+
+        np.round(
+            subtype_weights
+            .detach()
+            .cpu()
+            .numpy(),
+            6,
+        ).tolist(),
     )
 
+    # ========================================================
+    # Optimizer
+    # ========================================================
     optimizer = torch.optim.AdamW(
         [
             {
@@ -2029,11 +2298,9 @@ def main():
                     .parameters()
                 ),
 
-                "lr": (
-                    cfg[
-                        "BACKBONE_LR"
-                    ]
-                ),
+                "lr": cfg[
+                    "BACKBONE_LR"
+                ],
             },
 
             {
@@ -2042,19 +2309,15 @@ def main():
                     .parameters()
                 ),
 
-                "lr": (
-                    cfg[
-                        "HEAD_LR"
-                    ]
-                ),
+                "lr": cfg[
+                    "HEAD_LR"
+                ],
             },
         ],
 
-        weight_decay=(
-            cfg[
-                "WEIGHT_DECAY"
-            ]
-        ),
+        weight_decay=cfg[
+            "WEIGHT_DECAY"
+        ],
     )
 
     use_amp = bool(
@@ -2070,6 +2333,9 @@ def main():
         use_amp
     )
 
+    # ========================================================
+    # 模型选择状态
+    # ========================================================
     best_score = float(
         "-inf"
     )
@@ -2078,12 +2344,18 @@ def main():
         "-inf"
     )
 
+    best_epoch = -1
+
     fallback_f1 = float(
         "-inf"
     )
 
-    best_epoch = -1
+    fallback_score = float(
+        "-inf"
+    )
+
     bad_epochs = 0
+
     has_valid_model = False
 
     print()
@@ -2094,13 +2366,16 @@ def main():
 
     print(
         "DIRECT FOUR-CLASS "
-        "CONSISTENT TRAINING"
+        "CALIBRATED TRAINING"
     )
 
     print(
         "=" * 90
     )
 
+    # ========================================================
+    # 训练循环
+    # ========================================================
     for epoch in range(
         1,
         cfg[
@@ -2111,7 +2386,7 @@ def main():
 
         start_time = time.time()
 
-        current_lrs = set_lrs(
+        current_lrs = set_epoch_lrs(
             optimizer,
 
             [
@@ -2145,50 +2420,92 @@ def main():
             ],
         )
 
-        train_result = train_epoch(
+        # ----------------------------------------------------
+        # 训练
+        # ----------------------------------------------------
+        train_result = train_one_epoch(
             train_loader,
             model,
             optimizer,
             device,
             scaler,
             use_amp,
-            four_class_weights,
+            four_weights,
             subtype_weights,
             cfg,
         )
 
-        validation_result = (
-            evaluate_with_search(
-                validation_loader,
-                model,
-                device,
-                four_class_weights,
-                subtype_weights,
-                cfg,
-            )
+        # ----------------------------------------------------
+        # 验证并搜索校准参数
+        # ----------------------------------------------------
+        validation_result = evaluate_search(
+            selection_loader,
+            model,
+            device,
+            four_weights,
+            subtype_weights,
+            train_set.class_counts,
+            cfg,
         )
 
+        # ----------------------------------------------------
+        # 永远保存最后一轮
+        # ----------------------------------------------------
         save_checkpoint(
             last_path,
             epoch,
             model,
             optimizer,
             validation_result,
+            four_weights,
+            subtype_weights,
             cfg,
         )
 
-        if (
-            validation_result[
-                "MACRO_F1"
-            ]
+        current_score = validation_result[
+            "FOUR_SCORE"
+        ]
+
+        current_f1 = validation_result[
+            "MACRO_F1"
+        ]
+
+        # ----------------------------------------------------
+        # 保存 Macro-F1 最佳备用模型
+        # ----------------------------------------------------
+        fallback_improved = (
+            current_f1
             >
             fallback_f1
-        ):
+            + 1e-12
+
+            or
+
+            (
+                abs(
+                    current_f1
+                    -
+                    fallback_f1
+                )
+                <= 1e-12
+
+                and
+
+                current_score
+                >
+                fallback_score
+                + 1e-12
+            )
+        )
+
+        if fallback_improved:
 
             fallback_f1 = (
-                validation_result[
-                    "MACRO_F1"
-                ]
+                current_f1
+            )
+
+            fallback_score = (
+                current_score
             )
 
             save_checkpoint(
@@ -2197,57 +2514,59 @@ def main():
                 model,
                 optimizer,
                 validation_result,
+                four_weights,
+                subtype_weights,
                 cfg,
             )
 
+        # ----------------------------------------------------
+        # 主最佳模型
+        # ----------------------------------------------------
         valid_candidate = bool(
             validation_result[
-                "VALID_BIAS"
+                "VALID_CALIBRATION"
             ]
         )
 
-        improved = (
+        main_improved = (
             valid_candidate
+
             and
+
             (
-                validation_result[
-                    "FOUR_SCORE"
-                ]
+                current_score
                 >
                 best_score
+                + 1e-12
 
                 or
 
                 (
-                    validation_result[
-                        "FOUR_SCORE"
-                    ]
-                    ==
-                    best_score
+                    abs(
+                        current_score
+                        -
+                        best_score
+                    )
+                    <= 1e-12
 
                     and
 
-                    validation_result[
-                        "MACRO_F1"
-                    ]
+                    current_f1
                     >
                     best_f1
+                    + 1e-12
                 )
             )
         )
 
-        if improved:
+        if main_improved:
 
             best_score = (
-                validation_result[
-                    "FOUR_SCORE"
-                ]
+                current_score
             )
 
             best_f1 = (
-                validation_result[
-                    "MACRO_F1"
-                ]
+                current_f1
             )
 
             best_epoch = (
@@ -2255,7 +2574,10 @@ def main():
             )
 
             bad_epochs = 0
-            has_valid_model = True
+
+            has_valid_model = (
+                True
+            )
 
             marker = (
                 "BEST"
@@ -2267,6 +2589,8 @@ def main():
                 model,
                 optimizer,
                 validation_result,
+                four_weights,
+                subtype_weights,
                 cfg,
             )
 
@@ -2282,12 +2606,21 @@ def main():
                 cfg[
                     "MIN_EPOCHS"
                 ]
+
                 and
+
                 has_valid_model
             ):
-
                 bad_epochs += 1
 
+        elapsed = (
+            time.time()
+            - start_time
+        )
+
+        # ----------------------------------------------------
+        # 日志
+        # ----------------------------------------------------
         print(
             f"[{marker}] "
             f"Epoch "
@@ -2321,6 +2654,9 @@ def main():
             f"Bias "
             f"{validation_result['ABNORMAL_BIAS']:+.2f} | "
 
+            f"Tau "
+            f"{validation_result['TAU']:.2f} | "
+
             f"Valid "
             f"{valid_candidate} | "
 
@@ -2332,43 +2668,57 @@ def main():
             f"{current_lrs[0]:.8f}/"
             f"{current_lrs[1]:.8f} | "
 
-            f"{time.time() - start_time:.1f}s"
+            f"{elapsed:.1f}s"
         )
 
         print(
-            "    Recall="
+            "    Recall[0,1,2,3]="
             f"{np.round(validation_result['RECALL'], 3).tolist()} | "
 
             f"PredCount="
             f"{validation_result['PRED_COUNTS'].tolist()}"
         )
 
-        if (
+        # ----------------------------------------------------
+        # Early Stop
+        # ----------------------------------------------------
+        should_early_stop = (
             epoch
             >=
             cfg[
                 "MIN_EPOCHS"
             ]
+
             and
+
             has_valid_model
+
             and
+
             bad_epochs
             >=
             cfg[
                 "PATIENCE"
             ]
-        ):
+        )
+
+        if should_early_stop:
 
             print(
                 "[Early Stop] "
-                f"Best epoch="
+                f"Epoch="
+                f"{epoch}, "
+                f"Best Epoch="
                 f"{best_epoch}, "
-                f"score="
+                f"Best Score="
                 f"{best_score:.4f}"
             )
 
             break
 
+    # ========================================================
+    # 选择最终模型
+    # ========================================================
     if best_path.exists():
 
         selected_path = (
@@ -2376,8 +2726,8 @@ def main():
         )
 
         print(
-            "[Checkpoint] 使用有效的 "
-            "Score 最佳模型。"
+            "[Checkpoint] 使用满足全部约束的"
+            "最佳 Score 模型。"
         )
 
     elif fallback_path.exists():
@@ -2387,8 +2737,8 @@ def main():
         )
 
         print(
-            "[Checkpoint] 使用 Macro-F1 "
-            "最佳备用模型。"
+            "[Checkpoint] 没有满足全部约束的模型，"
+            "使用 Macro-F1 最佳模型。"
         )
 
     else:
@@ -2412,90 +2762,63 @@ def main():
         ]
     )
 
-    test_result = evaluate_fixed_bias(
+    # ========================================================
+    # 最终测试
+    # ========================================================
+    final_result = evaluate_fixed(
         test_loader,
         model,
         device,
-        four_class_weights,
+        four_weights,
         subtype_weights,
-        cfg,
-
+        train_set.class_counts,
         checkpoint[
             "abnormal_bias"
         ],
+        checkpoint[
+            "tau"
+        ],
+        cfg,
+    )
+
+    print(
+        "[Training Completed] "
+        f"Selected Epoch="
+        f"{checkpoint['epoch']}, "
+        f"Validation Score="
+        f"{checkpoint['four_score']:.4f}, "
+        f"SP="
+        f"{checkpoint['four_sp']:.4f}, "
+        f"SE="
+        f"{checkpoint['four_se']:.4f}, "
+        f"F1="
+        f"{checkpoint['macro_f1']:.4f}"
+    )
+
+    print_final(
+        final_result
     )
 
     print()
 
     print(
-        "=" * 80
-    )
-
-    print(
-        "[FINAL]"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        f"Bias="
-        f"{test_result['ABNORMAL_BIAS']:+.2f}"
-    )
-
-    print(
-        f"Score="
-        f"{test_result['FOUR_SCORE']:.4f}"
-    )
-
-    print(
-        f"SP="
-        f"{test_result['FOUR_SP']:.4f}"
-    )
-
-    print(
-        f"SE="
-        f"{test_result['FOUR_SE']:.4f}"
-    )
-
-    print(
-        f"Accuracy="
-        f"{test_result['ACC']:.4f}"
-    )
-
-    print(
-        f"Macro-F1="
-        f"{test_result['MACRO_F1']:.4f}"
-    )
-
-    print(
-        "Recall=",
-        np.round(
-            test_result[
-                "RECALL"
-            ],
-            4,
-        ).tolist(),
-    )
-
-    print(
-        "PredCount=",
-        test_result[
-            "PRED_COUNTS"
-        ].tolist(),
-    )
-
-    print(
-        "CM=\n",
-        test_result[
-            "FOUR_CM"
-        ],
-    )
-
-    print(
         "Selected checkpoint:",
         selected_path,
+    )
+
+    print(
+        "Best valid checkpoint:",
+        best_path,
+    )
+
+    print(
+        "Fallback checkpoint:",
+        fallback_path,
+    )
+
+    print(
+        "Last checkpoint:",
+        last_path,
     )
 
 
