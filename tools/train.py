@@ -28,7 +28,7 @@ from torch.utils.data import (
 
 
 # ============================================================
-# Project Import
+# 1. Project Import
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,11 +45,11 @@ from mymodels.model import (
 
 
 # ============================================================
-# Configuration
+# 2. Configuration
 # ============================================================
 CONFIG: Dict[str, object] = {
     # --------------------------------------------------------
-    # 数据目录
+    # 数据路径
     # --------------------------------------------------------
     "ROOT": (
         "/data/dingcong/hybrid/"
@@ -57,11 +57,11 @@ CONFIG: Dict[str, object] = {
     ),
 
     # --------------------------------------------------------
-    # 保存目录
+    # 保存路径
     # --------------------------------------------------------
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_d3_hierarchical_multitask_seed42"
+        "checkpoints_d4_dynamic_hierarchical_seed42"
     ),
 
     # --------------------------------------------------------
@@ -80,13 +80,13 @@ CONFIG: Dict[str, object] = {
     "REQUIRE_MAMBA": True,
 
     # --------------------------------------------------------
-    # Fbank尺寸
+    # Fbank输入
     # --------------------------------------------------------
     "FBANK_FRAMES": 798,
     "FBANK_MELS": 128,
 
     # --------------------------------------------------------
-    # 模型结构
+    # 模型参数
     # --------------------------------------------------------
     "STEM_DIM": 64,
     "D_MODEL": 256,
@@ -106,38 +106,38 @@ CONFIG: Dict[str, object] = {
     "DROPOUT": 0.15,
     "HEAD_DROPOUT": 0.20,
 
-    # --------------------------------------------------------
-    # 多任务损失
-    #
-    # Total Loss =
-    # 1.0 * Four Loss
-    # + 0.5 * Binary Loss
-    # + 0.5 * Abnormal Loss
-    # --------------------------------------------------------
-    "FOUR_LOSS_WEIGHT": 1.0,
-    "BINARY_LOSS_WEIGHT": 0.5,
-    "ABNORMAL_LOSS_WEIGHT": 0.5,
+    # Binary residual logits缩放系数
+    "BINARY_RESIDUAL_SCALE": 0.50,
 
     # --------------------------------------------------------
-    # 推理融合
+    # 多任务损失权重
     #
-    # Final Probability =
-    # 0.5 * Four-class Probability
-    # + 0.5 * Hierarchical Probability
+    # Total Loss =
+    # 1.00 × Four Loss
+    # + 0.25 × Binary Loss
+    # + 0.75 × Abnormal Loss
     # --------------------------------------------------------
-    "FOUR_PROBABILITY_WEIGHT": 0.5,
+    "FOUR_LOSS_WEIGHT": 1.00,
+    "BINARY_LOSS_WEIGHT": 0.25,
+    "ABNORMAL_LOSS_WEIGHT": 0.75,
 
     # --------------------------------------------------------
     # 类别权重
     #
-    # 第一轮层级实验暂时关闭类别权重
+    # 四分类头不加权
+    # 二分类头不加权
+    # 异常三分类头使用轻度手动权重
     # --------------------------------------------------------
     "USE_FOUR_CLASS_WEIGHTS": False,
     "USE_BINARY_CLASS_WEIGHTS": False,
-    "USE_ABNORMAL_CLASS_WEIGHTS": False,
+    "USE_ABNORMAL_CLASS_WEIGHTS": True,
 
-    "CLASS_WEIGHT_POWER": 0.25,
-    "CLASS_WEIGHT_MAX": 1.50,
+    # Crackle / Wheeze / Both
+    "ABNORMAL_MANUAL_WEIGHTS": [
+        1.00,
+        1.10,
+        1.35,
+    ],
 
     # --------------------------------------------------------
     # Label Smoothing
@@ -147,12 +147,28 @@ CONFIG: Dict[str, object] = {
     "ABNORMAL_LABEL_SMOOTHING": 0.0,
 
     # --------------------------------------------------------
+    # 动态融合
+    #
+    # Binary不确定时：
+    # hierarchical weight接近0.15
+    #
+    # Binary确定时：
+    # hierarchical weight最高0.60
+    # --------------------------------------------------------
+    "MIN_HIERARCHICAL_WEIGHT": 0.15,
+    "MAX_HIERARCHICAL_WEIGHT": 0.60,
+
+    # --------------------------------------------------------
     # SpecAugment
     # --------------------------------------------------------
     "USE_SPECAUGMENT": True,
 
     "TIME_MASK_MAX": 80,
     "FREQ_MASK_MAX": 16,
+
+    # 每个样本分别使用一个时间遮挡和一个频率遮挡
+    "NUM_TIME_MASKS": 1,
+    "NUM_FREQ_MASKS": 1,
 
     # --------------------------------------------------------
     # 学习率
@@ -178,7 +194,7 @@ CONFIG: Dict[str, object] = {
 
 
 # ============================================================
-# Random Seed
+# 3. Random Seed
 # ============================================================
 def set_seed(
     seed: int,
@@ -205,7 +221,7 @@ def set_seed(
 
 
 # ============================================================
-# AMP GradScaler
+# 4. AMP GradScaler
 # ============================================================
 def make_scaler(
     enabled: bool,
@@ -225,18 +241,18 @@ def make_scaler(
 
 
 # ============================================================
-# Warmup + Cosine Learning Rate
+# 5. Warmup + Cosine Learning Rate
 # ============================================================
 def set_epoch_lrs(
     optimizer: torch.optim.Optimizer,
     base_lrs,
-    min_lrs,
+    minimum_lrs,
     epoch: int,
     total_epochs: int,
     warmup_epochs: int,
 ):
     if epoch <= warmup_epochs:
-        warmup_scale = (
+        warmup_ratio = (
             0.20
             + 0.80
             * epoch
@@ -247,7 +263,7 @@ def set_epoch_lrs(
         )
 
         current_lrs = [
-            base_lr * warmup_scale
+            base_lr * warmup_ratio
             for base_lr in base_lrs
         ]
 
@@ -274,16 +290,16 @@ def set_epoch_lrs(
         )
 
         current_lrs = [
-            min_lr
+            minimum_lr
             + (
                 base_lr
-                - min_lr
+                - minimum_lr
             )
             * cosine_ratio
-            for base_lr, min_lr
+            for base_lr, minimum_lr
             in zip(
                 base_lrs,
-                min_lrs,
+                minimum_lrs,
             )
         ]
 
@@ -299,12 +315,14 @@ def set_epoch_lrs(
 
 
 # ============================================================
-# SpecAugment
+# 6. SpecAugment
 # ============================================================
 def apply_specaugment(
     fbank: torch.Tensor,
     time_mask_max: int,
     frequency_mask_max: int,
+    num_time_masks: int = 1,
+    num_frequency_masks: int = 1,
 ) -> torch.Tensor:
     """
     输入：
@@ -313,6 +331,12 @@ def apply_specaugment(
     输出：
         [T, F]
     """
+
+    if fbank.ndim != 2:
+        raise ValueError(
+            "SpecAugment输入必须为[T,F]，"
+            f"当前为{tuple(fbank.shape)}。"
+        )
 
     x = fbank.clone()
 
@@ -327,9 +351,17 @@ def apply_specaugment(
     mask_value = x.mean()
 
     # --------------------------------------------------------
-    # Time Mask
+    # Time Masks
     # --------------------------------------------------------
-    if time_mask_max > 0:
+    for _ in range(
+        max(
+            num_time_masks,
+            0,
+        )
+    ):
+        if time_mask_max <= 0:
+            break
+
         time_width = random.randint(
             0,
             min(
@@ -352,9 +384,17 @@ def apply_specaugment(
             ] = mask_value
 
     # --------------------------------------------------------
-    # Frequency Mask
+    # Frequency Masks
     # --------------------------------------------------------
-    if frequency_mask_max > 0:
+    for _ in range(
+        max(
+            num_frequency_masks,
+            0,
+        )
+    ):
+        if frequency_mask_max <= 0:
+            break
+
         frequency_width = random.randint(
             0,
             min(
@@ -380,7 +420,7 @@ def apply_specaugment(
 
 
 # ============================================================
-# Fbank Dataset
+# 7. Fbank Dataset
 # ============================================================
 class FbankDataset(Dataset):
     """
@@ -396,7 +436,7 @@ class FbankDataset(Dataset):
     返回：
 
         x: [1, 798, 128]
-        y: Long Tensor
+        y: Long Tensor标量
     """
 
     def __init__(
@@ -589,15 +629,29 @@ class FbankDataset(Dataset):
             )
         ):
             x = apply_specaugment(
-                x,
+                fbank=x,
+
                 time_mask_max=int(
                     self.cfg[
                         "TIME_MASK_MAX"
                     ]
                 ),
+
                 frequency_mask_max=int(
                     self.cfg[
                         "FREQ_MASK_MAX"
+                    ]
+                ),
+
+                num_time_masks=int(
+                    self.cfg[
+                        "NUM_TIME_MASKS"
+                    ]
+                ),
+
+                num_frequency_masks=int(
+                    self.cfg[
+                        "NUM_FREQ_MASKS"
                     ]
                 ),
             )
@@ -620,7 +674,7 @@ class FbankDataset(Dataset):
 
 
 # ============================================================
-# DataLoader
+# 8. DataLoader
 # ============================================================
 def make_loader(
     dataset,
@@ -670,145 +724,169 @@ def make_loader(
 
 
 # ============================================================
-# Class Weight
+# 9. Loss Weights
 # ============================================================
-def make_class_weight(
-    counts,
-    use_weight: bool,
-    power: float,
-    maximum: float,
-    device,
-    name: str,
-) -> Optional[torch.Tensor]:
-    if not use_weight:
-        print(
-            f"[Loss] {name}不使用类别权重。",
-            flush=True,
-        )
-
-        return None
-
-    counts = np.asarray(
-        counts,
-        dtype=np.float64,
-    )
-
-    counts = np.maximum(
-        counts,
-        1.0,
-    )
-
-    weights = (
-        counts.max()
-        / counts
-    ) ** power
-
-    weights = (
-        weights
-        / weights.mean()
-    )
-
-    weights = np.minimum(
-        weights,
-        maximum,
-    )
-
-    weight_tensor = torch.tensor(
-        weights,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    print(
-        f"[Loss] {name}权重：",
-        np.round(
-            weights,
-            6,
-        ).tolist(),
-        flush=True,
-    )
-
-    return weight_tensor
-
-
 def build_loss_weights(
     train_class_counts,
     cfg,
     device,
 ):
-    four_counts = np.asarray(
+    train_class_counts = np.asarray(
         train_class_counts,
         dtype=np.int64,
     )
 
-    binary_counts = np.asarray(
-        [
-            four_counts[0],
-            four_counts[
-                1:
-            ].sum(),
-        ],
-        dtype=np.int64,
-    )
+    if train_class_counts.shape != (
+        4,
+    ):
+        raise ValueError(
+            "train_class_counts必须包含4类。"
+        )
 
-    abnormal_counts = np.asarray(
-        [
-            four_counts[1],
-            four_counts[2],
-            four_counts[3],
-        ],
-        dtype=np.int64,
-    )
-
-    power = float(
+    # --------------------------------------------------------
+    # Four-class Weight
+    # --------------------------------------------------------
+    if bool(
         cfg[
-            "CLASS_WEIGHT_POWER"
+            "USE_FOUR_CLASS_WEIGHTS"
         ]
-    )
+    ):
+        four_counts = np.maximum(
+            train_class_counts.astype(
+                np.float64
+            ),
+            1.0,
+        )
 
-    maximum = float(
+        four_weights_np = (
+            four_counts.max()
+            / four_counts
+        ) ** 0.25
+
+        four_weights_np = (
+            four_weights_np
+            / four_weights_np.mean()
+        )
+
+        four_weight = torch.tensor(
+            four_weights_np,
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        four_weight = None
+
+    # --------------------------------------------------------
+    # Binary Weight
+    # --------------------------------------------------------
+    if bool(
         cfg[
-            "CLASS_WEIGHT_MAX"
+            "USE_BINARY_CLASS_WEIGHTS"
         ]
+    ):
+        binary_counts = np.asarray(
+            [
+                train_class_counts[0],
+                train_class_counts[
+                    1:
+                ].sum(),
+            ],
+            dtype=np.float64,
+        )
+
+        binary_counts = np.maximum(
+            binary_counts,
+            1.0,
+        )
+
+        binary_weights_np = (
+            binary_counts.max()
+            / binary_counts
+        ) ** 0.25
+
+        binary_weights_np = (
+            binary_weights_np
+            / binary_weights_np.mean()
+        )
+
+        binary_weight = torch.tensor(
+            binary_weights_np,
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        binary_weight = None
+
+    # --------------------------------------------------------
+    # Abnormal Weight
+    # Crackle / Wheeze / Both
+    # --------------------------------------------------------
+    if bool(
+        cfg[
+            "USE_ABNORMAL_CLASS_WEIGHTS"
+        ]
+    ):
+        abnormal_manual_weights = list(
+            cfg[
+                "ABNORMAL_MANUAL_WEIGHTS"
+            ]
+        )
+
+        if len(
+            abnormal_manual_weights
+        ) != 3:
+            raise ValueError(
+                "ABNORMAL_MANUAL_WEIGHTS必须包含3个值。"
+            )
+
+        abnormal_weight = torch.tensor(
+            abnormal_manual_weights,
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        abnormal_weight = None
+
+    print(
+        "[Loss] Four-class weight:",
+        (
+            None
+            if four_weight is None
+            else four_weight.detach()
+            .cpu()
+            .numpy()
+            .round(4)
+            .tolist()
+        ),
+        flush=True,
     )
 
-    four_weight = make_class_weight(
-        counts=four_counts,
-        use_weight=bool(
-            cfg[
-                "USE_FOUR_CLASS_WEIGHTS"
-            ]
+    print(
+        "[Loss] Binary weight:",
+        (
+            None
+            if binary_weight is None
+            else binary_weight.detach()
+            .cpu()
+            .numpy()
+            .round(4)
+            .tolist()
         ),
-        power=power,
-        maximum=maximum,
-        device=device,
-        name="Four-class",
+        flush=True,
     )
 
-    binary_weight = make_class_weight(
-        counts=binary_counts,
-        use_weight=bool(
-            cfg[
-                "USE_BINARY_CLASS_WEIGHTS"
-            ]
+    print(
+        "[Loss] Abnormal weight:",
+        (
+            None
+            if abnormal_weight is None
+            else abnormal_weight.detach()
+            .cpu()
+            .numpy()
+            .round(4)
+            .tolist()
         ),
-        power=power,
-        maximum=maximum,
-        device=device,
-        name="Binary",
-    )
-
-    abnormal_weight = make_class_weight(
-        counts=abnormal_counts,
-        use_weight=bool(
-            cfg[
-                "USE_ABNORMAL_CLASS_WEIGHTS"
-            ]
-        ),
-        power=power,
-        maximum=maximum,
-        device=device,
-        name="Abnormal",
+        flush=True,
     )
 
     return {
@@ -819,7 +897,7 @@ def build_loss_weights(
 
 
 # ============================================================
-# Multi-task Loss
+# 10. Multi-task Loss
 # ============================================================
 def calculate_multitask_loss(
     outputs,
@@ -827,6 +905,25 @@ def calculate_multitask_loss(
     loss_weights,
     cfg,
 ):
+    required_keys = {
+        "four_logits",
+        "binary_logits",
+        "abnormal_logits",
+    }
+
+    missing_keys = (
+        required_keys
+        - set(
+            outputs.keys()
+        )
+    )
+
+    if missing_keys:
+        raise KeyError(
+            f"模型输出缺少键："
+            f"{sorted(missing_keys)}"
+        )
+
     # --------------------------------------------------------
     # Four-class Loss
     #
@@ -840,9 +937,11 @@ def calculate_multitask_loss(
             "four_logits"
         ],
         labels,
+
         weight=loss_weights[
             "four"
         ],
+
         label_smoothing=float(
             cfg[
                 "FOUR_LABEL_SMOOTHING"
@@ -865,9 +964,11 @@ def calculate_multitask_loss(
             "binary_logits"
         ],
         binary_labels,
+
         weight=loss_weights[
             "binary"
         ],
+
         label_smoothing=float(
             cfg[
                 "BINARY_LABEL_SMOOTHING"
@@ -913,9 +1014,11 @@ def calculate_multitask_loss(
         abnormal_loss = F.cross_entropy(
             abnormal_logits,
             abnormal_labels,
+
             weight=loss_weights[
                 "abnormal"
             ],
+
             label_smoothing=float(
                 cfg[
                     "ABNORMAL_LABEL_SMOOTHING"
@@ -938,12 +1041,14 @@ def calculate_multitask_loss(
             ]
         )
         * four_loss
+
         + float(
             cfg[
                 "BINARY_LOSS_WEIGHT"
             ]
         )
         * binary_loss
+
         + float(
             cfg[
                 "ABNORMAL_LOSS_WEIGHT"
@@ -962,7 +1067,7 @@ def calculate_multitask_loss(
 
 
 # ============================================================
-# Train One Epoch
+# 11. Train One Epoch
 # ============================================================
 def train_one_epoch(
     loader,
@@ -992,15 +1097,6 @@ def train_one_epoch(
     accumulated_binary_loss = 0.0
     accumulated_abnormal_loss = 0.0
 
-    epoch_start_time = time.time()
-
-    trainable_parameters = [
-        parameter
-        for parameter
-        in model.parameters()
-        if parameter.requires_grad
-    ]
-
     accum_steps = int(
         cfg[
             "ACCUM_STEPS"
@@ -1012,6 +1108,15 @@ def train_one_epoch(
             "PRINT_INTERVAL"
         ]
     )
+
+    trainable_parameters = [
+        parameter
+        for parameter
+        in model.parameters()
+        if parameter.requires_grad
+    ]
+
+    epoch_start_time = time.time()
 
     print(
         f"[TRAIN] "
@@ -1037,6 +1142,27 @@ def train_one_epoch(
             non_blocking=True,
         )
 
+        completed_batches = (
+            batch_index + 1
+        )
+
+        # 最后一个不完整累积窗口的实际大小
+        accumulation_window_start = (
+            batch_index
+            // accum_steps
+        ) * accum_steps
+
+        accumulation_window_end = min(
+            accumulation_window_start
+            + accum_steps,
+            total_batches,
+        )
+
+        current_accumulation_size = (
+            accumulation_window_end
+            - accumulation_window_start
+        )
+
         with torch.autocast(
             device_type=device.type,
             enabled=use_amp,
@@ -1058,7 +1184,10 @@ def train_one_epoch(
 
             backward_loss = (
                 total_loss
-                / accum_steps
+                / max(
+                    current_accumulation_size,
+                    1,
+                )
             )
 
         scaler.scale(
@@ -1115,16 +1244,9 @@ def train_one_epoch(
                 * abnormal_count
             )
 
-        completed_batches = (
-            batch_index + 1
-        )
-
         should_update = (
             completed_batches
-            % accum_steps
-            == 0
-            or completed_batches
-            == total_batches
+            == accumulation_window_end
         )
 
         if should_update:
@@ -1198,69 +1320,80 @@ def train_one_epoch(
                 f"  Batch "
                 f"{completed_batches:04d}/"
                 f"{total_batches} | "
+
                 f"Total "
                 f"{loss_result['total_loss'].item():.4f} | "
+
                 f"Four "
                 f"{loss_result['four_loss'].item():.4f} | "
+
                 f"Bin "
                 f"{loss_result['binary_loss'].item():.4f} | "
+
                 f"Abn "
                 f"{loss_result['abnormal_loss'].item():.4f} | "
+
                 f"ETA "
                 f"{remaining_seconds / 60:.1f}min | "
+
                 f"GPU "
                 f"{allocated_memory:.2f}/"
                 f"{reserved_memory:.2f}GB",
                 flush=True,
             )
 
-    average_total_loss = (
-        accumulated_total_loss
-        / max(
-            total_samples,
-            1,
-        )
-    )
-
-    average_four_loss = (
-        accumulated_four_loss
-        / max(
-            total_samples,
-            1,
-        )
-    )
-
-    average_binary_loss = (
-        accumulated_binary_loss
-        / max(
-            total_samples,
-            1,
-        )
-    )
-
-    average_abnormal_loss = (
-        accumulated_abnormal_loss
-        / max(
-            total_abnormal_samples,
-            1,
-        )
-    )
-
     return {
-        "total_loss": average_total_loss,
-        "four_loss": average_four_loss,
-        "binary_loss": average_binary_loss,
-        "abnormal_loss": average_abnormal_loss,
+        "total_loss": (
+            accumulated_total_loss
+            / max(
+                total_samples,
+                1,
+            )
+        ),
+
+        "four_loss": (
+            accumulated_four_loss
+            / max(
+                total_samples,
+                1,
+            )
+        ),
+
+        "binary_loss": (
+            accumulated_binary_loss
+            / max(
+                total_samples,
+                1,
+            )
+        ),
+
+        "abnormal_loss": (
+            accumulated_abnormal_loss
+            / max(
+                total_abnormal_samples,
+                1,
+            )
+        ),
     }
 
 
 # ============================================================
-# ICBHI Metrics
+# 12. ICBHI Metrics
 # ============================================================
 def calculate_metrics(
     y_true,
     y_pred,
 ):
+    y_true = np.asarray(
+        y_true,
+        dtype=np.int64,
+    )
+
+    y_pred = np.asarray(
+        y_pred,
+        dtype=np.int64,
+    )
+
     confusion = confusion_matrix(
         y_true,
         y_pred,
@@ -1401,7 +1534,7 @@ def calculate_metrics(
 
 
 # ============================================================
-# Evaluation
+# 13. Evaluation
 # ============================================================
 @torch.no_grad()
 def evaluate(
@@ -1419,10 +1552,13 @@ def evaluate(
     all_four_predictions = []
     all_hierarchical_predictions = []
 
-    all_binary_head_predictions = []
+    all_binary_predictions = []
 
     all_abnormal_true = []
-    all_abnormal_head_predictions = []
+    all_abnormal_predictions = []
+
+    binary_confidence_values = []
+    hierarchical_weight_values = []
 
     for x, y in loader:
         x = x.to(
@@ -1443,15 +1579,22 @@ def evaluate(
                 x
             )
 
-            probabilities = (
-                model.build_probabilities(
-                    outputs,
-                    four_weight=float(
-                        cfg[
-                            "FOUR_PROBABILITY_WEIGHT"
-                        ]
-                    ),
-                )
+            probabilities = model.build_probabilities(
+                outputs=outputs,
+
+                four_weight=None,
+
+                minimum_hierarchical_weight=float(
+                    cfg[
+                        "MIN_HIERARCHICAL_WEIGHT"
+                    ]
+                ),
+
+                maximum_hierarchical_weight=float(
+                    cfg[
+                        "MAX_HIERARCHICAL_WEIGHT"
+                    ]
+                ),
             )
 
         final_predictions = torch.argmax(
@@ -1468,25 +1611,23 @@ def evaluate(
             dim=1,
         )
 
-        hierarchical_predictions = (
-            torch.argmax(
-                probabilities[
-                    "hierarchical_probability"
-                ],
-                dim=1,
-            )
-        )
-
-        binary_head_predictions = torch.argmax(
-            outputs[
-                "binary_logits"
+        hierarchical_predictions = torch.argmax(
+            probabilities[
+                "hierarchical_probability"
             ],
             dim=1,
         )
 
-        abnormal_head_predictions = torch.argmax(
-            outputs[
-                "abnormal_logits"
+        binary_predictions = torch.argmax(
+            probabilities[
+                "binary_probability"
+            ],
+            dim=1,
+        )
+
+        abnormal_predictions = torch.argmax(
+            probabilities[
+                "abnormal_probability"
             ],
             dim=1,
         )
@@ -1507,8 +1648,20 @@ def evaluate(
             hierarchical_predictions.cpu()
         )
 
-        all_binary_head_predictions.append(
-            binary_head_predictions.cpu()
+        all_binary_predictions.append(
+            binary_predictions.cpu()
+        )
+
+        binary_confidence_values.append(
+            probabilities[
+                "binary_confidence"
+            ].detach().cpu()
+        )
+
+        hierarchical_weight_values.append(
+            probabilities[
+                "hierarchical_weight"
+            ].detach().cpu()
         )
 
         abnormal_mask = (
@@ -1527,8 +1680,8 @@ def evaluate(
                 ).cpu()
             )
 
-            all_abnormal_head_predictions.append(
-                abnormal_head_predictions[
+            all_abnormal_predictions.append(
+                abnormal_predictions[
                     abnormal_mask
                 ].cpu()
             )
@@ -1549,8 +1702,8 @@ def evaluate(
         all_hierarchical_predictions
     ).numpy()
 
-    binary_head_pred = torch.cat(
-        all_binary_head_predictions
+    binary_pred = torch.cat(
+        all_binary_predictions
     ).numpy()
 
     binary_true = (
@@ -1559,9 +1712,17 @@ def evaluate(
         np.int64
     )
 
+    binary_confidence = torch.cat(
+        binary_confidence_values
+    ).numpy()
+
+    hierarchical_weights = torch.cat(
+        hierarchical_weight_values
+    ).numpy()
+
     binary_head_cm = confusion_matrix(
         binary_true,
-        binary_head_pred,
+        binary_pred,
         labels=[
             0,
             1,
@@ -1571,7 +1732,7 @@ def evaluate(
     binary_head_accuracy = (
         accuracy_score(
             binary_true,
-            binary_head_pred,
+            binary_pred,
         )
         * 100.0
     )
@@ -1583,13 +1744,13 @@ def evaluate(
             all_abnormal_true
         ).numpy()
 
-        abnormal_head_pred = torch.cat(
-            all_abnormal_head_predictions
+        abnormal_pred = torch.cat(
+            all_abnormal_predictions
         ).numpy()
 
         abnormal_head_cm = confusion_matrix(
             abnormal_true,
-            abnormal_head_pred,
+            abnormal_pred,
             labels=[
                 0,
                 1,
@@ -1600,9 +1761,21 @@ def evaluate(
         abnormal_head_accuracy = (
             accuracy_score(
                 abnormal_true,
-                abnormal_head_pred,
+                abnormal_pred,
             )
             * 100.0
+        )
+
+        abnormal_recalls = recall_score(
+            abnormal_true,
+            abnormal_pred,
+            labels=[
+                0,
+                1,
+                2,
+            ],
+            average=None,
+            zero_division=0,
         )
 
     else:
@@ -1615,6 +1788,11 @@ def evaluate(
         )
 
         abnormal_head_accuracy = 0.0
+
+        abnormal_recalls = np.zeros(
+            3,
+            dtype=np.float64,
+        )
 
     return {
         "final": calculate_metrics(
@@ -1632,32 +1810,61 @@ def evaluate(
             hierarchical_pred,
         ),
 
+        "binary_head_accuracy": float(
+            binary_head_accuracy
+        ),
+
         "binary_head_cm": (
             binary_head_cm
         ),
 
-        "binary_head_accuracy": float(
-            binary_head_accuracy
+        "abnormal_head_accuracy": float(
+            abnormal_head_accuracy
         ),
 
         "abnormal_head_cm": (
             abnormal_head_cm
         ),
 
-        "abnormal_head_accuracy": float(
-            abnormal_head_accuracy
+        "abnormal_head_recalls": (
+            abnormal_recalls
+        ),
+
+        "mean_binary_confidence": float(
+            binary_confidence.mean()
+        ),
+
+        "min_binary_confidence": float(
+            binary_confidence.min()
+        ),
+
+        "max_binary_confidence": float(
+            binary_confidence.max()
+        ),
+
+        "mean_hierarchical_weight": float(
+            hierarchical_weights.mean()
+        ),
+
+        "min_hierarchical_weight": float(
+            hierarchical_weights.min()
+        ),
+
+        "max_hierarchical_weight": float(
+            hierarchical_weights.max()
         ),
     }
 
 
 # ============================================================
-# Shape Test
+# 14. Shape Test
 # ============================================================
 @torch.no_grad()
 def shape_test(
     loader,
     model,
     device,
+    cfg,
 ) -> None:
     model.eval()
 
@@ -1694,11 +1901,22 @@ def shape_test(
         x
     )
 
-    probabilities = (
-        model.build_probabilities(
-            outputs,
-            four_weight=0.5,
-        )
+    probabilities = model.build_probabilities(
+        outputs=outputs,
+
+        four_weight=None,
+
+        minimum_hierarchical_weight=float(
+            cfg[
+                "MIN_HIERARCHICAL_WEIGHT"
+            ]
+        ),
+
+        maximum_hierarchical_weight=float(
+            cfg[
+                "MAX_HIERARCHICAL_WEIGHT"
+            ]
+        ),
     )
 
     print(
@@ -1762,6 +1980,24 @@ def shape_test(
     )
 
     print(
+        "[Shape Test] Four Binary Logits:",
+        tuple(
+            outputs[
+                "four_binary_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "[Shape Test] Binary Residual Logits:",
+        tuple(
+            outputs[
+                "binary_residual_logits"
+            ].shape
+        ),
+    )
+
+    print(
         "[Shape Test] Binary Logits:",
         tuple(
             outputs[
@@ -1786,6 +2022,13 @@ def shape_test(
                 "final_probability"
             ].shape
         ),
+    )
+
+    print(
+        "[Shape Test] Hierarchical Weight:",
+        probabilities[
+            "hierarchical_weight"
+        ].detach().cpu().flatten().tolist(),
     )
 
     print(
@@ -1881,6 +2124,26 @@ def shape_test(
 
     assert tuple(
         outputs[
+            "four_binary_logits"
+        ].shape[
+            1:
+        ]
+    ) == (
+        2,
+    )
+
+    assert tuple(
+        outputs[
+            "binary_residual_logits"
+        ].shape[
+            1:
+        ]
+    ) == (
+        2,
+    )
+
+    assert tuple(
+        outputs[
             "binary_logits"
         ].shape[
             1:
@@ -1910,7 +2173,7 @@ def shape_test(
     )
 
     print(
-        "[PASS] 层级多任务模型连接成功。",
+        "[PASS] D4动态层级模型连接成功。",
         flush=True,
     )
 
@@ -1918,14 +2181,13 @@ def shape_test(
 
 
 # ============================================================
-# Print Metrics
+# 15. Print Metrics
 # ============================================================
 def print_metric_block(
     title: str,
     result,
 ) -> None:
     print()
-
     print(
         "-" * 80
     )
@@ -2010,7 +2272,6 @@ def print_final(
     evaluation_result,
 ) -> None:
     print()
-
     print(
         "=" * 80
     )
@@ -2024,7 +2285,7 @@ def print_final(
     )
 
     print_metric_block(
-        "FINAL FUSED PREDICTION",
+        "FINAL DYNAMIC FUSED PREDICTION",
         evaluation_result[
             "final"
         ],
@@ -2045,7 +2306,6 @@ def print_final(
     )
 
     print()
-
     print(
         "-" * 80
     )
@@ -2081,6 +2341,17 @@ def print_final(
     )
 
     print(
+        "Abnormal Head Recall "
+        "[Crackle, Wheeze, Both]:",
+        np.round(
+            evaluation_result[
+                "abnormal_head_recalls"
+            ],
+            4,
+        ).tolist(),
+    )
+
+    print(
         "Abnormal Head Confusion Matrix "
         "[Crackle, Wheeze, Both]:"
     )
@@ -2091,9 +2362,35 @@ def print_final(
         ]
     )
 
+    print()
+
+    print(
+        f"Mean Binary Confidence: "
+        f"{evaluation_result['mean_binary_confidence']:.4f}"
+    )
+
+    print(
+        f"Binary Confidence Range: "
+        f"{evaluation_result['min_binary_confidence']:.4f}"
+        f" - "
+        f"{evaluation_result['max_binary_confidence']:.4f}"
+    )
+
+    print(
+        f"Mean Hierarchical Weight: "
+        f"{evaluation_result['mean_hierarchical_weight']:.4f}"
+    )
+
+    print(
+        f"Hierarchical Weight Range: "
+        f"{evaluation_result['min_hierarchical_weight']:.4f}"
+        f" - "
+        f"{evaluation_result['max_hierarchical_weight']:.4f}"
+    )
+
 
 # ============================================================
-# Main
+# 16. Main
 # ============================================================
 def main() -> None:
     cfg = CONFIG
@@ -2197,12 +2494,13 @@ def main() -> None:
     )
 
     print(
-        "[Experiment] D3："
+        "[Experiment] D4："
         "DTF Stem"
         " + Progressive Downsampling"
         " + Time-Mamba"
         " + Frequency-Attention"
-        " + Hierarchical Multi-task Heads"
+        " + Consistent Binary Residual"
+        " + Dynamic Hierarchical Fusion"
     )
 
     print(
@@ -2213,10 +2511,17 @@ def main() -> None:
     )
 
     print(
-        "[Probability Fusion] "
-        f"Four={cfg['FOUR_PROBABILITY_WEIGHT']} | "
-        f"Hierarchical="
-        f"{1.0 - float(cfg['FOUR_PROBABILITY_WEIGHT'])}"
+        "[Dynamic Fusion] "
+        f"Hierarchical Weight="
+        f"{cfg['MIN_HIERARCHICAL_WEIGHT']}"
+        f"~"
+        f"{cfg['MAX_HIERARCHICAL_WEIGHT']}"
+    )
+
+    print(
+        "[Binary Residual] "
+        f"Scale="
+        f"{cfg['BINARY_RESIDUAL_SCALE']}"
     )
 
     save_dir = Path(
@@ -2353,6 +2658,12 @@ def main() -> None:
                 "EXPAND"
             ]
         ),
+
+        binary_residual_scale=float(
+            cfg[
+                "BINARY_RESIDUAL_SCALE"
+            ]
+        ),
     ).to(
         device
     )
@@ -2361,6 +2672,7 @@ def main() -> None:
         train_loader,
         model,
         device,
+        cfg,
     )
 
     total_parameters = sum(
@@ -2514,13 +2826,12 @@ def main() -> None:
     history = []
 
     print()
-
     print(
         "=" * 100
     )
 
     print(
-        "D3: HIERARCHICAL MULTI-TASK TRAINING"
+        "D4: CONSISTENT DYNAMIC HIERARCHICAL TRAINING"
     )
 
     print(
@@ -2545,7 +2856,7 @@ def main() -> None:
 
             base_lrs=base_learning_rates,
 
-            min_lrs=minimum_learning_rates,
+            minimum_lrs=minimum_learning_rates,
 
             epoch=epoch,
 
@@ -2677,20 +2988,27 @@ def main() -> None:
             f"Epoch "
             f"{epoch:03d}/"
             f"{cfg['EPOCHS']} | "
+
             f"Total "
             f"{train_result['total_loss']:.4f} | "
+
             f"Four "
             f"{train_result['four_loss']:.4f} | "
+
             f"Bin "
             f"{train_result['binary_loss']:.4f} | "
+
             f"Abn "
             f"{train_result['abnormal_loss']:.4f} | "
+
             f"Alpha "
             f"{stem_alpha:.4f} | "
+
             f"LR "
             f"{current_learning_rates[0]:.8f}/"
             f"{current_learning_rates[1]:.8f}/"
             f"{current_learning_rates[2]:.8f} | "
+
             f"{elapsed_time:.1f}s",
             flush=True,
         )
@@ -2699,11 +3017,15 @@ def main() -> None:
     # Final Official Test
     # --------------------------------------------------------
     evaluation_result = evaluate(
-        test_loader,
-        model,
-        device,
-        cfg,
-        use_amp,
+        loader=test_loader,
+
+        model=model,
+
+        device=device,
+
+        cfg=cfg,
+
+        use_amp=use_amp,
     )
 
     print_final(
@@ -2718,11 +3040,9 @@ def main() -> None:
         "four_only"
     ]
 
-    hierarchical_only_result = (
-        evaluation_result[
-            "hierarchical_only"
-        ]
-    )
+    hierarchical_only_result = evaluation_result[
+        "hierarchical_only"
+    ]
 
     torch.save(
         {
@@ -2745,7 +3065,7 @@ def main() -> None:
             ),
 
             # ------------------------------------------------
-            # Final Fused Prediction
+            # Final Dynamic Fusion
             # ------------------------------------------------
             "final_score": final_result[
                 "score"
@@ -2784,7 +3104,7 @@ def main() -> None:
             ].tolist(),
 
             # ------------------------------------------------
-            # Four-class Head Only
+            # Four-class Only
             # ------------------------------------------------
             "four_only_score": four_only_result[
                 "score"
@@ -2819,7 +3139,7 @@ def main() -> None:
             ].tolist(),
 
             # ------------------------------------------------
-            # Hierarchical Head Only
+            # Hierarchical Only
             # ------------------------------------------------
             "hierarchical_only_score": (
                 hierarchical_only_result[
@@ -2894,6 +3214,51 @@ def main() -> None:
                 evaluation_result[
                     "abnormal_head_cm"
                 ].tolist()
+            ),
+
+            "abnormal_head_recalls": (
+                evaluation_result[
+                    "abnormal_head_recalls"
+                ].tolist()
+            ),
+
+            # ------------------------------------------------
+            # Dynamic Fusion Statistics
+            # ------------------------------------------------
+            "mean_binary_confidence": (
+                evaluation_result[
+                    "mean_binary_confidence"
+                ]
+            ),
+
+            "min_binary_confidence": (
+                evaluation_result[
+                    "min_binary_confidence"
+                ]
+            ),
+
+            "max_binary_confidence": (
+                evaluation_result[
+                    "max_binary_confidence"
+                ]
+            ),
+
+            "mean_hierarchical_weight": (
+                evaluation_result[
+                    "mean_hierarchical_weight"
+                ]
+            ),
+
+            "min_hierarchical_weight": (
+                evaluation_result[
+                    "min_hierarchical_weight"
+                ]
+            ),
+
+            "max_hierarchical_weight": (
+                evaluation_result[
+                    "max_hierarchical_weight"
+                ]
             ),
         },
         final_checkpoint_path,

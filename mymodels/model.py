@@ -56,9 +56,7 @@ class FeedForward(nn.Module):
 # ============================================================
 class SamePadConv2d(nn.Module):
     """
-    动态SAME Padding二维卷积。
-
-    输入张量格式：
+    输入：
         [B, C, T, F]
     """
 
@@ -194,16 +192,14 @@ class SamePadConv2d(nn.Module):
 # ============================================================
 class DTFStem(nn.Module):
     """
-    时频解耦卷积Stem。
-
     输入：
         [B, 1, 798, 128]
 
     时间分支：
-        kernel = (6, 3)
+        kernel=(6,3)
 
     频率分支：
-        kernel = (3, 6)
+        kernel=(3,6)
 
     输出：
         [B, 64, 399, 64]
@@ -353,10 +349,7 @@ class DTFStem(nn.Module):
 # ============================================================
 class ResidualConvBlock(nn.Module):
     """
-    输入输出尺寸保持不变：
-
-        [B, C, T, F]
-            ↓
+    输入输出：
         [B, C, T, F]
     """
 
@@ -430,8 +423,6 @@ class ResidualConvBlock(nn.Module):
 # ============================================================
 class ProgressiveDownsample(nn.Module):
     """
-    渐进式下采样。
-
     输入：
         [B, 64, 399, 64]
 
@@ -576,12 +567,7 @@ class ProgressiveDownsample(nn.Module):
 # ============================================================
 class TimeMambaBlock(nn.Module):
     """
-    每个频率位置沿时间轴执行Mamba。
-
-    输入：
-        [B * F, T, D]
-
-    输出：
+    输入输出：
         [B * F, T, D]
     """
 
@@ -610,7 +596,6 @@ class TimeMambaBlock(nn.Module):
             self.use_mamba = True
 
         else:
-            # 仅用于没有安装mamba_ssm时进行形状检查。
             self.sequence_model = nn.GRU(
                 input_size=dim,
                 hidden_size=dim // 2,
@@ -676,12 +661,7 @@ class TimeMambaBlock(nn.Module):
 # ============================================================
 class FrequencyAttentionBlock(nn.Module):
     """
-    每个时间位置沿频率轴执行多头注意力。
-
-    输入：
-        [B * T, F, D]
-
-    输出：
+    输入输出：
         [B * T, F, D]
     """
 
@@ -762,15 +742,13 @@ class FrequencyAttentionBlock(nn.Module):
 class TimeFrequencyEncoder(nn.Module):
     """
     输入：
-        [B, F*T, input_dim]
+        [B, 1600, 256]
 
-    当前：
-        F = 16
-        T = 100
-        F*T = 1600
+    网格：
+        [B, 16, 100, 256]
 
     输出：
-        [B, d_model]
+        [B, 256]
     """
 
     def __init__(
@@ -952,17 +930,16 @@ class TimeFrequencyEncoder(nn.Module):
 
         if input_dim != self.input_dim:
             raise ValueError(
-                "Token特征维度错误："
+                "Token维度错误："
                 f"当前={input_dim}，"
                 f"要求={self.input_dim}。"
             )
 
-        # [B,1600,256]
         x = self.input_projection(
             x
         )
 
-        # [B,1600,256] -> [B,16,100,256]
+        # [B,1600,D] -> [B,16,100,D]
         x = x.reshape(
             batch_size,
             self.freq_patches,
@@ -982,9 +959,7 @@ class TimeFrequencyEncoder(nn.Module):
 
         # ----------------------------------------------------
         # Time-Mamba
-        #
-        # [B,F,T,D]
-        #   -> [B*F,T,D]
+        # [B,F,T,D] -> [B*F,T,D]
         # ----------------------------------------------------
         for block in self.time_blocks:
             time_sequence = x.reshape(
@@ -1007,10 +982,7 @@ class TimeFrequencyEncoder(nn.Module):
 
         # ----------------------------------------------------
         # Frequency-Attention
-        #
-        # [B,F,T,D]
-        #   -> [B,T,F,D]
-        #   -> [B*T,F,D]
+        # [B,F,T,D] -> [B*T,F,D]
         # ----------------------------------------------------
         for block in self.frequency_blocks:
             frequency_sequence = x.permute(
@@ -1056,9 +1028,7 @@ class TimeFrequencyEncoder(nn.Module):
             self.d_model,
         )
 
-        # ----------------------------------------------------
         # Attention Pooling
-        # ----------------------------------------------------
         attention_logits = (
             self.pooling_score(
                 tokens
@@ -1076,17 +1046,12 @@ class TimeFrequencyEncoder(nn.Module):
             dim=1,
         )
 
-        # ----------------------------------------------------
         # Max Pooling
-        # ----------------------------------------------------
         max_feature = torch.amax(
             tokens,
             dim=1,
         )
 
-        # ----------------------------------------------------
-        # Pooling Fusion
-        # ----------------------------------------------------
         feature = torch.cat(
             [
                 attention_feature,
@@ -1114,7 +1079,7 @@ class DTFFrontend(nn.Module):
     输入：
         [B,1,798,128]
 
-    DTF Stem：
+    Stem：
         [B,64,399,64]
 
     Stage 1：
@@ -1203,7 +1168,6 @@ class DTFFrontend(nn.Module):
                 f"当前为{tuple(x.shape[-2:])}。"
             )
 
-        # [B,1,798,128] -> [B,64,399,64]
         stem_map = self.stem(
             x
         )
@@ -1238,7 +1202,7 @@ class DTFFrontend(nn.Module):
             raise RuntimeError(
                 "Patch Map尺寸错误："
                 f"当前={tuple(patch_map.shape)}，"
-                f"要求空间尺寸={expected_map_shape}。"
+                f"要求={expected_map_shape}。"
             )
 
         batch_size = (
@@ -1280,34 +1244,31 @@ class DTFFrontend(nn.Module):
 
 
 # ============================================================
-# Hierarchical Multi-task DTF Hybrid Model
+# D4 Hierarchical Multi-task Model
 # ============================================================
 class DTFHybridModel(nn.Module):
     """
-    共享主干：
-
+    主干：
         Fbank
-          ↓
-        DTF Stem
-          ↓
-        Progressive Downsampling
-          ↓
-        Time-Mamba
-          ↓
-        Frequency-Attention
-          ↓
-        Shared Feature [B,256]
+        -> DTF Stem
+        -> Progressive Downsampling
+        -> Time-Mamba
+        -> Frequency-Attention
+        -> Shared Feature
 
     分类头：
-
-        four_head：
+        Four Head：
             Normal / Crackle / Wheeze / Both
 
-        binary_head：
+        Binary Residual Head：
             Normal / Abnormal
 
-        abnormal_head：
+        Abnormal Head：
             Crackle / Wheeze / Both
+
+    Binary Logits：
+        Four-class聚合二分类Logits
+        + 0.5 × Binary Residual Logits
     """
 
     def __init__(
@@ -1325,6 +1286,7 @@ class DTFHybridModel(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        binary_residual_scale: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -1333,8 +1295,17 @@ class DTFHybridModel(nn.Module):
                 "当前层级模型只支持4分类。"
             )
 
+        if binary_residual_scale < 0.0:
+            raise ValueError(
+                "binary_residual_scale不能小于0。"
+            )
+
         self.num_classes = num_classes
         self.d_model = d_model
+
+        self.binary_residual_scale = float(
+            binary_residual_scale
+        )
 
         self.frontend = DTFFrontend(
             in_channels=1,
@@ -1376,8 +1347,10 @@ class DTFHybridModel(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Binary Head
-        # Normal / Abnormal
+        # Binary Residual Head
+        #
+        # 不再完全独立构造Binary Logits，
+        # 只学习相对于Four Head聚合结果的残差。
         # ----------------------------------------------------
         self.binary_head = nn.Sequential(
             nn.LayerNorm(
@@ -1394,7 +1367,6 @@ class DTFHybridModel(nn.Module):
 
         # ----------------------------------------------------
         # Abnormal Subtype Head
-        # Crackle / Wheeze / Both
         # ----------------------------------------------------
         self.abnormal_head = nn.Sequential(
             nn.LayerNorm(
@@ -1436,6 +1408,59 @@ class DTFHybridModel(nn.Module):
 
         return feature
 
+    @staticmethod
+    def build_four_binary_logits(
+        four_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        将四分类Logits聚合为二分类Logits。
+
+        Normal：
+            four_logits[:, 0]
+
+        Abnormal：
+            logsumexp(
+                Crackle,
+                Wheeze,
+                Both
+            )
+        """
+
+        if four_logits.ndim != 2:
+            raise ValueError(
+                "four_logits必须为[B,4]。"
+            )
+
+        if four_logits.shape[1] != 4:
+            raise ValueError(
+                "four_logits第二维必须为4。"
+            )
+
+        normal_logit = (
+            four_logits[
+                :,
+                0,
+            ]
+        )
+
+        abnormal_logit = torch.logsumexp(
+            four_logits[
+                :,
+                1:4,
+            ],
+            dim=1,
+        )
+
+        four_binary_logits = torch.stack(
+            [
+                normal_logit,
+                abnormal_logit,
+            ],
+            dim=1,
+        )
+
+        return four_binary_logits
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1444,53 +1469,98 @@ class DTFHybridModel(nn.Module):
             x
         )
 
+        # ----------------------------------------------------
+        # Four-Class Head
+        # ----------------------------------------------------
         four_logits = self.four_head(
             feature
         )
 
-        binary_logits = self.binary_head(
-            feature
+        # ----------------------------------------------------
+        # Four Head聚合出的二分类Logits
+        # ----------------------------------------------------
+        four_binary_logits = (
+            self.build_four_binary_logits(
+                four_logits
+            )
         )
 
-        abnormal_logits = self.abnormal_head(
-            feature
+        # ----------------------------------------------------
+        # Binary Residual Head
+        # ----------------------------------------------------
+        binary_residual_logits = (
+            self.binary_head(
+                feature
+            )
+        )
+
+        # ----------------------------------------------------
+        # Consistent Binary Logits
+        #
+        # Binary不再脱离Four Head独立预测
+        # ----------------------------------------------------
+        binary_logits = (
+            four_binary_logits
+            + self.binary_residual_scale
+            * binary_residual_logits
+        )
+
+        # ----------------------------------------------------
+        # Abnormal Subtype Head
+        # ----------------------------------------------------
+        abnormal_logits = (
+            self.abnormal_head(
+                feature
+            )
         )
 
         return {
             "feature": feature,
-            "four_logits": four_logits,
-            "binary_logits": binary_logits,
-            "abnormal_logits": abnormal_logits,
+
+            "four_logits": (
+                four_logits
+            ),
+
+            "four_binary_logits": (
+                four_binary_logits
+            ),
+
+            "binary_residual_logits": (
+                binary_residual_logits
+            ),
+
+            "binary_logits": (
+                binary_logits
+            ),
+
+            "abnormal_logits": (
+                abnormal_logits
+            ),
         }
 
     @staticmethod
     def build_probabilities(
         outputs: Dict[str, torch.Tensor],
-        four_weight: float = 0.5,
+        four_weight: Optional[float] = None,
+        minimum_hierarchical_weight: float = 0.15,
+        maximum_hierarchical_weight: float = 0.60,
     ) -> Dict[str, torch.Tensor]:
         """
-        构造四分类概率、层级概率和最终融合概率。
+        动态置信度融合。
 
-        P_hierarchical(Normal)
-            = P_binary(Normal)
+        Binary Head不确定时：
+            hierarchical_weight接近0.15
 
-        P_hierarchical(Crackle)
-            = P_binary(Abnormal)
-              × P_abnormal(Crackle)
+        Binary Head确定时：
+            hierarchical_weight最高接近0.60
 
-        P_hierarchical(Wheeze)
-            = P_binary(Abnormal)
-              × P_abnormal(Wheeze)
+        参数four_weight保留兼容性：
+            four_weight=None：
+                使用动态融合
 
-        P_hierarchical(Both)
-            = P_binary(Abnormal)
-              × P_abnormal(Both)
+            four_weight为[0,1]：
+                使用固定融合
         """
-
-        if not 0.0 <= four_weight <= 1.0:
-            raise ValueError(
-                "four_weight必须在[0,1]范围内。"
-            )
 
         required_keys = {
             "four_logits",
@@ -1511,10 +1581,20 @@ class DTFHybridModel(nn.Module):
                 f"{sorted(missing_keys)}"
             )
 
-        hierarchical_weight = (
-            1.0 - four_weight
-        )
+        if not (
+            0.0
+            <= minimum_hierarchical_weight
+            <= maximum_hierarchical_weight
+            <= 1.0
+        ):
+            raise ValueError(
+                "层级融合权重范围必须满足："
+                "0 <= minimum <= maximum <= 1。"
+            )
 
+        # ----------------------------------------------------
+        # Three Probabilities
+        # ----------------------------------------------------
         four_probability = torch.softmax(
             outputs[
                 "four_logits"
@@ -1536,6 +1616,16 @@ class DTFHybridModel(nn.Module):
             dim=1,
         )
 
+        # ----------------------------------------------------
+        # Hierarchical Probability
+        #
+        # P(Normal)
+        #   = P(Binary=Normal)
+        #
+        # P(Abnormal Subtype)
+        #   = P(Binary=Abnormal)
+        #     × P(Subtype | Abnormal)
+        # ----------------------------------------------------
         normal_probability = (
             binary_probability[
                 :,
@@ -1559,11 +1649,110 @@ class DTFHybridModel(nn.Module):
             dim=1,
         )
 
+        # ----------------------------------------------------
+        # Dynamic Fusion
+        # ----------------------------------------------------
+        if four_weight is None:
+            binary_entropy = -torch.sum(
+                binary_probability
+                * torch.log(
+                    binary_probability.clamp_min(
+                        1e-8
+                    )
+                ),
+                dim=1,
+                keepdim=True,
+            )
+
+            binary_entropy = (
+                binary_entropy
+                / math.log(2.0)
+            )
+
+            binary_confidence = (
+                1.0
+                - binary_entropy
+            ).clamp(
+                min=0.0,
+                max=1.0,
+            )
+
+            hierarchical_weight = (
+                minimum_hierarchical_weight
+                + (
+                    maximum_hierarchical_weight
+                    - minimum_hierarchical_weight
+                )
+                * binary_confidence
+            )
+
+            four_probability_weight = (
+                1.0
+                - hierarchical_weight
+            )
+
+        else:
+            if not 0.0 <= four_weight <= 1.0:
+                raise ValueError(
+                    "four_weight必须在[0,1]范围内。"
+                )
+
+            batch_size = (
+                four_probability.shape[0]
+            )
+
+            four_probability_weight = (
+                four_probability.new_full(
+                    (
+                        batch_size,
+                        1,
+                    ),
+                    float(
+                        four_weight
+                    ),
+                )
+            )
+
+            hierarchical_weight = (
+                1.0
+                - four_probability_weight
+            )
+
+            binary_entropy = -torch.sum(
+                binary_probability
+                * torch.log(
+                    binary_probability.clamp_min(
+                        1e-8
+                    )
+                ),
+                dim=1,
+                keepdim=True,
+            ) / math.log(2.0)
+
+            binary_confidence = (
+                1.0
+                - binary_entropy
+            ).clamp(
+                min=0.0,
+                max=1.0,
+            )
+
         final_probability = (
-            four_weight
+            four_probability_weight
             * four_probability
             + hierarchical_weight
             * hierarchical_probability
+        )
+
+        # 数值安全归一化
+        final_probability = (
+            final_probability
+            / final_probability.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(
+                1e-8
+            )
         )
 
         return {
@@ -1581,6 +1770,22 @@ class DTFHybridModel(nn.Module):
 
             "hierarchical_probability": (
                 hierarchical_probability
+            ),
+
+            "binary_entropy": (
+                binary_entropy
+            ),
+
+            "binary_confidence": (
+                binary_confidence
+            ),
+
+            "four_probability_weight": (
+                four_probability_weight
+            ),
+
+            "hierarchical_weight": (
+                hierarchical_weight
             ),
 
             "final_probability": (
@@ -1622,6 +1827,7 @@ if __name__ == "__main__":
         d_state=16,
         d_conv=4,
         expand=2,
+        binary_residual_scale=0.5,
     ).to(
         device
     )
@@ -1652,10 +1858,13 @@ if __name__ == "__main__":
             dummy_input
         )
 
+        # 动态融合
         probabilities = (
             model.build_probabilities(
                 outputs,
-                four_weight=0.5,
+                four_weight=None,
+                minimum_hierarchical_weight=0.15,
+                maximum_hierarchical_weight=0.60,
             )
         )
 
@@ -1720,6 +1929,24 @@ if __name__ == "__main__":
     )
 
     print(
+        "Four Binary Logits:",
+        tuple(
+            outputs[
+                "four_binary_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "Binary Residual Logits:",
+        tuple(
+            outputs[
+                "binary_residual_logits"
+            ].shape
+        ),
+    )
+
+    print(
         "Binary Logits:",
         tuple(
             outputs[
@@ -1738,30 +1965,26 @@ if __name__ == "__main__":
     )
 
     print(
-        "Four Probability:",
-        tuple(
-            probabilities[
-                "four_probability"
-            ].shape
-        ),
-    )
-
-    print(
-        "Hierarchical Probability:",
-        tuple(
-            probabilities[
-                "hierarchical_probability"
-            ].shape
-        ),
-    )
-
-    print(
         "Final Probability:",
         tuple(
             probabilities[
                 "final_probability"
             ].shape
         ),
+    )
+
+    print(
+        "Binary Confidence:",
+        probabilities[
+            "binary_confidence"
+        ].detach().cpu().flatten().tolist(),
+    )
+
+    print(
+        "Hierarchical Weight:",
+        probabilities[
+            "hierarchical_weight"
+        ].detach().cpu().flatten().tolist(),
     )
 
     print(
@@ -1842,6 +2065,24 @@ if __name__ == "__main__":
 
     assert tuple(
         outputs[
+            "four_binary_logits"
+        ].shape
+    ) == (
+        2,
+        2,
+    )
+
+    assert tuple(
+        outputs[
+            "binary_residual_logits"
+        ].shape
+    ) == (
+        2,
+        2,
+    )
+
+    assert tuple(
+        outputs[
             "binary_logits"
         ].shape
     ) == (
@@ -1860,24 +2101,6 @@ if __name__ == "__main__":
 
     assert tuple(
         probabilities[
-            "four_probability"
-        ].shape
-    ) == (
-        2,
-        4,
-    )
-
-    assert tuple(
-        probabilities[
-            "hierarchical_probability"
-        ].shape
-    ) == (
-        2,
-        4,
-    )
-
-    assert tuple(
-        probabilities[
             "final_probability"
         ].shape
     ) == (
@@ -1885,20 +2108,25 @@ if __name__ == "__main__":
         4,
     )
 
-    four_probability_sum = (
+    assert tuple(
         probabilities[
-            "four_probability"
-        ].sum(
-            dim=1
-        )
+            "hierarchical_weight"
+        ].shape
+    ) == (
+        2,
+        1,
     )
 
-    hierarchical_probability_sum = (
+    assert torch.all(
         probabilities[
-            "hierarchical_probability"
-        ].sum(
-            dim=1
-        )
+            "hierarchical_weight"
+        ] >= 0.15 - 1e-6
+    )
+
+    assert torch.all(
+        probabilities[
+            "hierarchical_weight"
+        ] <= 0.60 + 1e-6
     )
 
     final_probability_sum = (
@@ -1910,22 +2138,6 @@ if __name__ == "__main__":
     )
 
     assert torch.allclose(
-        four_probability_sum,
-        torch.ones_like(
-            four_probability_sum
-        ),
-        atol=1e-5,
-    )
-
-    assert torch.allclose(
-        hierarchical_probability_sum,
-        torch.ones_like(
-            hierarchical_probability_sum
-        ),
-        atol=1e-5,
-    )
-
-    assert torch.allclose(
         final_probability_sum,
         torch.ones_like(
             final_probability_sum
@@ -1934,5 +2146,5 @@ if __name__ == "__main__":
     )
 
     print(
-        "Hierarchical multi-task model shape test passed."
+        "D4 consistent dynamic hierarchical model shape test passed."
     )
