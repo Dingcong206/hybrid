@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,10 +25,6 @@ except Exception:
 # Feed Forward Network
 # ============================================================
 class FeedForward(nn.Module):
-    """
-    Transformer/Mamba Block中的前馈网络。
-    """
-
     def __init__(
         self,
         dim: int,
@@ -41,21 +37,11 @@ class FeedForward(nn.Module):
             hidden_dim = dim * 2
 
         self.network = nn.Sequential(
-            nn.Linear(
-                dim,
-                hidden_dim,
-            ),
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
-            nn.Linear(
-                hidden_dim,
-                dim,
-            ),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(
@@ -70,16 +56,10 @@ class FeedForward(nn.Module):
 # ============================================================
 class SamePadConv2d(nn.Module):
     """
-    支持偶数卷积核和任意步长的动态SAME Padding。
+    动态SAME Padding二维卷积。
 
-    输入张量轴顺序：
-
+    输入张量格式：
         [B, C, T, F]
-
-    B：Batch
-    C：Channel
-    T：Time
-    F：Frequency
     """
 
     def __init__(
@@ -94,44 +74,27 @@ class SamePadConv2d(nn.Module):
     ) -> None:
         super().__init__()
 
-        if isinstance(
-            kernel_size,
-            int,
-        ):
+        if isinstance(kernel_size, int):
             kernel_size = (
                 kernel_size,
                 kernel_size,
             )
 
-        if isinstance(
-            stride,
-            int,
-        ):
+        if isinstance(stride, int):
             stride = (
                 stride,
                 stride,
             )
 
-        if isinstance(
-            dilation,
-            int,
-        ):
+        if isinstance(dilation, int):
             dilation = (
                 dilation,
                 dilation,
             )
 
-        self.kernel_size = tuple(
-            kernel_size
-        )
-
-        self.stride = tuple(
-            stride
-        )
-
-        self.dilation = tuple(
-            dilation
-        )
+        self.kernel_size = tuple(kernel_size)
+        self.stride = tuple(stride)
+        self.dilation = tuple(dilation)
 
         self.conv = nn.Conv2d(
             in_channels=in_channels,
@@ -151,50 +114,33 @@ class SamePadConv2d(nn.Module):
         input_time = x.shape[-2]
         input_frequency = x.shape[-1]
 
-        kernel_time, kernel_frequency = (
-            self.kernel_size
-        )
-
-        stride_time, stride_frequency = (
-            self.stride
-        )
-
-        dilation_time, dilation_frequency = (
-            self.dilation
-        )
+        kernel_time, kernel_frequency = self.kernel_size
+        stride_time, stride_frequency = self.stride
+        dilation_time, dilation_frequency = self.dilation
 
         output_time = math.ceil(
-            input_time
-            / stride_time
+            input_time / stride_time
         )
 
         output_frequency = math.ceil(
-            input_frequency
-            / stride_frequency
+            input_frequency / stride_frequency
         )
 
         effective_kernel_time = (
             dilation_time
-            * (
-                kernel_time
-                - 1
-            )
+            * (kernel_time - 1)
             + 1
         )
 
         effective_kernel_frequency = (
             dilation_frequency
-            * (
-                kernel_frequency
-                - 1
-            )
+            * (kernel_frequency - 1)
             + 1
         )
 
         total_padding_time = max(
             (
-                output_time
-                - 1
+                output_time - 1
             )
             * stride_time
             + effective_kernel_time
@@ -204,8 +150,7 @@ class SamePadConv2d(nn.Module):
 
         total_padding_frequency = max(
             (
-                output_frequency
-                - 1
+                output_frequency - 1
             )
             * stride_frequency
             + effective_kernel_frequency
@@ -214,8 +159,7 @@ class SamePadConv2d(nn.Module):
         )
 
         padding_top = (
-            total_padding_time
-            // 2
+            total_padding_time // 2
         )
 
         padding_bottom = (
@@ -224,8 +168,7 @@ class SamePadConv2d(nn.Module):
         )
 
         padding_left = (
-            total_padding_frequency
-            // 2
+            total_padding_frequency // 2
         )
 
         padding_right = (
@@ -247,37 +190,23 @@ class SamePadConv2d(nn.Module):
 
 
 # ============================================================
-# DTF Time-Frequency Decoupled Stem
+# DTF Stem
 # ============================================================
 class DTFStem(nn.Module):
     """
-    DTF时频解耦Stem。
+    时频解耦卷积Stem。
 
     输入：
-
         [B, 1, 798, 128]
 
     时间分支：
-
         kernel = (6, 3)
 
     频率分支：
-
         kernel = (3, 6)
 
-    第一层stride=(2,2)，输出：
-
+    输出：
         [B, 64, 399, 64]
-
-    第二层stride=(1,1)，保持尺寸：
-
-        [B, 64, 399, 64]
-
-    最后通过可学习权重alpha进行融合：
-
-        output =
-            alpha * time_feature
-            + (1-alpha) * frequency_feature
     """
 
     def __init__(
@@ -295,10 +224,6 @@ class DTFStem(nn.Module):
     ) -> None:
         super().__init__()
 
-        # ----------------------------------------------------
-        # Time Branch
-        # 时间维度卷积核更大
-        # ----------------------------------------------------
         self.time_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
@@ -310,11 +235,9 @@ class DTFStem(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 out_channels
             ),
-
             nn.GELU(),
 
             SamePadConv2d(
@@ -327,18 +250,12 @@ class DTFStem(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 out_channels
             ),
-
             nn.GELU(),
         )
 
-        # ----------------------------------------------------
-        # Frequency Branch
-        # 频率维度卷积核更大
-        # ----------------------------------------------------
         self.frequency_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
@@ -350,11 +267,9 @@ class DTFStem(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 out_channels
             ),
-
             nn.GELU(),
 
             SamePadConv2d(
@@ -367,16 +282,13 @@ class DTFStem(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 out_channels
             ),
-
             nn.GELU(),
         )
 
         # sigmoid(0) = 0.5
-        # 初始状态下两个分支权重相同
         self.alpha_logit = nn.Parameter(
             torch.zeros(())
         )
@@ -428,8 +340,7 @@ class DTFStem(nn.Module):
             alpha
             * time_feature
             + (
-                1.0
-                - alpha
+                1.0 - alpha
             )
             * frequency_feature
         )
@@ -442,15 +353,11 @@ class DTFStem(nn.Module):
 # ============================================================
 class ResidualConvBlock(nn.Module):
     """
-    二维残差卷积模块。
-
-    输入输出尺寸相同：
+    输入输出尺寸保持不变：
 
         [B, C, T, F]
             ↓
         [B, C, T, F]
-
-    用于渐进式下采样后的局部特征细化。
     """
 
     def __init__(
@@ -464,7 +371,6 @@ class ResidualConvBlock(nn.Module):
             nn.BatchNorm2d(
                 channels
             ),
-
             nn.GELU(),
 
             nn.Conv2d(
@@ -488,9 +394,7 @@ class ResidualConvBlock(nn.Module):
             nn.BatchNorm2d(
                 channels
             ),
-
             nn.GELU(),
-
             nn.Dropout2d(
                 dropout
             ),
@@ -526,32 +430,19 @@ class ResidualConvBlock(nn.Module):
 # ============================================================
 class ProgressiveDownsample(nn.Module):
     """
-    渐进式下采样，避免原始5×5、stride=5一次性压缩。
+    渐进式下采样。
 
     输入：
-
         [B, 64, 399, 64]
 
     Stage 1：
-
-        Conv 3×3, stride=2
         [B, 96, 200, 32]
 
     Stage 2：
-
-        Conv 3×3, stride=2
         [B, 160, 100, 16]
 
     Stage 3：
-
-        Conv 3×3, stride=1
         [B, 256, 100, 16]
-
-    最终保留：
-
-        100个时间位置
-        16个频率位置
-        共1600个时频位置
     """
 
     def __init__(
@@ -562,10 +453,6 @@ class ProgressiveDownsample(nn.Module):
     ) -> None:
         super().__init__()
 
-        # ----------------------------------------------------
-        # Stage 1
-        # [399,64] -> [200,32]
-        # ----------------------------------------------------
         self.stage1 = nn.Sequential(
             nn.Conv2d(
                 in_channels=in_channels,
@@ -584,24 +471,17 @@ class ProgressiveDownsample(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 96
             ),
-
             nn.GELU(),
 
             ResidualConvBlock(
                 channels=96,
-                dropout=dropout
-                * 0.25,
+                dropout=dropout * 0.25,
             ),
         )
 
-        # ----------------------------------------------------
-        # Stage 2
-        # [200,32] -> [100,16]
-        # ----------------------------------------------------
         self.stage2 = nn.Sequential(
             nn.Conv2d(
                 in_channels=96,
@@ -620,25 +500,17 @@ class ProgressiveDownsample(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 160
             ),
-
             nn.GELU(),
 
             ResidualConvBlock(
                 channels=160,
-                dropout=dropout
-                * 0.50,
+                dropout=dropout * 0.50,
             ),
         )
 
-        # ----------------------------------------------------
-        # Stage 3
-        # [100,16] -> [100,16]
-        # 通道160 -> 256
-        # ----------------------------------------------------
         self.stage3 = nn.Sequential(
             nn.Conv2d(
                 in_channels=160,
@@ -657,11 +529,9 @@ class ProgressiveDownsample(nn.Module):
                 ),
                 bias=False,
             ),
-
             nn.BatchNorm2d(
                 out_channels
             ),
-
             nn.GELU(),
 
             ResidualConvBlock(
@@ -687,33 +557,31 @@ class ProgressiveDownsample(nn.Module):
             stage1_map
         )
 
-        stage3_map = self.stage3(
+        patch_map = self.stage3(
             stage2_map
         )
 
         if return_stage_maps:
             return (
-                stage3_map,
+                patch_map,
                 stage1_map,
                 stage2_map,
             )
 
-        return stage3_map
+        return patch_map
 
 
 # ============================================================
-# Time-Mamba Block
+# Time Mamba Block
 # ============================================================
 class TimeMambaBlock(nn.Module):
     """
-    对每个频率位置沿时间轴执行Mamba。
+    每个频率位置沿时间轴执行Mamba。
 
     输入：
-
         [B * F, T, D]
 
     输出：
-
         [B * F, T, D]
     """
 
@@ -742,8 +610,7 @@ class TimeMambaBlock(nn.Module):
             self.use_mamba = True
 
         else:
-            # 没有安装mamba_ssm时，仅用于形状测试。
-            # 正式训练时train.py会检查HAS_MAMBA。
+            # 仅用于没有安装mamba_ssm时进行形状检查。
             self.sequence_model = nn.GRU(
                 input_size=dim,
                 hidden_size=dim // 2,
@@ -754,7 +621,7 @@ class TimeMambaBlock(nn.Module):
 
             self.use_mamba = False
 
-        self.dropout1 = nn.Dropout(
+        self.sequence_dropout = nn.Dropout(
             dropout
         )
 
@@ -791,7 +658,7 @@ class TimeMambaBlock(nn.Module):
                 )
             )
 
-        x = residual + self.dropout1(
+        x = residual + self.sequence_dropout(
             sequence_output
         )
 
@@ -805,18 +672,16 @@ class TimeMambaBlock(nn.Module):
 
 
 # ============================================================
-# Frequency-Attention Block
+# Frequency Attention Block
 # ============================================================
 class FrequencyAttentionBlock(nn.Module):
     """
-    对每个时间位置沿频率轴执行多头注意力。
+    每个时间位置沿频率轴执行多头注意力。
 
     输入：
-
         [B * T, F, D]
 
     输出：
-
         [B * T, F, D]
     """
 
@@ -828,11 +693,7 @@ class FrequencyAttentionBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        if (
-            dim
-            % num_heads
-            != 0
-        ):
+        if dim % num_heads != 0:
             raise ValueError(
                 f"dim={dim}不能被"
                 f"num_heads={num_heads}整除。"
@@ -849,7 +710,7 @@ class FrequencyAttentionBlock(nn.Module):
             batch_first=True,
         )
 
-        self.dropout1 = nn.Dropout(
+        self.attention_dropout = nn.Dropout(
             dropout
         )
 
@@ -882,7 +743,7 @@ class FrequencyAttentionBlock(nn.Module):
             )
         )
 
-        x = residual + self.dropout1(
+        x = residual + self.attention_dropout(
             attention_output
         )
 
@@ -896,38 +757,19 @@ class FrequencyAttentionBlock(nn.Module):
 
 
 # ============================================================
-# Time-Mamba + Frequency-Attention Encoder
+# Time-Frequency Encoder
 # ============================================================
 class TimeFrequencyEncoder(nn.Module):
     """
     输入：
-
         [B, F*T, input_dim]
 
-    当前二维网格：
-
+    当前：
         F = 16
         T = 100
         F*T = 1600
 
-    流程：
-
-        Input Projection
-            ↓
-        2D Position Embedding
-            ↓
-        Time-Mamba
-            ↓
-        Frequency-Attention
-            ↓
-        Attention Pooling
-            +
-        Max Pooling
-            ↓
-        Feature Fusion
-
     输出：
-
         [B, d_model]
     """
 
@@ -973,29 +815,20 @@ class TimeFrequencyEncoder(nn.Module):
             * time_patches
         )
 
-        # ----------------------------------------------------
-        # Input Projection
-        # ----------------------------------------------------
         self.input_projection = nn.Sequential(
             nn.LayerNorm(
                 input_dim
             ),
-
             nn.Linear(
                 input_dim,
                 d_model,
             ),
-
             nn.GELU(),
-
             nn.Dropout(
                 dropout
             ),
         )
 
-        # ----------------------------------------------------
-        # 2D Time-Frequency Position Embedding
-        # ----------------------------------------------------
         self.frequency_position = nn.Parameter(
             torch.zeros(
                 1,
@@ -1018,9 +851,6 @@ class TimeFrequencyEncoder(nn.Module):
             dropout
         )
 
-        # ----------------------------------------------------
-        # Time-Mamba Blocks
-        # ----------------------------------------------------
         self.time_blocks = nn.ModuleList(
             [
                 TimeMambaBlock(
@@ -1036,9 +866,6 @@ class TimeFrequencyEncoder(nn.Module):
             ]
         )
 
-        # ----------------------------------------------------
-        # Frequency-Attention Blocks
-        # ----------------------------------------------------
         self.frequency_blocks = nn.ModuleList(
             [
                 FrequencyAttentionBlock(
@@ -1052,9 +879,6 @@ class TimeFrequencyEncoder(nn.Module):
             ]
         )
 
-        # ----------------------------------------------------
-        # Pooling
-        # ----------------------------------------------------
         pooling_hidden = max(
             64,
             d_model // 2,
@@ -1064,14 +888,11 @@ class TimeFrequencyEncoder(nn.Module):
             nn.LayerNorm(
                 d_model
             ),
-
             nn.Linear(
                 d_model,
                 pooling_hidden,
             ),
-
             nn.Tanh(),
-
             nn.Linear(
                 pooling_hidden,
                 1,
@@ -1082,14 +903,11 @@ class TimeFrequencyEncoder(nn.Module):
             nn.LayerNorm(
                 d_model * 2
             ),
-
             nn.Linear(
                 d_model * 2,
                 d_model,
             ),
-
             nn.GELU(),
-
             nn.Dropout(
                 dropout
             ),
@@ -1099,9 +917,6 @@ class TimeFrequencyEncoder(nn.Module):
             d_model
         )
 
-        # ----------------------------------------------------
-        # Position Initialization
-        # ----------------------------------------------------
         nn.init.trunc_normal_(
             self.frequency_position,
             std=0.02,
@@ -1128,40 +943,26 @@ class TimeFrequencyEncoder(nn.Module):
             input_dim,
         ) = x.shape
 
-        if (
-            num_tokens
-            != self.num_tokens
-        ):
+        if num_tokens != self.num_tokens:
             raise ValueError(
                 "Token数量错误："
-                f"输入={num_tokens}，"
-                f"要求={self.num_tokens}，"
-                f"即{self.freq_patches}"
-                f"×{self.time_patches}。"
+                f"当前={num_tokens}，"
+                f"要求={self.num_tokens}。"
             )
 
-        if (
-            input_dim
-            != self.input_dim
-        ):
+        if input_dim != self.input_dim:
             raise ValueError(
-                "Token维度错误："
-                f"输入={input_dim}，"
+                "Token特征维度错误："
+                f"当前={input_dim}，"
                 f"要求={self.input_dim}。"
             )
 
-        # ----------------------------------------------------
-        # Projection
-        # [B,1600,256] -> [B,1600,256]
-        # ----------------------------------------------------
+        # [B,1600,256]
         x = self.input_projection(
             x
         )
 
-        # ----------------------------------------------------
-        # Reshape to 2D Grid
-        # [B,1600,D] -> [B,16,100,D]
-        # ----------------------------------------------------
+        # [B,1600,256] -> [B,16,100,256]
         x = x.reshape(
             batch_size,
             self.freq_patches,
@@ -1169,9 +970,6 @@ class TimeFrequencyEncoder(nn.Module):
             self.d_model,
         )
 
-        # ----------------------------------------------------
-        # Add 2D Position Embedding
-        # ----------------------------------------------------
         x = (
             x
             + self.frequency_position
@@ -1186,8 +984,7 @@ class TimeFrequencyEncoder(nn.Module):
         # Time-Mamba
         #
         # [B,F,T,D]
-        #       ↓
-        # [B*F,T,D]
+        #   -> [B*F,T,D]
         # ----------------------------------------------------
         for block in self.time_blocks:
             time_sequence = x.reshape(
@@ -1212,10 +1009,8 @@ class TimeFrequencyEncoder(nn.Module):
         # Frequency-Attention
         #
         # [B,F,T,D]
-        #       ↓
-        # [B,T,F,D]
-        #       ↓
-        # [B*T,F,D]
+        #   -> [B,T,F,D]
+        #   -> [B*T,F,D]
         # ----------------------------------------------------
         for block in self.frequency_blocks:
             frequency_sequence = x.permute(
@@ -1254,10 +1049,7 @@ class TimeFrequencyEncoder(nn.Module):
                 3,
             ).contiguous()
 
-        # ----------------------------------------------------
-        # Flatten Tokens
         # [B,F,T,D] -> [B,F*T,D]
-        # ----------------------------------------------------
         tokens = x.reshape(
             batch_size,
             self.num_tokens,
@@ -1293,7 +1085,7 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Feature Fusion
+        # Pooling Fusion
         # ----------------------------------------------------
         feature = torch.cat(
             [
@@ -1319,29 +1111,22 @@ class TimeFrequencyEncoder(nn.Module):
 # ============================================================
 class DTFFrontend(nn.Module):
     """
-    Fbank前端。
-
     输入：
-
         [B,1,798,128]
 
     DTF Stem：
-
         [B,64,399,64]
 
-    Progressive Downsampling：
-
-        Stage1:
+    Stage 1：
         [B,96,200,32]
 
-        Stage2:
+    Stage 2：
         [B,160,100,16]
 
-        Stage3:
+    Patch Map：
         [B,256,100,16]
 
     Tokens：
-
         [B,1600,256]
     """
 
@@ -1418,19 +1203,11 @@ class DTFFrontend(nn.Module):
                 f"当前为{tuple(x.shape[-2:])}。"
             )
 
-        # ----------------------------------------------------
-        # DTF Stem
-        # [B,1,798,128]
-        #       ↓
-        # [B,64,399,64]
-        # ----------------------------------------------------
+        # [B,1,798,128] -> [B,64,399,64]
         stem_map = self.stem(
             x
         )
 
-        # ----------------------------------------------------
-        # Progressive Downsampling
-        # ----------------------------------------------------
         if return_stage_maps:
             (
                 patch_map,
@@ -1468,11 +1245,7 @@ class DTFFrontend(nn.Module):
             patch_map.shape[0]
         )
 
-        # ----------------------------------------------------
-        # [B,D,T,F]
-        #       ↓
-        # [B,F,T,D]
-        # ----------------------------------------------------
+        # [B,D,T,F] -> [B,F,T,D]
         patch_grid = patch_map.permute(
             0,
             3,
@@ -1480,11 +1253,7 @@ class DTFFrontend(nn.Module):
             1,
         ).contiguous()
 
-        # ----------------------------------------------------
-        # [B,F,T,D]
-        #       ↓
-        # [B,F*T,D]
-        # ----------------------------------------------------
+        # [B,F,T,D] -> [B,F*T,D]
         tokens = patch_grid.reshape(
             batch_size,
             self.num_tokens,
@@ -1511,11 +1280,11 @@ class DTFFrontend(nn.Module):
 
 
 # ============================================================
-# Complete DTF Hybrid Model
+# Hierarchical Multi-task DTF Hybrid Model
 # ============================================================
 class DTFHybridModel(nn.Module):
     """
-    完整模型结构：
+    共享主干：
 
         Fbank
           ↓
@@ -1527,15 +1296,18 @@ class DTFHybridModel(nn.Module):
           ↓
         Frequency-Attention
           ↓
-        Attention Pooling
-          +
-        Max Pooling
-          ↓
-        Four-Class Classifier
+        Shared Feature [B,256]
 
-    输出：
+    分类头：
 
-        logits [B,4]
+        four_head：
+            Normal / Crackle / Wheeze / Both
+
+        binary_head：
+            Normal / Abnormal
+
+        abnormal_head：
+            Crackle / Wheeze / Both
     """
 
     def __init__(
@@ -1556,7 +1328,13 @@ class DTFHybridModel(nn.Module):
     ) -> None:
         super().__init__()
 
+        if num_classes != 4:
+            raise ValueError(
+                "当前层级模型只支持4分类。"
+            )
+
         self.num_classes = num_classes
+        self.d_model = d_model
 
         self.frontend = DTFFrontend(
             in_channels=1,
@@ -1581,18 +1359,53 @@ class DTFHybridModel(nn.Module):
             expand=expand,
         )
 
-        self.classifier = nn.Sequential(
+        # ----------------------------------------------------
+        # Four-Class Head
+        # ----------------------------------------------------
+        self.four_head = nn.Sequential(
             nn.LayerNorm(
                 d_model
             ),
-
             nn.Dropout(
                 head_dropout
             ),
-
             nn.Linear(
                 d_model,
-                num_classes,
+                4,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Binary Head
+        # Normal / Abnormal
+        # ----------------------------------------------------
+        self.binary_head = nn.Sequential(
+            nn.LayerNorm(
+                d_model
+            ),
+            nn.Dropout(
+                head_dropout
+            ),
+            nn.Linear(
+                d_model,
+                2,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Abnormal Subtype Head
+        # Crackle / Wheeze / Both
+        # ----------------------------------------------------
+        self.abnormal_head = nn.Sequential(
+            nn.LayerNorm(
+                d_model
+            ),
+            nn.Dropout(
+                head_dropout
+            ),
+            nn.Linear(
+                d_model,
+                3,
             ),
         )
 
@@ -1626,16 +1439,154 @@ class DTFHybridModel(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         feature = self.extract_feature(
             x
         )
 
-        logits = self.classifier(
+        four_logits = self.four_head(
             feature
         )
 
-        return logits
+        binary_logits = self.binary_head(
+            feature
+        )
+
+        abnormal_logits = self.abnormal_head(
+            feature
+        )
+
+        return {
+            "feature": feature,
+            "four_logits": four_logits,
+            "binary_logits": binary_logits,
+            "abnormal_logits": abnormal_logits,
+        }
+
+    @staticmethod
+    def build_probabilities(
+        outputs: Dict[str, torch.Tensor],
+        four_weight: float = 0.5,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        构造四分类概率、层级概率和最终融合概率。
+
+        P_hierarchical(Normal)
+            = P_binary(Normal)
+
+        P_hierarchical(Crackle)
+            = P_binary(Abnormal)
+              × P_abnormal(Crackle)
+
+        P_hierarchical(Wheeze)
+            = P_binary(Abnormal)
+              × P_abnormal(Wheeze)
+
+        P_hierarchical(Both)
+            = P_binary(Abnormal)
+              × P_abnormal(Both)
+        """
+
+        if not 0.0 <= four_weight <= 1.0:
+            raise ValueError(
+                "four_weight必须在[0,1]范围内。"
+            )
+
+        required_keys = {
+            "four_logits",
+            "binary_logits",
+            "abnormal_logits",
+        }
+
+        missing_keys = (
+            required_keys
+            - set(
+                outputs.keys()
+            )
+        )
+
+        if missing_keys:
+            raise KeyError(
+                f"outputs缺少键："
+                f"{sorted(missing_keys)}"
+            )
+
+        hierarchical_weight = (
+            1.0 - four_weight
+        )
+
+        four_probability = torch.softmax(
+            outputs[
+                "four_logits"
+            ],
+            dim=1,
+        )
+
+        binary_probability = torch.softmax(
+            outputs[
+                "binary_logits"
+            ],
+            dim=1,
+        )
+
+        abnormal_probability = torch.softmax(
+            outputs[
+                "abnormal_logits"
+            ],
+            dim=1,
+        )
+
+        normal_probability = (
+            binary_probability[
+                :,
+                0:1,
+            ]
+        )
+
+        hierarchical_abnormal_probability = (
+            binary_probability[
+                :,
+                1:2,
+            ]
+            * abnormal_probability
+        )
+
+        hierarchical_probability = torch.cat(
+            [
+                normal_probability,
+                hierarchical_abnormal_probability,
+            ],
+            dim=1,
+        )
+
+        final_probability = (
+            four_weight
+            * four_probability
+            + hierarchical_weight
+            * hierarchical_probability
+        )
+
+        return {
+            "four_probability": (
+                four_probability
+            ),
+
+            "binary_probability": (
+                binary_probability
+            ),
+
+            "abnormal_probability": (
+                abnormal_probability
+            ),
+
+            "hierarchical_probability": (
+                hierarchical_probability
+            ),
+
+            "final_probability": (
+                final_probability
+            ),
+        }
 
 
 # ============================================================
@@ -1697,12 +1648,15 @@ if __name__ == "__main__":
             return_stage_maps=True,
         )
 
-        feature = model.extract_feature(
+        outputs = model(
             dummy_input
         )
 
-        logits = model(
-            dummy_input
+        probabilities = (
+            model.build_probabilities(
+                outputs,
+                four_weight=0.5,
+            )
         )
 
     print(
@@ -1750,14 +1704,63 @@ if __name__ == "__main__":
     print(
         "Feature:",
         tuple(
-            feature.shape
+            outputs[
+                "feature"
+            ].shape
         ),
     )
 
     print(
-        "Logits:",
+        "Four Logits:",
         tuple(
-            logits.shape
+            outputs[
+                "four_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "Binary Logits:",
+        tuple(
+            outputs[
+                "binary_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "Abnormal Logits:",
+        tuple(
+            outputs[
+                "abnormal_logits"
+            ].shape
+        ),
+    )
+
+    print(
+        "Four Probability:",
+        tuple(
+            probabilities[
+                "four_probability"
+            ].shape
+        ),
+    )
+
+    print(
+        "Hierarchical Probability:",
+        tuple(
+            probabilities[
+                "hierarchical_probability"
+            ].shape
+        ),
+    )
+
+    print(
+        "Final Probability:",
+        tuple(
+            probabilities[
+                "final_probability"
+            ].shape
         ),
     )
 
@@ -1820,19 +1823,116 @@ if __name__ == "__main__":
     )
 
     assert tuple(
-        feature.shape
+        outputs[
+            "feature"
+        ].shape
     ) == (
         2,
         256,
     )
 
     assert tuple(
-        logits.shape
+        outputs[
+            "four_logits"
+        ].shape
     ) == (
         2,
         4,
     )
 
+    assert tuple(
+        outputs[
+            "binary_logits"
+        ].shape
+    ) == (
+        2,
+        2,
+    )
+
+    assert tuple(
+        outputs[
+            "abnormal_logits"
+        ].shape
+    ) == (
+        2,
+        3,
+    )
+
+    assert tuple(
+        probabilities[
+            "four_probability"
+        ].shape
+    ) == (
+        2,
+        4,
+    )
+
+    assert tuple(
+        probabilities[
+            "hierarchical_probability"
+        ].shape
+    ) == (
+        2,
+        4,
+    )
+
+    assert tuple(
+        probabilities[
+            "final_probability"
+        ].shape
+    ) == (
+        2,
+        4,
+    )
+
+    four_probability_sum = (
+        probabilities[
+            "four_probability"
+        ].sum(
+            dim=1
+        )
+    )
+
+    hierarchical_probability_sum = (
+        probabilities[
+            "hierarchical_probability"
+        ].sum(
+            dim=1
+        )
+    )
+
+    final_probability_sum = (
+        probabilities[
+            "final_probability"
+        ].sum(
+            dim=1
+        )
+    )
+
+    assert torch.allclose(
+        four_probability_sum,
+        torch.ones_like(
+            four_probability_sum
+        ),
+        atol=1e-5,
+    )
+
+    assert torch.allclose(
+        hierarchical_probability_sum,
+        torch.ones_like(
+            hierarchical_probability_sum
+        ),
+        atol=1e-5,
+    )
+
+    assert torch.allclose(
+        final_probability_sum,
+        torch.ones_like(
+            final_probability_sum
+        ),
+        atol=1e-5,
+    )
+
     print(
-        "D2 progressive-downsampling model shape test passed."
+        "Hierarchical multi-task model shape test passed."
     )
