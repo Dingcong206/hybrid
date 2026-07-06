@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,9 +22,13 @@ except Exception:
 
 
 # ============================================================
-# Feed Forward
+# Feed Forward Network
 # ============================================================
 class FeedForward(nn.Module):
+    """
+    Transformer/Mamba Block中的前馈网络。
+    """
+
     def __init__(
         self,
         dim: int,
@@ -33,70 +37,32 @@ class FeedForward(nn.Module):
     ) -> None:
         super().__init__()
 
-        hidden_dim = hidden_dim or dim * 2
+        if hidden_dim is None:
+            hidden_dim = dim * 2
 
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+        self.network = nn.Sequential(
+            nn.Linear(
+                dim,
+                hidden_dim,
+            ),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout),
+            nn.Dropout(
+                dropout
+            ),
+            nn.Linear(
+                hidden_dim,
+                dim,
+            ),
+            nn.Dropout(
+                dropout
+            ),
         )
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.net(x)
-
-
-# ============================================================
-# Drop Path
-# ============================================================
-class DropPath(nn.Module):
-    def __init__(
-        self,
-        drop_prob: float = 0.0,
-    ) -> None:
-        super().__init__()
-
-        if not 0.0 <= drop_prob < 1.0:
-            raise ValueError(
-                f"drop_prob必须在[0,1)内，当前为{drop_prob}。"
-            )
-
-        self.drop_prob = float(drop_prob)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        if (
-            self.drop_prob == 0.0
-            or not self.training
-        ):
-            return x
-
-        keep_prob = 1.0 - self.drop_prob
-
-        shape = (
-            x.shape[0],
-            *([1] * (x.ndim - 1)),
-        )
-
-        random_tensor = keep_prob + torch.rand(
-            shape,
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-        random_tensor.floor_()
-
-        return (
-            x
-            / keep_prob
-            * random_tensor
-        )
+        return self.network(x)
 
 
 # ============================================================
@@ -104,10 +70,16 @@ class DropPath(nn.Module):
 # ============================================================
 class SamePadConv2d(nn.Module):
     """
-    支持偶数卷积核的动态SAME Padding。
+    支持偶数卷积核和任意步长的动态SAME Padding。
 
     输入张量轴顺序：
+
         [B, C, T, F]
+
+    B：Batch
+    C：Channel
+    T：Time
+    F：Frequency
     """
 
     def __init__(
@@ -122,27 +94,44 @@ class SamePadConv2d(nn.Module):
     ) -> None:
         super().__init__()
 
-        if isinstance(kernel_size, int):
+        if isinstance(
+            kernel_size,
+            int,
+        ):
             kernel_size = (
                 kernel_size,
                 kernel_size,
             )
 
-        if isinstance(stride, int):
+        if isinstance(
+            stride,
+            int,
+        ):
             stride = (
                 stride,
                 stride,
             )
 
-        if isinstance(dilation, int):
+        if isinstance(
+            dilation,
+            int,
+        ):
             dilation = (
                 dilation,
                 dilation,
             )
 
-        self.kernel_size = tuple(kernel_size)
-        self.stride = tuple(stride)
-        self.dilation = tuple(dilation)
+        self.kernel_size = tuple(
+            kernel_size
+        )
+
+        self.stride = tuple(
+            stride
+        )
+
+        self.dilation = tuple(
+            dilation
+        )
 
         self.conv = nn.Conv2d(
             in_channels=in_channels,
@@ -175,28 +164,37 @@ class SamePadConv2d(nn.Module):
         )
 
         output_time = math.ceil(
-            input_time / stride_time
+            input_time
+            / stride_time
         )
 
         output_frequency = math.ceil(
-            input_frequency / stride_frequency
+            input_frequency
+            / stride_frequency
         )
 
         effective_kernel_time = (
             dilation_time
-            * (kernel_time - 1)
+            * (
+                kernel_time
+                - 1
+            )
             + 1
         )
 
         effective_kernel_frequency = (
             dilation_frequency
-            * (kernel_frequency - 1)
+            * (
+                kernel_frequency
+                - 1
+            )
             + 1
         )
 
         total_padding_time = max(
             (
-                output_time - 1
+                output_time
+                - 1
             )
             * stride_time
             + effective_kernel_time
@@ -206,7 +204,8 @@ class SamePadConv2d(nn.Module):
 
         total_padding_frequency = max(
             (
-                output_frequency - 1
+                output_frequency
+                - 1
             )
             * stride_frequency
             + effective_kernel_frequency
@@ -215,7 +214,8 @@ class SamePadConv2d(nn.Module):
         )
 
         padding_top = (
-            total_padding_time // 2
+            total_padding_time
+            // 2
         )
 
         padding_bottom = (
@@ -224,7 +224,8 @@ class SamePadConv2d(nn.Module):
         )
 
         padding_left = (
-            total_padding_frequency // 2
+            total_padding_frequency
+            // 2
         )
 
         padding_right = (
@@ -246,122 +247,136 @@ class SamePadConv2d(nn.Module):
 
 
 # ============================================================
-# Squeeze-and-Excitation
-# ============================================================
-class SqueezeExcitation(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        reduction_ratio: int = 4,
-    ) -> None:
-        super().__init__()
-
-        hidden_channels = max(
-            channels // reduction_ratio,
-            8,
-        )
-
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-        self.fc = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                hidden_channels,
-                kernel_size=1,
-                bias=True,
-            ),
-            nn.GELU(),
-            nn.Conv2d(
-                hidden_channels,
-                channels,
-                kernel_size=1,
-                bias=True,
-            ),
-            nn.Sigmoid(),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        weight = self.pool(x)
-        weight = self.fc(weight)
-
-        return x * weight
-
-
-# ============================================================
-# DTF Stem
+# DTF Time-Frequency Decoupled Stem
 # ============================================================
 class DTFStem(nn.Module):
     """
+    DTF时频解耦Stem。
+
     输入：
-        [B,1,798,128]
+
+        [B, 1, 798, 128]
 
     时间分支：
-        kernel=(6,3)
+
+        kernel = (6, 3)
 
     频率分支：
-        kernel=(3,6)
 
-    输出：
-        [B,64,399,64]
+        kernel = (3, 6)
+
+    第一层stride=(2,2)，输出：
+
+        [B, 64, 399, 64]
+
+    第二层stride=(1,1)，保持尺寸：
+
+        [B, 64, 399, 64]
+
+    最后通过可学习权重alpha进行融合：
+
+        output =
+            alpha * time_feature
+            + (1-alpha) * frequency_feature
     """
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 64,
-        time_kernel: Tuple[int, int] = (6, 3),
-        frequency_kernel: Tuple[int, int] = (3, 6),
+        time_kernel: Tuple[int, int] = (
+            6,
+            3,
+        ),
+        frequency_kernel: Tuple[int, int] = (
+            3,
+            6,
+        ),
     ) -> None:
         super().__init__()
 
+        # ----------------------------------------------------
+        # Time Branch
+        # 时间维度卷积核更大
+        # ----------------------------------------------------
         self.time_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=time_kernel,
-                stride=(2, 2),
+                stride=(
+                    2,
+                    2,
+                ),
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
             nn.GELU(),
 
             SamePadConv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=time_kernel,
-                stride=(1, 1),
+                stride=(
+                    1,
+                    1,
+                ),
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
             nn.GELU(),
         )
 
+        # ----------------------------------------------------
+        # Frequency Branch
+        # 频率维度卷积核更大
+        # ----------------------------------------------------
         self.frequency_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=frequency_kernel,
-                stride=(2, 2),
+                stride=(
+                    2,
+                    2,
+                ),
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
             nn.GELU(),
 
             SamePadConv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=frequency_kernel,
-                stride=(1, 1),
+                stride=(
+                    1,
+                    1,
+                ),
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
             nn.GELU(),
         )
 
         # sigmoid(0) = 0.5
+        # 初始状态下两个分支权重相同
         self.alpha_logit = nn.Parameter(
             torch.zeros(())
         )
@@ -387,10 +402,14 @@ class DTFStem(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        time_feature = self.time_branch(x)
+        time_feature = self.time_branch(
+            x
+        )
 
         frequency_feature = (
-            self.frequency_branch(x)
+            self.frequency_branch(
+                x
+            )
         )
 
         if (
@@ -398,170 +417,288 @@ class DTFStem(nn.Module):
             != frequency_feature.shape
         ):
             raise RuntimeError(
-                "DTF Stem两个分支尺寸不一致："
+                "DTF两个分支输出尺寸不一致："
                 f"time={tuple(time_feature.shape)}, "
                 f"frequency={tuple(frequency_feature.shape)}"
             )
 
         alpha = self.get_alpha_tensor()
 
-        return (
-            alpha * time_feature
+        output = (
+            alpha
+            * time_feature
             + (
-                1.0 - alpha
-            ) * frequency_feature
+                1.0
+                - alpha
+            )
+            * frequency_feature
         )
 
+        return output
+
 
 # ============================================================
-# 可选TF-MBConv
-# 当前实验depth=0，不会执行
+# Residual Convolution Block
 # ============================================================
-class TFMBConv(nn.Module):
+class ResidualConvBlock(nn.Module):
     """
-    当tf_mbconv_depth > 0时启用。
+    二维残差卷积模块。
 
-    当前B1实验：
-        tf_mbconv_depth = 0
+    输入输出尺寸相同：
+
+        [B, C, T, F]
+            ↓
+        [B, C, T, F]
+
+    用于渐进式下采样后的局部特征细化。
     """
 
     def __init__(
         self,
         channels: int,
-        expand_ratio: int = 2,
-        time_kernel: Tuple[int, int] = (6, 3),
-        frequency_kernel: Tuple[int, int] = (3, 6),
-        se_reduction: int = 4,
-        drop_path: float = 0.0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
-        hidden_channels = (
-            channels * expand_ratio
-        )
+        self.block = nn.Sequential(
+            nn.BatchNorm2d(
+                channels
+            ),
 
-        self.pre_norm = nn.BatchNorm2d(
-            channels
-        )
+            nn.GELU(),
 
-        self.expand_conv = nn.Conv2d(
-            in_channels=channels,
-            out_channels=hidden_channels,
-            kernel_size=1,
-            bias=False,
-        )
+            nn.Conv2d(
+                in_channels=channels,
+                out_channels=channels,
+                kernel_size=(
+                    3,
+                    3,
+                ),
+                stride=(
+                    1,
+                    1,
+                ),
+                padding=(
+                    1,
+                    1,
+                ),
+                bias=False,
+            ),
 
-        self.expand_norm = nn.BatchNorm2d(
-            hidden_channels
-        )
+            nn.BatchNorm2d(
+                channels
+            ),
 
-        self.expand_activation = nn.GELU()
+            nn.GELU(),
 
-        self.time_depthwise = SamePadConv2d(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            kernel_size=time_kernel,
-            stride=1,
-            groups=hidden_channels,
-            bias=False,
-        )
+            nn.Dropout2d(
+                dropout
+            ),
 
-        self.frequency_depthwise = SamePadConv2d(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            kernel_size=frequency_kernel,
-            stride=1,
-            groups=hidden_channels,
-            bias=False,
-        )
-
-        self.beta_logit = nn.Parameter(
-            torch.zeros(())
-        )
-
-        self.depthwise_norm = nn.BatchNorm2d(
-            hidden_channels
-        )
-
-        self.depthwise_activation = nn.GELU()
-
-        self.se = SqueezeExcitation(
-            channels=hidden_channels,
-            reduction_ratio=se_reduction,
-        )
-
-        self.project_conv = nn.Conv2d(
-            in_channels=hidden_channels,
-            out_channels=channels,
-            kernel_size=1,
-            bias=False,
-        )
-
-        self.project_norm = nn.BatchNorm2d(
-            channels
-        )
-
-        self.drop_path = DropPath(
-            drop_prob=drop_path
-        )
-
-    def get_beta_tensor(
-        self,
-    ) -> torch.Tensor:
-        return torch.sigmoid(
-            self.beta_logit
-        )
-
-    def get_beta(
-        self,
-    ) -> float:
-        return float(
-            self.get_beta_tensor()
-            .detach()
-            .cpu()
-            .item()
+            nn.Conv2d(
+                in_channels=channels,
+                out_channels=channels,
+                kernel_size=(
+                    3,
+                    3,
+                ),
+                stride=(
+                    1,
+                    1,
+                ),
+                padding=(
+                    1,
+                    1,
+                ),
+                bias=False,
+            ),
         )
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        residual = x
+        return x + self.block(x)
 
-        x = self.pre_norm(x)
 
-        x = self.expand_conv(x)
-        x = self.expand_norm(x)
-        x = self.expand_activation(x)
+# ============================================================
+# Progressive Downsampling
+# ============================================================
+class ProgressiveDownsample(nn.Module):
+    """
+    渐进式下采样，避免原始5×5、stride=5一次性压缩。
 
-        time_feature = self.time_depthwise(
+    输入：
+
+        [B, 64, 399, 64]
+
+    Stage 1：
+
+        Conv 3×3, stride=2
+        [B, 96, 200, 32]
+
+    Stage 2：
+
+        Conv 3×3, stride=2
+        [B, 160, 100, 16]
+
+    Stage 3：
+
+        Conv 3×3, stride=1
+        [B, 256, 100, 16]
+
+    最终保留：
+
+        100个时间位置
+        16个频率位置
+        共1600个时频位置
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 64,
+        out_channels: int = 256,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+
+        # ----------------------------------------------------
+        # Stage 1
+        # [399,64] -> [200,32]
+        # ----------------------------------------------------
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=96,
+                kernel_size=(
+                    3,
+                    3,
+                ),
+                stride=(
+                    2,
+                    2,
+                ),
+                padding=(
+                    1,
+                    1,
+                ),
+                bias=False,
+            ),
+
+            nn.BatchNorm2d(
+                96
+            ),
+
+            nn.GELU(),
+
+            ResidualConvBlock(
+                channels=96,
+                dropout=dropout
+                * 0.25,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Stage 2
+        # [200,32] -> [100,16]
+        # ----------------------------------------------------
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=96,
+                out_channels=160,
+                kernel_size=(
+                    3,
+                    3,
+                ),
+                stride=(
+                    2,
+                    2,
+                ),
+                padding=(
+                    1,
+                    1,
+                ),
+                bias=False,
+            ),
+
+            nn.BatchNorm2d(
+                160
+            ),
+
+            nn.GELU(),
+
+            ResidualConvBlock(
+                channels=160,
+                dropout=dropout
+                * 0.50,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Stage 3
+        # [100,16] -> [100,16]
+        # 通道160 -> 256
+        # ----------------------------------------------------
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=160,
+                out_channels=out_channels,
+                kernel_size=(
+                    3,
+                    3,
+                ),
+                stride=(
+                    1,
+                    1,
+                ),
+                padding=(
+                    1,
+                    1,
+                ),
+                bias=False,
+            ),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
+            nn.GELU(),
+
+            ResidualConvBlock(
+                channels=out_channels,
+                dropout=dropout,
+            ),
+
+            nn.Dropout2d(
+                dropout
+            ),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_stage_maps: bool = False,
+    ):
+        stage1_map = self.stage1(
             x
         )
 
-        frequency_feature = (
-            self.frequency_depthwise(x)
+        stage2_map = self.stage2(
+            stage1_map
         )
 
-        beta = self.get_beta_tensor()
-
-        x = (
-            beta * time_feature
-            + (
-                1.0 - beta
-            ) * frequency_feature
+        stage3_map = self.stage3(
+            stage2_map
         )
 
-        x = self.depthwise_norm(x)
-        x = self.depthwise_activation(x)
+        if return_stage_maps:
+            return (
+                stage3_map,
+                stage1_map,
+                stage2_map,
+            )
 
-        x = self.se(x)
-
-        x = self.project_conv(x)
-        x = self.project_norm(x)
-
-        x = self.drop_path(x)
-
-        return residual + x
+        return stage3_map
 
 
 # ============================================================
@@ -569,10 +706,15 @@ class TFMBConv(nn.Module):
 # ============================================================
 class TimeMambaBlock(nn.Module):
     """
-    每个频率位置沿时间轴执行Mamba。
+    对每个频率位置沿时间轴执行Mamba。
 
-    输入输出：
-        [B*F,T,D]
+    输入：
+
+        [B * F, T, D]
+
+    输出：
+
+        [B * F, T, D]
     """
 
     def __init__(
@@ -585,7 +727,9 @@ class TimeMambaBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(
+            dim
+        )
 
         if HAS_MAMBA:
             self.sequence_model = Mamba(
@@ -598,7 +742,8 @@ class TimeMambaBlock(nn.Module):
             self.use_mamba = True
 
         else:
-            # 仅用于没有Mamba时的形状检查。
+            # 没有安装mamba_ssm时，仅用于形状测试。
+            # 正式训练时train.py会检查HAS_MAMBA。
             self.sequence_model = nn.GRU(
                 input_size=dim,
                 hidden_size=dim // 2,
@@ -609,11 +754,13 @@ class TimeMambaBlock(nn.Module):
 
             self.use_mamba = False
 
-        self.dropout = nn.Dropout(
+        self.dropout1 = nn.Dropout(
             dropout
         )
 
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(
+            dim
+        )
 
         self.ffn = FeedForward(
             dim=dim,
@@ -627,23 +774,31 @@ class TimeMambaBlock(nn.Module):
     ) -> torch.Tensor:
         residual = x
 
-        x_norm = self.norm1(x)
+        normalized = self.norm1(
+            x
+        )
 
         if self.use_mamba:
             sequence_output = (
-                self.sequence_model(x_norm)
+                self.sequence_model(
+                    normalized
+                )
             )
         else:
             sequence_output, _ = (
-                self.sequence_model(x_norm)
+                self.sequence_model(
+                    normalized
+                )
             )
 
-        x = residual + self.dropout(
+        x = residual + self.dropout1(
             sequence_output
         )
 
         x = x + self.ffn(
-            self.norm2(x)
+            self.norm2(
+                x
+            )
         )
 
         return x
@@ -654,10 +809,15 @@ class TimeMambaBlock(nn.Module):
 # ============================================================
 class FrequencyAttentionBlock(nn.Module):
     """
-    每个时间位置沿频率轴执行注意力。
+    对每个时间位置沿频率轴执行多头注意力。
 
-    输入输出：
-        [B*T,F,D]
+    输入：
+
+        [B * T, F, D]
+
+    输出：
+
+        [B * T, F, D]
     """
 
     def __init__(
@@ -668,12 +828,19 @@ class FrequencyAttentionBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        if dim % num_heads != 0:
+        if (
+            dim
+            % num_heads
+            != 0
+        ):
             raise ValueError(
-                f"dim={dim}不能被num_heads={num_heads}整除。"
+                f"dim={dim}不能被"
+                f"num_heads={num_heads}整除。"
             )
 
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(
+            dim
+        )
 
         self.attention = nn.MultiheadAttention(
             embed_dim=dim,
@@ -682,11 +849,13 @@ class FrequencyAttentionBlock(nn.Module):
             batch_first=True,
         )
 
-        self.dropout = nn.Dropout(
+        self.dropout1 = nn.Dropout(
             dropout
         )
 
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(
+            dim
+        )
 
         self.ffn = FeedForward(
             dim=dim,
@@ -700,23 +869,27 @@ class FrequencyAttentionBlock(nn.Module):
     ) -> torch.Tensor:
         residual = x
 
-        x_norm = self.norm1(x)
+        normalized = self.norm1(
+            x
+        )
 
         attention_output, _ = (
             self.attention(
-                query=x_norm,
-                key=x_norm,
-                value=x_norm,
+                query=normalized,
+                key=normalized,
+                value=normalized,
                 need_weights=False,
             )
         )
 
-        x = residual + self.dropout(
+        x = residual + self.dropout1(
             attention_output
         )
 
         x = x + self.ffn(
-            self.norm2(x)
+            self.norm2(
+                x
+            )
         )
 
         return x
@@ -726,12 +899,44 @@ class FrequencyAttentionBlock(nn.Module):
 # Time-Mamba + Frequency-Attention Encoder
 # ============================================================
 class TimeFrequencyEncoder(nn.Module):
+    """
+    输入：
+
+        [B, F*T, input_dim]
+
+    当前二维网格：
+
+        F = 16
+        T = 100
+        F*T = 1600
+
+    流程：
+
+        Input Projection
+            ↓
+        2D Position Embedding
+            ↓
+        Time-Mamba
+            ↓
+        Frequency-Attention
+            ↓
+        Attention Pooling
+            +
+        Max Pooling
+            ↓
+        Feature Fusion
+
+    输出：
+
+        [B, d_model]
+    """
+
     def __init__(
         self,
         input_dim: int = 256,
         d_model: int = 256,
-        freq_patches: int = 12,
-        time_patches: int = 79,
+        freq_patches: int = 16,
+        time_patches: int = 100,
         time_depth: int = 1,
         freq_depth: int = 1,
         num_heads: int = 8,
@@ -742,27 +947,55 @@ class TimeFrequencyEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
+        if freq_patches <= 0:
+            raise ValueError(
+                "freq_patches必须大于0。"
+            )
+
+        if time_patches <= 0:
+            raise ValueError(
+                "time_patches必须大于0。"
+            )
+
         self.input_dim = input_dim
         self.d_model = d_model
 
-        self.freq_patches = freq_patches
-        self.time_patches = time_patches
+        self.freq_patches = (
+            freq_patches
+        )
+
+        self.time_patches = (
+            time_patches
+        )
 
         self.num_tokens = (
             freq_patches
             * time_patches
         )
 
+        # ----------------------------------------------------
+        # Input Projection
+        # ----------------------------------------------------
         self.input_projection = nn.Sequential(
-            nn.LayerNorm(input_dim),
+            nn.LayerNorm(
+                input_dim
+            ),
+
             nn.Linear(
                 input_dim,
                 d_model,
             ),
+
             nn.GELU(),
-            nn.Dropout(dropout),
+
+            nn.Dropout(
+                dropout
+            ),
         )
 
+        # ----------------------------------------------------
+        # 2D Time-Frequency Position Embedding
+        # ----------------------------------------------------
         self.frequency_position = nn.Parameter(
             torch.zeros(
                 1,
@@ -785,6 +1018,9 @@ class TimeFrequencyEncoder(nn.Module):
             dropout
         )
 
+        # ----------------------------------------------------
+        # Time-Mamba Blocks
+        # ----------------------------------------------------
         self.time_blocks = nn.ModuleList(
             [
                 TimeMambaBlock(
@@ -794,10 +1030,15 @@ class TimeFrequencyEncoder(nn.Module):
                     expand=expand,
                     dropout=dropout,
                 )
-                for _ in range(time_depth)
+                for _ in range(
+                    time_depth
+                )
             ]
         )
 
+        # ----------------------------------------------------
+        # Frequency-Attention Blocks
+        # ----------------------------------------------------
         self.frequency_blocks = nn.ModuleList(
             [
                 FrequencyAttentionBlock(
@@ -805,22 +1046,32 @@ class TimeFrequencyEncoder(nn.Module):
                     num_heads=num_heads,
                     dropout=dropout,
                 )
-                for _ in range(freq_depth)
+                for _ in range(
+                    freq_depth
+                )
             ]
         )
 
+        # ----------------------------------------------------
+        # Pooling
+        # ----------------------------------------------------
         pooling_hidden = max(
             64,
             d_model // 2,
         )
 
         self.pooling_score = nn.Sequential(
-            nn.LayerNorm(d_model),
+            nn.LayerNorm(
+                d_model
+            ),
+
             nn.Linear(
                 d_model,
                 pooling_hidden,
             ),
+
             nn.Tanh(),
+
             nn.Linear(
                 pooling_hidden,
                 1,
@@ -828,19 +1079,29 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         self.pooling_fusion = nn.Sequential(
-            nn.LayerNorm(d_model * 2),
+            nn.LayerNorm(
+                d_model * 2
+            ),
+
             nn.Linear(
                 d_model * 2,
                 d_model,
             ),
+
             nn.GELU(),
-            nn.Dropout(dropout),
+
+            nn.Dropout(
+                dropout
+            ),
         )
 
         self.output_norm = nn.LayerNorm(
             d_model
         )
 
+        # ----------------------------------------------------
+        # Position Initialization
+        # ----------------------------------------------------
         nn.init.trunc_normal_(
             self.frequency_position,
             std=0.02,
@@ -857,29 +1118,50 @@ class TimeFrequencyEncoder(nn.Module):
     ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(
-                "输入必须为[B,N,D]，"
+                "Encoder输入必须为[B,N,D]，"
                 f"当前为{tuple(x.shape)}。"
             )
 
-        batch_size, num_tokens, input_dim = (
-            x.shape
+        (
+            batch_size,
+            num_tokens,
+            input_dim,
+        ) = x.shape
+
+        if (
+            num_tokens
+            != self.num_tokens
+        ):
+            raise ValueError(
+                "Token数量错误："
+                f"输入={num_tokens}，"
+                f"要求={self.num_tokens}，"
+                f"即{self.freq_patches}"
+                f"×{self.time_patches}。"
+            )
+
+        if (
+            input_dim
+            != self.input_dim
+        ):
+            raise ValueError(
+                "Token维度错误："
+                f"输入={input_dim}，"
+                f"要求={self.input_dim}。"
+            )
+
+        # ----------------------------------------------------
+        # Projection
+        # [B,1600,256] -> [B,1600,256]
+        # ----------------------------------------------------
+        x = self.input_projection(
+            x
         )
 
-        if num_tokens != self.num_tokens:
-            raise ValueError(
-                f"Token数量错误："
-                f"{num_tokens}!={self.num_tokens}"
-            )
-
-        if input_dim != self.input_dim:
-            raise ValueError(
-                f"Token维度错误："
-                f"{input_dim}!={self.input_dim}"
-            )
-
-        x = self.input_projection(x)
-
-        # [B,948,D] -> [B,F,T,D]
+        # ----------------------------------------------------
+        # Reshape to 2D Grid
+        # [B,1600,D] -> [B,16,100,D]
+        # ----------------------------------------------------
         x = x.reshape(
             batch_size,
             self.freq_patches,
@@ -887,16 +1169,25 @@ class TimeFrequencyEncoder(nn.Module):
             self.d_model,
         )
 
+        # ----------------------------------------------------
+        # Add 2D Position Embedding
+        # ----------------------------------------------------
         x = (
             x
             + self.frequency_position
             + self.time_position
         )
 
-        x = self.position_dropout(x)
+        x = self.position_dropout(
+            x
+        )
 
         # ----------------------------------------------------
         # Time-Mamba
+        #
+        # [B,F,T,D]
+        #       ↓
+        # [B*F,T,D]
         # ----------------------------------------------------
         for block in self.time_blocks:
             time_sequence = x.reshape(
@@ -919,6 +1210,12 @@ class TimeFrequencyEncoder(nn.Module):
 
         # ----------------------------------------------------
         # Frequency-Attention
+        #
+        # [B,F,T,D]
+        #       ↓
+        # [B,T,F,D]
+        #       ↓
+        # [B*T,F,D]
         # ----------------------------------------------------
         for block in self.frequency_blocks:
             frequency_sequence = x.permute(
@@ -958,7 +1255,8 @@ class TimeFrequencyEncoder(nn.Module):
             ).contiguous()
 
         # ----------------------------------------------------
-        # Pooling
+        # Flatten Tokens
+        # [B,F,T,D] -> [B,F*T,D]
         # ----------------------------------------------------
         tokens = x.reshape(
             batch_size,
@@ -966,8 +1264,13 @@ class TimeFrequencyEncoder(nn.Module):
             self.d_model,
         )
 
+        # ----------------------------------------------------
+        # Attention Pooling
+        # ----------------------------------------------------
         attention_logits = (
-            self.pooling_score(tokens)
+            self.pooling_score(
+                tokens
+            )
         )
 
         attention_weights = torch.softmax(
@@ -976,15 +1279,22 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         attention_feature = torch.sum(
-            tokens * attention_weights,
+            tokens
+            * attention_weights,
             dim=1,
         )
 
+        # ----------------------------------------------------
+        # Max Pooling
+        # ----------------------------------------------------
         max_feature = torch.amax(
             tokens,
             dim=1,
         )
 
+        # ----------------------------------------------------
+        # Feature Fusion
+        # ----------------------------------------------------
         feature = torch.cat(
             [
                 attention_feature,
@@ -1006,24 +1316,33 @@ class TimeFrequencyEncoder(nn.Module):
 
 # ============================================================
 # DTF Frontend
-# tf_mbconv_depth可设置为0
 # ============================================================
 class DTFFrontend(nn.Module):
     """
-    当前实验设置：
-        tf_mbconv_depth=0
+    Fbank前端。
 
     输入：
+
         [B,1,798,128]
 
     DTF Stem：
+
         [B,64,399,64]
 
-    Patch Downsampling：
-        [B,256,79,12]
+    Progressive Downsampling：
+
+        Stage1:
+        [B,96,200,32]
+
+        Stage2:
+        [B,160,100,16]
+
+        Stage3:
+        [B,256,100,16]
 
     Tokens：
-        [B,948,256]
+
+        [B,1600,256]
     """
 
     def __init__(
@@ -1031,32 +1350,25 @@ class DTFFrontend(nn.Module):
         in_channels: int = 1,
         stem_dim: int = 64,
         embed_dim: int = 256,
-        freq_patches: int = 12,
-        time_patches: int = 79,
-        tf_mbconv_depth: int = 0,
-        tf_expand_ratio: int = 2,
-        tf_se_reduction: int = 4,
-        max_drop_path: float = 0.05,
+        freq_patches: int = 16,
+        time_patches: int = 100,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
 
-        if tf_mbconv_depth < 0:
-            raise ValueError(
-                "tf_mbconv_depth不能小于0。"
-            )
-
         self.embed_dim = embed_dim
-        self.freq_patches = freq_patches
-        self.time_patches = time_patches
+
+        self.freq_patches = (
+            freq_patches
+        )
+
+        self.time_patches = (
+            time_patches
+        )
 
         self.num_tokens = (
             freq_patches
             * time_patches
-        )
-
-        self.tf_mbconv_depth = (
-            tf_mbconv_depth
         )
 
         self.stem = DTFStem(
@@ -1064,80 +1376,35 @@ class DTFFrontend(nn.Module):
             out_channels=stem_dim,
         )
 
-        if tf_mbconv_depth == 0:
-            drop_path_values = []
-        else:
-            drop_path_values = torch.linspace(
-                0.0,
-                max_drop_path,
-                steps=tf_mbconv_depth,
-            ).tolist()
-
-        self.tf_mbconv_blocks = nn.ModuleList(
-            [
-                TFMBConv(
-                    channels=stem_dim,
-                    expand_ratio=tf_expand_ratio,
-                    time_kernel=(6, 3),
-                    frequency_kernel=(3, 6),
-                    se_reduction=tf_se_reduction,
-                    drop_path=drop_path_values[
-                        block_index
-                    ],
-                )
-                for block_index in range(
-                    tf_mbconv_depth
-                )
-            ]
-        )
-
-        self.patch_downsample = nn.Sequential(
-            nn.Conv2d(
+        self.progressive_downsample = (
+            ProgressiveDownsample(
                 in_channels=stem_dim,
                 out_channels=embed_dim,
-                kernel_size=(5, 5),
-                stride=(5, 5),
-                padding=0,
-                bias=False,
-            ),
-            nn.BatchNorm2d(embed_dim),
-            nn.GELU(),
-            nn.Dropout2d(dropout),
+                dropout=dropout,
+            )
         )
 
-    def get_all_alphas(
+    def get_alpha(
         self,
-    ) -> Dict[str, float]:
-        values = {
-            "stem_alpha": (
-                self.stem.get_alpha()
-            )
-        }
-
-        for index, block in enumerate(
-            self.tf_mbconv_blocks,
-            start=1,
-        ):
-            values[
-                f"block_{index}_beta"
-            ] = block.get_beta()
-
-        return values
+    ) -> float:
+        return self.stem.get_alpha()
 
     def forward(
         self,
         x: torch.Tensor,
         return_maps: bool = False,
+        return_stage_maps: bool = False,
     ):
         if x.ndim != 4:
             raise ValueError(
-                "DTFFrontend输入必须为[B,C,T,F]，"
+                "Frontend输入必须为[B,C,T,F]，"
                 f"当前为{tuple(x.shape)}。"
             )
 
         if x.shape[1] != 1:
             raise ValueError(
-                f"输入通道必须为1，当前为{x.shape[1]}。"
+                "输入通道数必须为1，"
+                f"当前为{x.shape[1]}。"
             )
 
         if tuple(
@@ -1151,23 +1418,37 @@ class DTFFrontend(nn.Module):
                 f"当前为{tuple(x.shape[-2:])}。"
             )
 
+        # ----------------------------------------------------
+        # DTF Stem
         # [B,1,798,128]
-        # -> [B,64,399,64]
-        stem_map = self.stem(x)
+        #       ↓
+        # [B,64,399,64]
+        # ----------------------------------------------------
+        stem_map = self.stem(
+            x
+        )
 
-        # depth=0时，此循环不执行
-        block_map = stem_map
-
-        for block in self.tf_mbconv_blocks:
-            block_map = block(
-                block_map
+        # ----------------------------------------------------
+        # Progressive Downsampling
+        # ----------------------------------------------------
+        if return_stage_maps:
+            (
+                patch_map,
+                stage1_map,
+                stage2_map,
+            ) = self.progressive_downsample(
+                stem_map,
+                return_stage_maps=True,
+            )
+        else:
+            patch_map = (
+                self.progressive_downsample(
+                    stem_map
+                )
             )
 
-        # [B,64,399,64]
-        # -> [B,256,79,12]
-        patch_map = self.patch_downsample(
-            block_map
-        )
+            stage1_map = None
+            stage2_map = None
 
         expected_map_shape = (
             self.time_patches,
@@ -1180,12 +1461,18 @@ class DTFFrontend(nn.Module):
             raise RuntimeError(
                 "Patch Map尺寸错误："
                 f"当前={tuple(patch_map.shape)}，"
-                f"要求={expected_map_shape}。"
+                f"要求空间尺寸={expected_map_shape}。"
             )
 
-        batch_size = patch_map.shape[0]
+        batch_size = (
+            patch_map.shape[0]
+        )
 
-        # [B,D,T,F] -> [B,F,T,D]
+        # ----------------------------------------------------
+        # [B,D,T,F]
+        #       ↓
+        # [B,F,T,D]
+        # ----------------------------------------------------
         patch_grid = patch_map.permute(
             0,
             3,
@@ -1193,18 +1480,30 @@ class DTFFrontend(nn.Module):
             1,
         ).contiguous()
 
-        # [B,F,T,D] -> [B,F*T,D]
+        # ----------------------------------------------------
+        # [B,F,T,D]
+        #       ↓
+        # [B,F*T,D]
+        # ----------------------------------------------------
         tokens = patch_grid.reshape(
             batch_size,
             self.num_tokens,
             self.embed_dim,
         )
 
+        if return_stage_maps:
+            return (
+                tokens,
+                stem_map,
+                stage1_map,
+                stage2_map,
+                patch_map,
+            )
+
         if return_maps:
             return (
                 tokens,
                 stem_map,
-                block_map,
                 patch_map,
             )
 
@@ -1212,27 +1511,31 @@ class DTFFrontend(nn.Module):
 
 
 # ============================================================
-# 完整模型
+# Complete DTF Hybrid Model
 # ============================================================
 class DTFHybridModel(nn.Module):
     """
-    当前B1模型：
+    完整模型结构：
 
         Fbank
           ↓
         DTF Stem
           ↓
-        TF-MBConv depth=0
-          ↓
-        Patch Downsampling
+        Progressive Downsampling
           ↓
         Time-Mamba
           ↓
         Frequency-Attention
           ↓
-        Pooling
+        Attention Pooling
+          +
+        Max Pooling
           ↓
-        四分类
+        Four-Class Classifier
+
+    输出：
+
+        logits [B,4]
     """
 
     def __init__(
@@ -1240,12 +1543,8 @@ class DTFHybridModel(nn.Module):
         num_classes: int = 4,
         stem_dim: int = 64,
         d_model: int = 256,
-        freq_patches: int = 12,
-        time_patches: int = 79,
-        tf_mbconv_depth: int = 0,
-        tf_expand_ratio: int = 2,
-        tf_se_reduction: int = 4,
-        max_drop_path: float = 0.05,
+        freq_patches: int = 16,
+        time_patches: int = 100,
         time_depth: int = 1,
         freq_depth: int = 1,
         num_heads: int = 8,
@@ -1257,16 +1556,14 @@ class DTFHybridModel(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.num_classes = num_classes
+
         self.frontend = DTFFrontend(
             in_channels=1,
             stem_dim=stem_dim,
             embed_dim=d_model,
             freq_patches=freq_patches,
             time_patches=time_patches,
-            tf_mbconv_depth=tf_mbconv_depth,
-            tf_expand_ratio=tf_expand_ratio,
-            tf_se_reduction=tf_se_reduction,
-            max_drop_path=max_drop_path,
             dropout=dropout,
         )
 
@@ -1285,38 +1582,53 @@ class DTFHybridModel(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Dropout(head_dropout),
+            nn.LayerNorm(
+                d_model
+            ),
+
+            nn.Dropout(
+                head_dropout
+            ),
+
             nn.Linear(
                 d_model,
                 num_classes,
             ),
         )
 
+    def get_dtf_alpha(
+        self,
+    ) -> float:
+        return self.frontend.get_alpha()
+
     def extract_tokens(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.frontend(x)
+        return self.frontend(
+            x
+        )
 
-    def get_all_alphas(
+    def extract_feature(
         self,
-    ) -> Dict[str, float]:
-        return self.frontend.get_all_alphas()
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = self.frontend(
+            x
+        )
 
-    def get_dtf_alpha(
-        self,
-    ) -> float:
-        return self.frontend.stem.get_alpha()
+        feature = self.encoder(
+            tokens
+        )
+
+        return feature
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        tokens = self.frontend(x)
-
-        feature = self.encoder(
-            tokens
+        feature = self.extract_feature(
+            x
         )
 
         logits = self.classifier(
@@ -1340,22 +1652,28 @@ if __name__ == "__main__":
         else "cpu"
     )
 
+    print(
+        "Device:",
+        device,
+    )
+
     model = DTFHybridModel(
         num_classes=4,
         stem_dim=64,
         d_model=256,
-        freq_patches=12,
-        time_patches=79,
-
-        # 当前B1：关闭TF-MBConv
-        tf_mbconv_depth=0,
-
+        freq_patches=16,
+        time_patches=100,
         time_depth=1,
         freq_depth=1,
         num_heads=8,
         dropout=0.15,
         head_dropout=0.20,
-    ).to(device)
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    ).to(
+        device
+    )
 
     dummy_input = torch.randn(
         2,
@@ -1371,11 +1689,16 @@ if __name__ == "__main__":
         (
             tokens,
             stem_map,
-            block_map,
+            stage1_map,
+            stage2_map,
             patch_map,
         ) = model.frontend(
             dummy_input,
-            return_maps=True,
+            return_stage_maps=True,
+        )
+
+        feature = model.extract_feature(
+            dummy_input
         )
 
         logits = model(
@@ -1383,43 +1706,73 @@ if __name__ == "__main__":
         )
 
     print(
-        "Device:",
-        device,
-    )
-
-    print(
         "Input:",
-        tuple(dummy_input.shape),
+        tuple(
+            dummy_input.shape
+        ),
     )
 
     print(
         "DTF Stem Map:",
-        tuple(stem_map.shape),
+        tuple(
+            stem_map.shape
+        ),
     )
 
     print(
-        "Block Map:",
-        tuple(block_map.shape),
+        "Progressive Stage 1:",
+        tuple(
+            stage1_map.shape
+        ),
     )
 
     print(
-        "Patch Map:",
-        tuple(patch_map.shape),
+        "Progressive Stage 2:",
+        tuple(
+            stage2_map.shape
+        ),
+    )
+
+    print(
+        "Progressive Patch Map:",
+        tuple(
+            patch_map.shape
+        ),
     )
 
     print(
         "Tokens:",
-        tuple(tokens.shape),
+        tuple(
+            tokens.shape
+        ),
+    )
+
+    print(
+        "Feature:",
+        tuple(
+            feature.shape
+        ),
     )
 
     print(
         "Logits:",
-        tuple(logits.shape),
+        tuple(
+            logits.shape
+        ),
     )
 
     print(
-        "Alphas:",
-        model.get_all_alphas(),
+        "DTF Alpha:",
+        model.get_dtf_alpha(),
+    )
+
+    assert tuple(
+        dummy_input.shape
+    ) == (
+        2,
+        1,
+        798,
+        128,
     )
 
     assert tuple(
@@ -1432,12 +1785,21 @@ if __name__ == "__main__":
     )
 
     assert tuple(
-        block_map.shape
+        stage1_map.shape
     ) == (
         2,
-        64,
-        399,
-        64,
+        96,
+        200,
+        32,
+    )
+
+    assert tuple(
+        stage2_map.shape
+    ) == (
+        2,
+        160,
+        100,
+        16,
     )
 
     assert tuple(
@@ -1445,15 +1807,22 @@ if __name__ == "__main__":
     ) == (
         2,
         256,
-        79,
-        12,
+        100,
+        16,
     )
 
     assert tuple(
         tokens.shape
     ) == (
         2,
-        948,
+        1600,
+        256,
+    )
+
+    assert tuple(
+        feature.shape
+    ) == (
+        2,
         256,
     )
 
@@ -1464,12 +1833,6 @@ if __name__ == "__main__":
         4,
     )
 
-    assert set(
-        model.get_all_alphas().keys()
-    ) == {
-        "stem_alpha",
-    }
-
     print(
-        "B1 DTF model shape test passed."
+        "D2 progressive-downsampling model shape test passed."
     )
