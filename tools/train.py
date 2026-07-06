@@ -27,7 +27,7 @@ from torch.utils.data import (
 
 
 # ============================================================
-# Project Import
+# 项目路径与模型导入
 # ============================================================
 PROJECT_ROOT = Path(
     __file__
@@ -41,16 +41,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from mymodels.model import (
     HAS_MAMBA,
-    FbankHybridModel,
+    B2HybridModel,
 )
 
 
 # ============================================================
-# Configuration
+# 配置
 # ============================================================
 CONFIG = {
     # --------------------------------------------------------
-    # 数据目录
+    # 数据
     # --------------------------------------------------------
     "ROOT": (
         "/data/dingcong/hybrid/"
@@ -58,33 +58,15 @@ CONFIG = {
     ),
 
     # --------------------------------------------------------
-    # 当前运行 B0：No-TF
-    #
-    # B0：
-    #   FRONTEND_TYPE = "no_tf"
-    #
-    # B1：
-    #   FRONTEND_TYPE = "dtf"
+    # 保存目录
     # --------------------------------------------------------
-    "FRONTEND_TYPE": "no_tf",
-
-    # B0 保存目录
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_no_tf_baseline_seed42"
+        "checkpoints_b2_dtf_mbconv2_seed42"
     ),
 
-    # B1 时应改成：
-    #
-    # "FRONTEND_TYPE": "dtf",
-    #
-    # "SAVE_DIR": (
-    #     "/data/dingcong/hybrid/"
-    #     "checkpoints_dtf_stem_seed42"
-    # ),
-
     # --------------------------------------------------------
-    # Training
+    # 训练协议
     # --------------------------------------------------------
     "EPOCHS": 50,
 
@@ -106,10 +88,18 @@ CONFIG = {
     "FBANK_MELS": 128,
 
     # --------------------------------------------------------
-    # Model
+    # B2 前端
     # --------------------------------------------------------
     "STEM_DIM": 64,
 
+    "TF_MBCONV_DEPTH": 2,
+    "TF_EXPAND_RATIO": 2,
+    "TF_SE_REDUCTION": 4,
+    "MAX_DROP_PATH": 0.05,
+
+    # --------------------------------------------------------
+    # Hybrid Encoder
+    # --------------------------------------------------------
     "D_MODEL": 256,
 
     "FREQ_PATCHES": 12,
@@ -128,7 +118,9 @@ CONFIG = {
     "HEAD_DROPOUT": 0.20,
 
     # --------------------------------------------------------
-    # Learning Rate
+    # 学习率
+    #
+    # 与 B0、B1 保持一致
     # --------------------------------------------------------
     "FRONTEND_LR": 3e-4,
     "ENCODER_LR": 1e-4,
@@ -144,7 +136,7 @@ CONFIG = {
     "GRAD_CLIP": 2.0,
 
     # --------------------------------------------------------
-    # Loss
+    # 损失
     # --------------------------------------------------------
     "LABEL_SMOOTHING": 0.0,
 
@@ -153,6 +145,7 @@ CONFIG = {
 
     # --------------------------------------------------------
     # SpecAugment
+    # 与 B0、B1 保持一致
     # --------------------------------------------------------
     "USE_SPECAUGMENT": True,
 
@@ -160,23 +153,24 @@ CONFIG = {
     "FREQ_MASK_MAX": 48,
 
     # --------------------------------------------------------
-    # Logging
+    # 输出
     # --------------------------------------------------------
     "PRINT_INTERVAL": 50,
 }
 
 
 # ============================================================
-# Random Seed
+# 随机种子
 # ============================================================
-def set_seed(seed: int) -> None:
+def set_seed(
+    seed: int,
+) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # 与前面的 DTF Stem 实验保持一致
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
@@ -193,9 +187,11 @@ def set_seed(seed: int) -> None:
 
 
 # ============================================================
-# AMP Scaler
+# AMP
 # ============================================================
-def make_scaler(enabled: bool):
+def make_scaler(
+    enabled: bool,
+):
     try:
         return torch.amp.GradScaler(
             "cuda",
@@ -211,7 +207,7 @@ def make_scaler(enabled: bool):
 
 
 # ============================================================
-# Warmup + Cosine Learning Rate
+# Warmup + Cosine LR
 # ============================================================
 def set_epoch_lrs(
     optimizer,
@@ -262,8 +258,7 @@ def set_epoch_lrs(
         current_lrs = [
             min_lr
             + (
-                base_lr
-                - min_lr
+                base_lr - min_lr
             )
             * cosine_ratio
             for base_lr, min_lr
@@ -292,13 +287,6 @@ def apply_specaugment(
     time_mask_max: int,
     frequency_mask_max: int,
 ) -> torch.Tensor:
-    """
-    输入：
-        [T,F]
-
-    使用当前频谱的平均值作为遮挡值。
-    """
-
     x = fbank.clone()
 
     time_frames = x.shape[0]
@@ -306,9 +294,7 @@ def apply_specaugment(
 
     mask_value = x.mean()
 
-    # --------------------------------------------------------
     # Time Mask
-    # --------------------------------------------------------
     if time_mask_max > 0:
         width = random.randint(
             0,
@@ -329,9 +315,7 @@ def apply_specaugment(
                 :
             ] = mask_value
 
-    # --------------------------------------------------------
     # Frequency Mask
-    # --------------------------------------------------------
     if frequency_mask_max > 0:
         width = random.randint(
             0,
@@ -359,19 +343,6 @@ def apply_specaugment(
 # Fbank Dataset
 # ============================================================
 class FbankDataset(Dataset):
-    """
-    CSV 中读取：
-        fbank_path
-        label
-
-    单个 Fbank：
-        [798,128]
-
-    返回：
-        x = [1,798,128]
-        y = scalar
-    """
-
     def __init__(
         self,
         csv_path,
@@ -445,9 +416,7 @@ class FbankDataset(Dataset):
             ]
         )
 
-        if len(
-            invalid_labels
-        ) > 0:
+        if len(invalid_labels) > 0:
             raise ValueError(
                 "发现非法标签："
                 f"{invalid_labels.tolist()}"
@@ -607,7 +576,7 @@ def make_loader(
 
 
 # ============================================================
-# Four-Class Weights
+# Class Weights
 # ============================================================
 def build_four_weights(
     class_counts,
@@ -968,7 +937,7 @@ def calculate_metrics(
 
 
 # ============================================================
-# Test Evaluation
+# Evaluation
 # ============================================================
 @torch.no_grad()
 def evaluate(
@@ -1042,6 +1011,7 @@ def shape_test(
     (
         tokens,
         stem_map,
+        block_map,
         patch_map,
     ) = model.frontend(
         x,
@@ -1051,18 +1021,18 @@ def shape_test(
     logits = model(x)
 
     print(
-        "[Shape Test] Frontend:",
-        model.frontend_type,
-    )
-
-    print(
         "[Shape Test] Fbank:",
         tuple(x.shape),
     )
 
     print(
-        "[Shape Test] Stem Map:",
+        "[Shape Test] DTF Stem Map:",
         tuple(stem_map.shape),
+    )
+
+    print(
+        "[Shape Test] TF-MBConv Map:",
+        tuple(block_map.shape),
     )
 
     print(
@@ -1086,8 +1056,8 @@ def shape_test(
     )
 
     print(
-        "[Shape Test] Alpha:",
-        model.get_frontend_alpha(),
+        "[Shape Test] Alphas:",
+        model.get_all_alphas(),
     )
 
     assert tuple(
@@ -1100,6 +1070,14 @@ def shape_test(
 
     assert tuple(
         stem_map.shape[1:]
+    ) == (
+        64,
+        399,
+        64,
+    )
+
+    assert tuple(
+        block_map.shape[1:]
     ) == (
         64,
         399,
@@ -1128,7 +1106,7 @@ def shape_test(
     )
 
     print(
-        "[PASS] train.py 与模型连接成功。",
+        "[PASS] B2 train.py 与模型连接成功。",
         flush=True,
     )
 
@@ -1261,8 +1239,7 @@ def main() -> None:
         and not HAS_MAMBA
     ):
         raise RuntimeError(
-            "mamba_ssm 导入失败，"
-            "不能进行正式训练。"
+            "mamba_ssm 导入失败。"
         )
 
     root = Path(
@@ -1290,7 +1267,7 @@ def main() -> None:
         )
 
     print(
-        "[Protocol] 使用完整官方训练集。"
+        "[Protocol] 完整官方训练集。"
     )
 
     print(
@@ -1298,18 +1275,20 @@ def main() -> None:
     )
 
     print(
-        "[Protocol] 固定训练轮数，"
+        "[Protocol] 固定训练50轮，"
         "结束后测试一次。"
     )
 
     print(
-        "[Input] 直接读取 Fbank，"
-        "不读取 AST Token。"
+        "[Input] 直接读取Fbank，"
+        "不读取AST Token。"
     )
 
     print(
-        "[Experiment] Frontend:",
-        cfg["FRONTEND_TYPE"],
+        "[Experiment] "
+        "DTF Stem + TF-MBConv×2 "
+        "+ Time-Mamba "
+        "+ Frequency-Attention"
     )
 
     save_dir = Path(
@@ -1323,12 +1302,12 @@ def main() -> None:
 
     last_checkpoint_path = (
         save_dir
-        / "last_model.pth"
+        / "last_b2_model.pth"
     )
 
     final_checkpoint_path = (
         save_dir
-        / "final_model.pth"
+        / "final_b2_model.pth"
     )
 
     history_path = (
@@ -1368,11 +1347,7 @@ def main() -> None:
     # --------------------------------------------------------
     # Model
     # --------------------------------------------------------
-    model = FbankHybridModel(
-        frontend_type=cfg[
-            "FRONTEND_TYPE"
-        ],
-
+    model = B2HybridModel(
         num_classes=4,
 
         stem_dim=cfg[
@@ -1389,6 +1364,22 @@ def main() -> None:
 
         time_patches=cfg[
             "TIME_PATCHES"
+        ],
+
+        tf_mbconv_depth=cfg[
+            "TF_MBCONV_DEPTH"
+        ],
+
+        tf_expand_ratio=cfg[
+            "TF_EXPAND_RATIO"
+        ],
+
+        tf_se_reduction=cfg[
+            "TF_SE_REDUCTION"
+        ],
+
+        max_drop_path=cfg[
+            "MAX_DROP_PATH"
         ],
 
         time_depth=cfg[
@@ -1548,9 +1539,10 @@ def main() -> None:
     )
 
     print(
-        f"{cfg['FRONTEND_TYPE'].upper()} STEM"
+        "B2: DTF STEM"
+        " -> TF-MBCONV x2"
         " -> TIME-MAMBA"
-        " -> FREQUENCY-ATTENTION TRAINING"
+        " -> FREQUENCY-ATTENTION"
     )
 
     print(
@@ -1558,7 +1550,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Fixed-Epoch Training
+    # Training
     # --------------------------------------------------------
     for epoch in range(
         1,
@@ -1607,9 +1599,8 @@ def main() -> None:
             - epoch_start_time
         )
 
-        alpha = (
-            model
-            .get_frontend_alpha()
+        alpha_values = (
+            model.get_all_alphas()
         )
 
         history_row = {
@@ -1631,11 +1622,23 @@ def main() -> None:
                 current_learning_rates[2]
             ),
 
-            "frontend_type": cfg[
-                "FRONTEND_TYPE"
-            ],
+            "stem_alpha": (
+                alpha_values[
+                    "stem_alpha"
+                ]
+            ),
 
-            "alpha": alpha,
+            "block_1_beta": (
+                alpha_values[
+                    "block_1_beta"
+                ]
+            ),
+
+            "block_2_beta": (
+                alpha_values[
+                    "block_2_beta"
+                ]
+            ),
 
             "seconds": elapsed_time,
         }
@@ -1667,19 +1670,11 @@ def main() -> None:
                     cfg
                 ),
 
-                "frontend_type": cfg[
-                    "FRONTEND_TYPE"
-                ],
-
-                "alpha": alpha,
+                "alpha_values": (
+                    alpha_values
+                ),
             },
             last_checkpoint_path,
-        )
-
-        alpha_text = (
-            "N/A"
-            if alpha is None
-            else f"{alpha:.4f}"
         )
 
         print(
@@ -1688,8 +1683,12 @@ def main() -> None:
             f"{cfg['EPOCHS']} | "
             f"Train "
             f"{train_loss:.4f} | "
-            f"Alpha "
-            f"{alpha_text} | "
+            f"StemAlpha "
+            f"{alpha_values['stem_alpha']:.4f} | "
+            f"Beta1 "
+            f"{alpha_values['block_1_beta']:.4f} | "
+            f"Beta2 "
+            f"{alpha_values['block_2_beta']:.4f} | "
             f"LR "
             f"{current_learning_rates[0]:.8f}/"
             f"{current_learning_rates[1]:.8f}/"
@@ -1699,7 +1698,7 @@ def main() -> None:
         )
 
     # --------------------------------------------------------
-    # Official Test: only once after training
+    # Final official test
     # --------------------------------------------------------
     final_result = evaluate(
         test_loader,
@@ -1725,13 +1724,8 @@ def main() -> None:
                 cfg
             ),
 
-            "frontend_type": cfg[
-                "FRONTEND_TYPE"
-            ],
-
-            "alpha": (
-                model
-                .get_frontend_alpha()
+            "alpha_values": (
+                model.get_all_alphas()
             ),
 
             "test_score": final_result[
