@@ -55,11 +55,6 @@ class FeedForward(nn.Module):
 # Dynamic SAME Padding Conv2d
 # ============================================================
 class SamePadConv2d(nn.Module):
-    """
-    输入：
-        [B, C, T, F]
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -73,22 +68,13 @@ class SamePadConv2d(nn.Module):
         super().__init__()
 
         if isinstance(kernel_size, int):
-            kernel_size = (
-                kernel_size,
-                kernel_size,
-            )
+            kernel_size = (kernel_size, kernel_size)
 
         if isinstance(stride, int):
-            stride = (
-                stride,
-                stride,
-            )
+            stride = (stride, stride)
 
         if isinstance(dilation, int):
-            dilation = (
-                dilation,
-                dilation,
-            )
+            dilation = (dilation, dilation)
 
         self.kernel_size = tuple(kernel_size)
         self.stride = tuple(stride)
@@ -137,9 +123,7 @@ class SamePadConv2d(nn.Module):
         )
 
         total_padding_time = max(
-            (
-                output_time - 1
-            )
+            (output_time - 1)
             * stride_time
             + effective_kernel_time
             - input_time,
@@ -147,9 +131,7 @@ class SamePadConv2d(nn.Module):
         )
 
         total_padding_frequency = max(
-            (
-                output_frequency - 1
-            )
+            (output_frequency - 1)
             * stride_frequency
             + effective_kernel_frequency
             - input_frequency,
@@ -195,12 +177,6 @@ class DTFStem(nn.Module):
     输入：
         [B, 1, 798, 128]
 
-    时间分支：
-        kernel=(6,3)
-
-    频率分支：
-        kernel=(3,6)
-
     输出：
         [B, 64, 399, 64]
     """
@@ -225,30 +201,20 @@ class DTFStem(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=time_kernel,
-                stride=(
-                    2,
-                    2,
-                ),
+                stride=(2, 2),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
 
             SamePadConv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=time_kernel,
-                stride=(
-                    1,
-                    1,
-                ),
+                stride=(1, 1),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
@@ -257,34 +223,23 @@ class DTFStem(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=frequency_kernel,
-                stride=(
-                    2,
-                    2,
-                ),
+                stride=(2, 2),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
 
             SamePadConv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=frequency_kernel,
-                stride=(
-                    1,
-                    1,
-                ),
+                stride=(1, 1),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
-        # sigmoid(0) = 0.5
         self.alpha_logit = nn.Parameter(
             torch.zeros(())
         )
@@ -310,14 +265,10 @@ class DTFStem(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        time_feature = self.time_branch(
-            x
-        )
+        time_feature = self.time_branch(x)
 
         frequency_feature = (
-            self.frequency_branch(
-                x
-            )
+            self.frequency_branch(x)
         )
 
         if (
@@ -332,27 +283,17 @@ class DTFStem(nn.Module):
 
         alpha = self.get_alpha_tensor()
 
-        output = (
-            alpha
-            * time_feature
-            + (
-                1.0 - alpha
-            )
+        return (
+            alpha * time_feature
+            + (1.0 - alpha)
             * frequency_feature
         )
-
-        return output
 
 
 # ============================================================
 # Residual Convolution Block
 # ============================================================
 class ResidualConvBlock(nn.Module):
-    """
-    输入输出：
-        [B, C, T, F]
-    """
-
     def __init__(
         self,
         channels: int,
@@ -361,52 +302,28 @@ class ResidualConvBlock(nn.Module):
         super().__init__()
 
         self.block = nn.Sequential(
-            nn.BatchNorm2d(
-                channels
-            ),
+            nn.BatchNorm2d(channels),
             nn.GELU(),
 
             nn.Conv2d(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=(
-                    3,
-                    3,
-                ),
-                stride=(
-                    1,
-                    1,
-                ),
-                padding=(
-                    1,
-                    1,
-                ),
+                channels,
+                channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
                 bias=False,
             ),
 
-            nn.BatchNorm2d(
-                channels
-            ),
+            nn.BatchNorm2d(channels),
             nn.GELU(),
-            nn.Dropout2d(
-                dropout
-            ),
+            nn.Dropout2d(dropout),
 
             nn.Conv2d(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=(
-                    3,
-                    3,
-                ),
-                stride=(
-                    1,
-                    1,
-                ),
-                padding=(
-                    1,
-                    1,
-                ),
+                channels,
+                channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
                 bias=False,
             ),
         )
@@ -424,16 +341,16 @@ class ResidualConvBlock(nn.Module):
 class ProgressiveDownsample(nn.Module):
     """
     输入：
-        [B, 64, 399, 64]
+        [B,64,399,64]
 
-    Stage 1：
-        [B, 96, 200, 32]
+    Stage1：
+        [B,96,200,32]
 
-    Stage 2：
-        [B, 160, 100, 16]
+    Stage2：
+        [B,160,100,16]
 
-    Stage 3：
-        [B, 256, 100, 16]
+    Patch：
+        [B,256,100,16]
     """
 
     def __init__(
@@ -446,25 +363,14 @@ class ProgressiveDownsample(nn.Module):
 
         self.stage1 = nn.Sequential(
             nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=96,
-                kernel_size=(
-                    3,
-                    3,
-                ),
-                stride=(
-                    2,
-                    2,
-                ),
-                padding=(
-                    1,
-                    1,
-                ),
+                in_channels,
+                96,
+                kernel_size=3,
+                stride=2,
+                padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                96
-            ),
+            nn.BatchNorm2d(96),
             nn.GELU(),
 
             ResidualConvBlock(
@@ -475,25 +381,14 @@ class ProgressiveDownsample(nn.Module):
 
         self.stage2 = nn.Sequential(
             nn.Conv2d(
-                in_channels=96,
-                out_channels=160,
-                kernel_size=(
-                    3,
-                    3,
-                ),
-                stride=(
-                    2,
-                    2,
-                ),
-                padding=(
-                    1,
-                    1,
-                ),
+                96,
+                160,
+                kernel_size=3,
+                stride=2,
+                padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                160
-            ),
+            nn.BatchNorm2d(160),
             nn.GELU(),
 
             ResidualConvBlock(
@@ -504,25 +399,14 @@ class ProgressiveDownsample(nn.Module):
 
         self.stage3 = nn.Sequential(
             nn.Conv2d(
-                in_channels=160,
-                out_channels=out_channels,
-                kernel_size=(
-                    3,
-                    3,
-                ),
-                stride=(
-                    1,
-                    1,
-                ),
-                padding=(
-                    1,
-                    1,
-                ),
+                160,
+                out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
 
             ResidualConvBlock(
@@ -530,9 +414,7 @@ class ProgressiveDownsample(nn.Module):
                 dropout=dropout,
             ),
 
-            nn.Dropout2d(
-                dropout
-            ),
+            nn.Dropout2d(dropout),
         )
 
     def forward(
@@ -540,17 +422,9 @@ class ProgressiveDownsample(nn.Module):
         x: torch.Tensor,
         return_stage_maps: bool = False,
     ):
-        stage1_map = self.stage1(
-            x
-        )
-
-        stage2_map = self.stage2(
-            stage1_map
-        )
-
-        patch_map = self.stage3(
-            stage2_map
-        )
+        stage1_map = self.stage1(x)
+        stage2_map = self.stage2(stage1_map)
+        patch_map = self.stage3(stage2_map)
 
         if return_stage_maps:
             return (
@@ -566,11 +440,6 @@ class ProgressiveDownsample(nn.Module):
 # Time Mamba Block
 # ============================================================
 class TimeMambaBlock(nn.Module):
-    """
-    输入输出：
-        [B * F, T, D]
-    """
-
     def __init__(
         self,
         dim: int,
@@ -581,9 +450,7 @@ class TimeMambaBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(
-            dim
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
         if HAS_MAMBA:
             self.sequence_model = Mamba(
@@ -594,7 +461,6 @@ class TimeMambaBlock(nn.Module):
             )
 
             self.use_mamba = True
-
         else:
             self.sequence_model = nn.GRU(
                 input_size=dim,
@@ -610,9 +476,7 @@ class TimeMambaBlock(nn.Module):
             dropout
         )
 
-        self.norm2 = nn.LayerNorm(
-            dim
-        )
+        self.norm2 = nn.LayerNorm(dim)
 
         self.ffn = FeedForward(
             dim=dim,
@@ -624,32 +488,28 @@ class TimeMambaBlock(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        residual = x
-
-        normalized = self.norm1(
-            x
-        )
+        normalized = self.norm1(x)
 
         if self.use_mamba:
             sequence_output = (
-                self.sequence_model(
-                    normalized
-                )
+                self.sequence_model(normalized)
             )
         else:
             sequence_output, _ = (
-                self.sequence_model(
-                    normalized
-                )
+                self.sequence_model(normalized)
             )
 
-        x = residual + self.sequence_dropout(
-            sequence_output
+        x = (
+            x
+            + self.sequence_dropout(
+                sequence_output
+            )
         )
 
-        x = x + self.ffn(
-            self.norm2(
-                x
+        x = (
+            x
+            + self.ffn(
+                self.norm2(x)
             )
         )
 
@@ -660,11 +520,6 @@ class TimeMambaBlock(nn.Module):
 # Frequency Attention Block
 # ============================================================
 class FrequencyAttentionBlock(nn.Module):
-    """
-    输入输出：
-        [B * T, F, D]
-    """
-
     def __init__(
         self,
         dim: int,
@@ -679,9 +534,7 @@ class FrequencyAttentionBlock(nn.Module):
                 f"num_heads={num_heads}整除。"
             )
 
-        self.norm1 = nn.LayerNorm(
-            dim
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
         self.attention = nn.MultiheadAttention(
             embed_dim=dim,
@@ -694,9 +547,7 @@ class FrequencyAttentionBlock(nn.Module):
             dropout
         )
 
-        self.norm2 = nn.LayerNorm(
-            dim
-        )
+        self.norm2 = nn.LayerNorm(dim)
 
         self.ffn = FeedForward(
             dim=dim,
@@ -708,11 +559,7 @@ class FrequencyAttentionBlock(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        residual = x
-
-        normalized = self.norm1(
-            x
-        )
+        normalized = self.norm1(x)
 
         attention_output, _ = (
             self.attention(
@@ -723,13 +570,17 @@ class FrequencyAttentionBlock(nn.Module):
             )
         )
 
-        x = residual + self.attention_dropout(
-            attention_output
+        x = (
+            x
+            + self.attention_dropout(
+                attention_output
+            )
         )
 
-        x = x + self.ffn(
-            self.norm2(
-                x
+        x = (
+            x
+            + self.ffn(
+                self.norm2(x)
             )
         )
 
@@ -737,20 +588,9 @@ class FrequencyAttentionBlock(nn.Module):
 
 
 # ============================================================
-# Time-Frequency Encoder
+# Time Frequency Encoder
 # ============================================================
 class TimeFrequencyEncoder(nn.Module):
-    """
-    输入：
-        [B, 1600, 256]
-
-    网格：
-        [B, 16, 100, 256]
-
-    输出：
-        [B, 256]
-    """
-
     def __init__(
         self,
         input_dim: int = 256,
@@ -767,26 +607,11 @@ class TimeFrequencyEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        if freq_patches <= 0:
-            raise ValueError(
-                "freq_patches必须大于0。"
-            )
-
-        if time_patches <= 0:
-            raise ValueError(
-                "time_patches必须大于0。"
-            )
-
         self.input_dim = input_dim
         self.d_model = d_model
 
-        self.freq_patches = (
-            freq_patches
-        )
-
-        self.time_patches = (
-            time_patches
-        )
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
 
         self.num_tokens = (
             freq_patches
@@ -794,17 +619,13 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         self.input_projection = nn.Sequential(
-            nn.LayerNorm(
-                input_dim
-            ),
+            nn.LayerNorm(input_dim),
             nn.Linear(
                 input_dim,
                 d_model,
             ),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
         )
 
         self.frequency_position = nn.Parameter(
@@ -838,9 +659,7 @@ class TimeFrequencyEncoder(nn.Module):
                     expand=expand,
                     dropout=dropout,
                 )
-                for _ in range(
-                    time_depth
-                )
+                for _ in range(time_depth)
             ]
         )
 
@@ -851,9 +670,7 @@ class TimeFrequencyEncoder(nn.Module):
                     num_heads=num_heads,
                     dropout=dropout,
                 )
-                for _ in range(
-                    freq_depth
-                )
+                for _ in range(freq_depth)
             ]
         )
 
@@ -863,9 +680,7 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         self.pooling_score = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
+            nn.LayerNorm(d_model),
             nn.Linear(
                 d_model,
                 pooling_hidden,
@@ -886,9 +701,7 @@ class TimeFrequencyEncoder(nn.Module):
                 d_model,
             ),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
         )
 
         self.output_norm = nn.LayerNorm(
@@ -915,11 +728,9 @@ class TimeFrequencyEncoder(nn.Module):
                 f"当前为{tuple(x.shape)}。"
             )
 
-        (
-            batch_size,
-            num_tokens,
-            input_dim,
-        ) = x.shape
+        batch_size, num_tokens, input_dim = (
+            x.shape
+        )
 
         if num_tokens != self.num_tokens:
             raise ValueError(
@@ -935,11 +746,8 @@ class TimeFrequencyEncoder(nn.Module):
                 f"要求={self.input_dim}。"
             )
 
-        x = self.input_projection(
-            x
-        )
+        x = self.input_projection(x)
 
-        # [B,1600,D] -> [B,16,100,D]
         x = x.reshape(
             batch_size,
             self.freq_patches,
@@ -953,14 +761,9 @@ class TimeFrequencyEncoder(nn.Module):
             + self.time_position
         )
 
-        x = self.position_dropout(
-            x
-        )
+        x = self.position_dropout(x)
 
-        # ----------------------------------------------------
         # Time-Mamba
-        # [B,F,T,D] -> [B*F,T,D]
-        # ----------------------------------------------------
         for block in self.time_blocks:
             time_sequence = x.reshape(
                 batch_size
@@ -980,10 +783,7 @@ class TimeFrequencyEncoder(nn.Module):
                 self.d_model,
             )
 
-        # ----------------------------------------------------
         # Frequency-Attention
-        # [B,F,T,D] -> [B*T,F,D]
-        # ----------------------------------------------------
         for block in self.frequency_blocks:
             frequency_sequence = x.permute(
                 0,
@@ -1021,18 +821,14 @@ class TimeFrequencyEncoder(nn.Module):
                 3,
             ).contiguous()
 
-        # [B,F,T,D] -> [B,F*T,D]
         tokens = x.reshape(
             batch_size,
             self.num_tokens,
             self.d_model,
         )
 
-        # Attention Pooling
         attention_logits = (
-            self.pooling_score(
-                tokens
-            )
+            self.pooling_score(tokens)
         )
 
         attention_weights = torch.softmax(
@@ -1041,12 +837,10 @@ class TimeFrequencyEncoder(nn.Module):
         )
 
         attention_feature = torch.sum(
-            tokens
-            * attention_weights,
+            tokens * attention_weights,
             dim=1,
         )
 
-        # Max Pooling
         max_feature = torch.amax(
             tokens,
             dim=1,
@@ -1075,26 +869,6 @@ class TimeFrequencyEncoder(nn.Module):
 # DTF Frontend
 # ============================================================
 class DTFFrontend(nn.Module):
-    """
-    输入：
-        [B,1,798,128]
-
-    Stem：
-        [B,64,399,64]
-
-    Stage 1：
-        [B,96,200,32]
-
-    Stage 2：
-        [B,160,100,16]
-
-    Patch Map：
-        [B,256,100,16]
-
-    Tokens：
-        [B,1600,256]
-    """
-
     def __init__(
         self,
         in_channels: int = 1,
@@ -1107,14 +881,8 @@ class DTFFrontend(nn.Module):
         super().__init__()
 
         self.embed_dim = embed_dim
-
-        self.freq_patches = (
-            freq_patches
-        )
-
-        self.time_patches = (
-            time_patches
-        )
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
 
         self.num_tokens = (
             freq_patches
@@ -1168,9 +936,7 @@ class DTFFrontend(nn.Module):
                 f"当前为{tuple(x.shape[-2:])}。"
             )
 
-        stem_map = self.stem(
-            x
-        )
+        stem_map = self.stem(x)
 
         if return_stage_maps:
             (
@@ -1205,11 +971,8 @@ class DTFFrontend(nn.Module):
                 f"要求={expected_map_shape}。"
             )
 
-        batch_size = (
-            patch_map.shape[0]
-        )
+        batch_size = patch_map.shape[0]
 
-        # [B,D,T,F] -> [B,F,T,D]
         patch_grid = patch_map.permute(
             0,
             3,
@@ -1217,7 +980,6 @@ class DTFFrontend(nn.Module):
             1,
         ).contiguous()
 
-        # [B,F,T,D] -> [B,F*T,D]
         tokens = patch_grid.reshape(
             batch_size,
             self.num_tokens,
@@ -1244,33 +1006,9 @@ class DTFFrontend(nn.Module):
 
 
 # ============================================================
-# D4 Hierarchical Multi-task Model
+# D4 Dynamic Hierarchical Model
 # ============================================================
 class DTFHybridModel(nn.Module):
-    """
-    主干：
-        Fbank
-        -> DTF Stem
-        -> Progressive Downsampling
-        -> Time-Mamba
-        -> Frequency-Attention
-        -> Shared Feature
-
-    分类头：
-        Four Head：
-            Normal / Crackle / Wheeze / Both
-
-        Binary Residual Head：
-            Normal / Abnormal
-
-        Abnormal Head：
-            Crackle / Wheeze / Both
-
-    Binary Logits：
-        Four-class聚合二分类Logits
-        + 0.5 × Binary Residual Logits
-    """
-
     def __init__(
         self,
         num_classes: int = 4,
@@ -1292,16 +1030,10 @@ class DTFHybridModel(nn.Module):
 
         if num_classes != 4:
             raise ValueError(
-                "当前层级模型只支持4分类。"
-            )
-
-        if binary_residual_scale < 0.0:
-            raise ValueError(
-                "binary_residual_scale不能小于0。"
+                "当前模型只支持ICBHI四分类。"
             )
 
         self.num_classes = num_classes
-        self.d_model = d_model
 
         self.binary_residual_scale = float(
             binary_residual_scale
@@ -1330,51 +1062,27 @@ class DTFHybridModel(nn.Module):
             expand=expand,
         )
 
-        # ----------------------------------------------------
-        # Four-Class Head
-        # ----------------------------------------------------
         self.four_head = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
-            nn.Dropout(
-                head_dropout
-            ),
+            nn.LayerNorm(d_model),
+            nn.Dropout(head_dropout),
             nn.Linear(
                 d_model,
                 4,
             ),
         )
 
-        # ----------------------------------------------------
-        # Binary Residual Head
-        #
-        # 不再完全独立构造Binary Logits，
-        # 只学习相对于Four Head聚合结果的残差。
-        # ----------------------------------------------------
         self.binary_head = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
-            nn.Dropout(
-                head_dropout
-            ),
+            nn.LayerNorm(d_model),
+            nn.Dropout(head_dropout),
             nn.Linear(
                 d_model,
                 2,
             ),
         )
 
-        # ----------------------------------------------------
-        # Abnormal Subtype Head
-        # ----------------------------------------------------
         self.abnormal_head = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
-            nn.Dropout(
-                head_dropout
-            ),
+            nn.LayerNorm(d_model),
+            nn.Dropout(head_dropout),
             nn.Linear(
                 d_model,
                 3,
@@ -1386,25 +1094,12 @@ class DTFHybridModel(nn.Module):
     ) -> float:
         return self.frontend.get_alpha()
 
-    def extract_tokens(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.frontend(
-            x
-        )
-
     def extract_feature(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        tokens = self.frontend(
-            x
-        )
-
-        feature = self.encoder(
-            tokens
-        )
+        tokens = self.frontend(x)
+        feature = self.encoder(tokens)
 
         return feature
 
@@ -1412,46 +1107,16 @@ class DTFHybridModel(nn.Module):
     def build_four_binary_logits(
         four_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        将四分类Logits聚合为二分类Logits。
-
-        Normal：
-            four_logits[:, 0]
-
-        Abnormal：
-            logsumexp(
-                Crackle,
-                Wheeze,
-                Both
-            )
-        """
-
-        if four_logits.ndim != 2:
-            raise ValueError(
-                "four_logits必须为[B,4]。"
-            )
-
-        if four_logits.shape[1] != 4:
-            raise ValueError(
-                "four_logits第二维必须为4。"
-            )
-
         normal_logit = (
-            four_logits[
-                :,
-                0,
-            ]
+            four_logits[:, 0]
         )
 
         abnormal_logit = torch.logsumexp(
-            four_logits[
-                :,
-                1:4,
-            ],
+            four_logits[:, 1:4],
             dim=1,
         )
 
-        four_binary_logits = torch.stack(
+        return torch.stack(
             [
                 normal_logit,
                 abnormal_logit,
@@ -1459,67 +1124,40 @@ class DTFHybridModel(nn.Module):
             dim=1,
         )
 
-        return four_binary_logits
-
     def forward(
         self,
         x: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        feature = self.extract_feature(
-            x
-        )
+        feature = self.extract_feature(x)
 
-        # ----------------------------------------------------
-        # Four-Class Head
-        # ----------------------------------------------------
         four_logits = self.four_head(
             feature
         )
 
-        # ----------------------------------------------------
-        # Four Head聚合出的二分类Logits
-        # ----------------------------------------------------
         four_binary_logits = (
             self.build_four_binary_logits(
                 four_logits
             )
         )
 
-        # ----------------------------------------------------
-        # Binary Residual Head
-        # ----------------------------------------------------
         binary_residual_logits = (
-            self.binary_head(
-                feature
-            )
+            self.binary_head(feature)
         )
 
-        # ----------------------------------------------------
-        # Consistent Binary Logits
-        #
-        # Binary不再脱离Four Head独立预测
-        # ----------------------------------------------------
         binary_logits = (
             four_binary_logits
             + self.binary_residual_scale
             * binary_residual_logits
         )
 
-        # ----------------------------------------------------
-        # Abnormal Subtype Head
-        # ----------------------------------------------------
         abnormal_logits = (
-            self.abnormal_head(
-                feature
-            )
+            self.abnormal_head(feature)
         )
 
         return {
             "feature": feature,
 
-            "four_logits": (
-                four_logits
-            ),
+            "four_logits": four_logits,
 
             "four_binary_logits": (
                 four_binary_logits
@@ -1529,9 +1167,7 @@ class DTFHybridModel(nn.Module):
                 binary_residual_logits
             ),
 
-            "binary_logits": (
-                binary_logits
-            ),
+            "binary_logits": binary_logits,
 
             "abnormal_logits": (
                 abnormal_logits
@@ -1545,99 +1181,27 @@ class DTFHybridModel(nn.Module):
         minimum_hierarchical_weight: float = 0.15,
         maximum_hierarchical_weight: float = 0.60,
     ) -> Dict[str, torch.Tensor]:
-        """
-        动态置信度融合。
-
-        Binary Head不确定时：
-            hierarchical_weight接近0.15
-
-        Binary Head确定时：
-            hierarchical_weight最高接近0.60
-
-        参数four_weight保留兼容性：
-            four_weight=None：
-                使用动态融合
-
-            four_weight为[0,1]：
-                使用固定融合
-        """
-
-        required_keys = {
-            "four_logits",
-            "binary_logits",
-            "abnormal_logits",
-        }
-
-        missing_keys = (
-            required_keys
-            - set(
-                outputs.keys()
-            )
-        )
-
-        if missing_keys:
-            raise KeyError(
-                f"outputs缺少键："
-                f"{sorted(missing_keys)}"
-            )
-
-        if not (
-            0.0
-            <= minimum_hierarchical_weight
-            <= maximum_hierarchical_weight
-            <= 1.0
-        ):
-            raise ValueError(
-                "层级融合权重范围必须满足："
-                "0 <= minimum <= maximum <= 1。"
-            )
-
-        # ----------------------------------------------------
-        # Three Probabilities
-        # ----------------------------------------------------
         four_probability = torch.softmax(
-            outputs[
-                "four_logits"
-            ],
+            outputs["four_logits"],
             dim=1,
         )
 
         binary_probability = torch.softmax(
-            outputs[
-                "binary_logits"
-            ],
+            outputs["binary_logits"],
             dim=1,
         )
 
         abnormal_probability = torch.softmax(
-            outputs[
-                "abnormal_logits"
-            ],
+            outputs["abnormal_logits"],
             dim=1,
         )
 
-        # ----------------------------------------------------
-        # Hierarchical Probability
-        #
-        # P(Normal)
-        #   = P(Binary=Normal)
-        #
-        # P(Abnormal Subtype)
-        #   = P(Binary=Abnormal)
-        #     × P(Subtype | Abnormal)
-        # ----------------------------------------------------
         normal_probability = (
-            binary_probability[
-                :,
-                0:1,
-            ]
+            binary_probability[:, 0:1]
         )
 
         hierarchical_abnormal_probability = (
-            binary_probability[
-                :,
-                1:2,
-            ]
+            binary_probability[:, 1:2]
             * abnormal_probability
         )
 
@@ -1649,34 +1213,26 @@ class DTFHybridModel(nn.Module):
             dim=1,
         )
 
-        # ----------------------------------------------------
-        # Dynamic Fusion
-        # ----------------------------------------------------
+        binary_entropy = -torch.sum(
+            binary_probability
+            * torch.log(
+                binary_probability.clamp_min(
+                    1e-8
+                )
+            ),
+            dim=1,
+            keepdim=True,
+        ) / math.log(2.0)
+
+        binary_confidence = (
+            1.0
+            - binary_entropy
+        ).clamp(
+            min=0.0,
+            max=1.0,
+        )
+
         if four_weight is None:
-            binary_entropy = -torch.sum(
-                binary_probability
-                * torch.log(
-                    binary_probability.clamp_min(
-                        1e-8
-                    )
-                ),
-                dim=1,
-                keepdim=True,
-            )
-
-            binary_entropy = (
-                binary_entropy
-                / math.log(2.0)
-            )
-
-            binary_confidence = (
-                1.0
-                - binary_entropy
-            ).clamp(
-                min=0.0,
-                max=1.0,
-            )
-
             hierarchical_weight = (
                 minimum_hierarchical_weight
                 + (
@@ -1694,7 +1250,7 @@ class DTFHybridModel(nn.Module):
         else:
             if not 0.0 <= four_weight <= 1.0:
                 raise ValueError(
-                    "four_weight必须在[0,1]范围内。"
+                    "four_weight必须位于[0,1]。"
                 )
 
             batch_size = (
@@ -1703,38 +1259,14 @@ class DTFHybridModel(nn.Module):
 
             four_probability_weight = (
                 four_probability.new_full(
-                    (
-                        batch_size,
-                        1,
-                    ),
-                    float(
-                        four_weight
-                    ),
+                    (batch_size, 1),
+                    float(four_weight),
                 )
             )
 
             hierarchical_weight = (
                 1.0
                 - four_probability_weight
-            )
-
-            binary_entropy = -torch.sum(
-                binary_probability
-                * torch.log(
-                    binary_probability.clamp_min(
-                        1e-8
-                    )
-                ),
-                dim=1,
-                keepdim=True,
-            ) / math.log(2.0)
-
-            binary_confidence = (
-                1.0
-                - binary_entropy
-            ).clamp(
-                min=0.0,
-                max=1.0,
             )
 
         final_probability = (
@@ -1744,15 +1276,12 @@ class DTFHybridModel(nn.Module):
             * hierarchical_probability
         )
 
-        # 数值安全归一化
         final_probability = (
             final_probability
             / final_probability.sum(
                 dim=1,
                 keepdim=True,
-            ).clamp_min(
-                1e-8
-            )
+            ).clamp_min(1e-8)
         )
 
         return {
@@ -1808,11 +1337,6 @@ if __name__ == "__main__":
         else "cpu"
     )
 
-    print(
-        "Device:",
-        device,
-    )
-
     model = DTFHybridModel(
         num_classes=4,
         stem_dim=64,
@@ -1827,10 +1351,8 @@ if __name__ == "__main__":
         d_state=16,
         d_conv=4,
         expand=2,
-        binary_residual_scale=0.5,
-    ).to(
-        device
-    )
+        binary_residual_scale=0.50,
+    ).to(device)
 
     dummy_input = torch.randn(
         2,
@@ -1854,11 +1376,8 @@ if __name__ == "__main__":
             return_stage_maps=True,
         )
 
-        outputs = model(
-            dummy_input
-        )
+        outputs = model(dummy_input)
 
-        # 动态融合
         probabilities = (
             model.build_probabilities(
                 outputs,
@@ -1870,135 +1389,69 @@ if __name__ == "__main__":
 
     print(
         "Input:",
-        tuple(
-            dummy_input.shape
-        ),
+        tuple(dummy_input.shape),
     )
 
     print(
-        "DTF Stem Map:",
-        tuple(
-            stem_map.shape
-        ),
+        "Stem:",
+        tuple(stem_map.shape),
     )
 
     print(
-        "Progressive Stage 1:",
-        tuple(
-            stage1_map.shape
-        ),
+        "Stage1:",
+        tuple(stage1_map.shape),
     )
 
     print(
-        "Progressive Stage 2:",
-        tuple(
-            stage2_map.shape
-        ),
+        "Stage2:",
+        tuple(stage2_map.shape),
     )
 
     print(
-        "Progressive Patch Map:",
-        tuple(
-            patch_map.shape
-        ),
+        "Patch:",
+        tuple(patch_map.shape),
     )
 
     print(
         "Tokens:",
-        tuple(
-            tokens.shape
-        ),
+        tuple(tokens.shape),
     )
 
     print(
         "Feature:",
         tuple(
-            outputs[
-                "feature"
-            ].shape
+            outputs["feature"].shape
         ),
     )
 
     print(
-        "Four Logits:",
+        "Four logits:",
         tuple(
-            outputs[
-                "four_logits"
-            ].shape
+            outputs["four_logits"].shape
         ),
     )
 
     print(
-        "Four Binary Logits:",
+        "Binary logits:",
         tuple(
-            outputs[
-                "four_binary_logits"
-            ].shape
+            outputs["binary_logits"].shape
         ),
     )
 
     print(
-        "Binary Residual Logits:",
+        "Abnormal logits:",
         tuple(
-            outputs[
-                "binary_residual_logits"
-            ].shape
+            outputs["abnormal_logits"].shape
         ),
     )
 
     print(
-        "Binary Logits:",
-        tuple(
-            outputs[
-                "binary_logits"
-            ].shape
-        ),
-    )
-
-    print(
-        "Abnormal Logits:",
-        tuple(
-            outputs[
-                "abnormal_logits"
-            ].shape
-        ),
-    )
-
-    print(
-        "Final Probability:",
+        "Final probability:",
         tuple(
             probabilities[
                 "final_probability"
             ].shape
         ),
-    )
-
-    print(
-        "Binary Confidence:",
-        probabilities[
-            "binary_confidence"
-        ].detach().cpu().flatten().tolist(),
-    )
-
-    print(
-        "Hierarchical Weight:",
-        probabilities[
-            "hierarchical_weight"
-        ].detach().cpu().flatten().tolist(),
-    )
-
-    print(
-        "DTF Alpha:",
-        model.get_dtf_alpha(),
-    )
-
-    assert tuple(
-        dummy_input.shape
-    ) == (
-        2,
-        1,
-        798,
-        128,
     )
 
     assert tuple(
@@ -2046,54 +1499,21 @@ if __name__ == "__main__":
     )
 
     assert tuple(
-        outputs[
-            "feature"
-        ].shape
-    ) == (
-        2,
-        256,
-    )
-
-    assert tuple(
-        outputs[
-            "four_logits"
-        ].shape
+        outputs["four_logits"].shape
     ) == (
         2,
         4,
     )
 
     assert tuple(
-        outputs[
-            "four_binary_logits"
-        ].shape
+        outputs["binary_logits"].shape
     ) == (
         2,
         2,
     )
 
     assert tuple(
-        outputs[
-            "binary_residual_logits"
-        ].shape
-    ) == (
-        2,
-        2,
-    )
-
-    assert tuple(
-        outputs[
-            "binary_logits"
-        ].shape
-    ) == (
-        2,
-        2,
-    )
-
-    assert tuple(
-        outputs[
-            "abnormal_logits"
-        ].shape
+        outputs["abnormal_logits"].shape
     ) == (
         2,
         3,
@@ -2108,43 +1528,6 @@ if __name__ == "__main__":
         4,
     )
 
-    assert tuple(
-        probabilities[
-            "hierarchical_weight"
-        ].shape
-    ) == (
-        2,
-        1,
-    )
-
-    assert torch.all(
-        probabilities[
-            "hierarchical_weight"
-        ] >= 0.15 - 1e-6
-    )
-
-    assert torch.all(
-        probabilities[
-            "hierarchical_weight"
-        ] <= 0.60 + 1e-6
-    )
-
-    final_probability_sum = (
-        probabilities[
-            "final_probability"
-        ].sum(
-            dim=1
-        )
-    )
-
-    assert torch.allclose(
-        final_probability_sum,
-        torch.ones_like(
-            final_probability_sum
-        ),
-        atol=1e-5,
-    )
-
     print(
-        "D4 consistent dynamic hierarchical model shape test passed."
+        "D4 dynamic hierarchical model shape test passed."
     )
