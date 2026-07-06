@@ -27,7 +27,7 @@ from torch.utils.data import (
 
 
 # ============================================================
-# 项目路径与模型导入
+# 项目路径
 # ============================================================
 PROJECT_ROOT = Path(
     __file__
@@ -41,7 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from mymodels.model import (
     HAS_MAMBA,
-    B2HybridModel,
+    DTFHybridModel,
 )
 
 
@@ -58,15 +58,15 @@ CONFIG = {
     ),
 
     # --------------------------------------------------------
-    # 保存目录
+    # 新实验保存目录
     # --------------------------------------------------------
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_b2_dtf_mbconv2_seed42"
+        "checkpoints_d1_b1_no_weight_weak_aug_seed42"
     ),
 
     # --------------------------------------------------------
-    # 训练协议
+    # 官方协议
     # --------------------------------------------------------
     "EPOCHS": 50,
 
@@ -88,17 +88,19 @@ CONFIG = {
     "FBANK_MELS": 128,
 
     # --------------------------------------------------------
-    # B2 前端
+    # DTF前端
     # --------------------------------------------------------
     "STEM_DIM": 64,
 
-    "TF_MBCONV_DEPTH": 2,
+    # 当前B1：关闭TF-MBConv
+    "TF_MBCONV_DEPTH": 0,
+
     "TF_EXPAND_RATIO": 2,
     "TF_SE_REDUCTION": 4,
     "MAX_DROP_PATH": 0.05,
 
     # --------------------------------------------------------
-    # Hybrid Encoder
+    # Time-Mamba + Frequency-Attention
     # --------------------------------------------------------
     "D_MODEL": 256,
 
@@ -119,8 +121,6 @@ CONFIG = {
 
     # --------------------------------------------------------
     # 学习率
-    #
-    # 与 B0、B1 保持一致
     # --------------------------------------------------------
     "FRONTEND_LR": 3e-4,
     "ENCODER_LR": 1e-4,
@@ -137,23 +137,23 @@ CONFIG = {
 
     # --------------------------------------------------------
     # 损失
+    #
+    # 当前实验关闭类别权重
     # --------------------------------------------------------
+    "USE_CLASS_WEIGHTS": False,
+
     "LABEL_SMOOTHING": 0.0,
 
-    "FOUR_WEIGHT_POWER": 0.50,
-    "FOUR_WEIGHT_MAX": 2.20,
-
     # --------------------------------------------------------
-    # SpecAugment
-    # 与 B0、B1 保持一致
+    # 弱化SpecAugment
     # --------------------------------------------------------
     "USE_SPECAUGMENT": True,
 
-    "TIME_MASK_MAX": 160,
-    "FREQ_MASK_MAX": 48,
+    "TIME_MASK_MAX": 80,
+    "FREQ_MASK_MAX": 16,
 
     # --------------------------------------------------------
-    # 输出
+    # 日志
     # --------------------------------------------------------
     "PRINT_INTERVAL": 50,
 }
@@ -171,6 +171,7 @@ def set_seed(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    # 保持与前面实验相同
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
@@ -258,7 +259,8 @@ def set_epoch_lrs(
         current_lrs = [
             min_lr
             + (
-                base_lr - min_lr
+                base_lr
+                - min_lr
             )
             * cosine_ratio
             for base_lr, min_lr
@@ -287,6 +289,15 @@ def apply_specaugment(
     time_mask_max: int,
     frequency_mask_max: int,
 ) -> torch.Tensor:
+    """
+    输入：
+        [T,F]
+
+    当前弱增强：
+        Time最大遮挡80帧
+        Frequency最大遮挡16个频带
+    """
+
     x = fbank.clone()
 
     time_frames = x.shape[0]
@@ -294,7 +305,9 @@ def apply_specaugment(
 
     mask_value = x.mean()
 
+    # --------------------------------------------------------
     # Time Mask
+    # --------------------------------------------------------
     if time_mask_max > 0:
         width = random.randint(
             0,
@@ -315,7 +328,9 @@ def apply_specaugment(
                 :
             ] = mask_value
 
+    # --------------------------------------------------------
     # Frequency Mask
+    # --------------------------------------------------------
     if frequency_mask_max > 0:
         width = random.randint(
             0,
@@ -340,7 +355,7 @@ def apply_specaugment(
 
 
 # ============================================================
-# Fbank Dataset
+# Dataset
 # ============================================================
 class FbankDataset(Dataset):
     def __init__(
@@ -365,7 +380,7 @@ class FbankDataset(Dataset):
 
         if not self.csv_path.exists():
             raise FileNotFoundError(
-                f"CSV 不存在：{self.csv_path}"
+                f"CSV不存在：{self.csv_path}"
             )
 
         self.dataframe = pd.read_csv(
@@ -388,7 +403,7 @@ class FbankDataset(Dataset):
 
         if missing_columns:
             raise ValueError(
-                f"{self.csv_path} 缺少列："
+                f"{self.csv_path}缺少列："
                 f"{sorted(missing_columns)}"
             )
 
@@ -437,7 +452,9 @@ class FbankDataset(Dataset):
             flush=True,
         )
 
-    def __len__(self) -> int:
+    def __len__(
+        self,
+    ) -> int:
         return len(
             self.dataframe
         )
@@ -462,7 +479,7 @@ class FbankDataset(Dataset):
             return relative_path
 
         raise FileNotFoundError(
-            f"Fbank 文件不存在：{raw_path}"
+            f"Fbank文件不存在：{raw_path}"
         )
 
     def __getitem__(
@@ -486,7 +503,7 @@ class FbankDataset(Dataset):
             fbank.shape
         ) != self.expected_shape:
             raise ValueError(
-                f"Fbank 尺寸错误：{fbank_path}\n"
+                f"Fbank尺寸错误：{fbank_path}\n"
                 f"当前={tuple(fbank.shape)}，"
                 f"要求={self.expected_shape}"
             )
@@ -495,7 +512,7 @@ class FbankDataset(Dataset):
             fbank
         ).all():
             raise ValueError(
-                "Fbank 包含 NaN 或 Inf："
+                "Fbank包含NaN或Inf："
                 f"{fbank_path}"
             )
 
@@ -519,7 +536,7 @@ class FbankDataset(Dataset):
                 ],
             )
 
-        # [T,F] → [1,T,F]
+        # [T,F] -> [1,T,F]
         x = x.unsqueeze(0)
 
         y = torch.tensor(
@@ -576,42 +593,58 @@ def make_loader(
 
 
 # ============================================================
-# Class Weights
+# 类别权重
 # ============================================================
-def build_four_weights(
+def build_class_weights(
     class_counts,
     cfg,
-) -> torch.Tensor:
+    device,
+):
+    if not cfg["USE_CLASS_WEIGHTS"]:
+        print(
+            "[Loss] 不使用类别权重。",
+            flush=True,
+        )
+
+        return None
+
     counts = np.asarray(
         class_counts,
         dtype=np.float64,
     )
 
-    weights = np.power(
-        counts[0]
-        / np.maximum(
-            counts,
-            1.0,
-        ),
-        cfg[
-            "FOUR_WEIGHT_POWER"
-        ],
+    weights = (
+        counts.sum()
+        / (
+            len(counts)
+            * np.maximum(
+                counts,
+                1.0,
+            )
+        )
     )
 
-    weights[0] = 1.0
-
-    weights = np.clip(
-        weights,
-        1.0,
-        cfg[
-            "FOUR_WEIGHT_MAX"
-        ],
+    weights = (
+        weights
+        / weights.mean()
     )
 
-    return torch.tensor(
+    weight_tensor = torch.tensor(
         weights,
         dtype=torch.float32,
+        device=device,
     )
+
+    print(
+        "[Loss] class weights:",
+        np.round(
+            weights,
+            6,
+        ).tolist(),
+        flush=True,
+    )
+
+    return weight_tensor
 
 
 # ============================================================
@@ -620,13 +653,13 @@ def build_four_weights(
 def calculate_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    four_weights: torch.Tensor,
+    class_weights,
     cfg,
 ) -> torch.Tensor:
     return F.cross_entropy(
         logits,
         labels,
-        weight=four_weights,
+        weight=class_weights,
         label_smoothing=cfg[
             "LABEL_SMOOTHING"
         ],
@@ -634,7 +667,7 @@ def calculate_loss(
 
 
 # ============================================================
-# Train One Epoch
+# 单轮训练
 # ============================================================
 def train_one_epoch(
     loader,
@@ -643,7 +676,7 @@ def train_one_epoch(
     device,
     scaler,
     use_amp: bool,
-    four_weights,
+    class_weights,
     cfg,
 ):
     model.train()
@@ -695,7 +728,7 @@ def train_one_epoch(
             loss = calculate_loss(
                 logits=logits,
                 labels=y,
-                four_weights=four_weights,
+                class_weights=class_weights,
                 cfg=cfg,
             )
 
@@ -810,7 +843,7 @@ def train_one_epoch(
 
 
 # ============================================================
-# ICBHI Metrics
+# ICBHI指标
 # ============================================================
 def calculate_metrics(
     y_true,
@@ -937,7 +970,7 @@ def calculate_metrics(
 
 
 # ============================================================
-# Evaluation
+# 测试
 # ============================================================
 @torch.no_grad()
 def evaluate(
@@ -1020,6 +1053,10 @@ def shape_test(
 
     logits = model(x)
 
+    alpha_values = (
+        model.get_all_alphas()
+    )
+
     print(
         "[Shape Test] Fbank:",
         tuple(x.shape),
@@ -1031,7 +1068,7 @@ def shape_test(
     )
 
     print(
-        "[Shape Test] TF-MBConv Map:",
+        "[Shape Test] Block Map:",
         tuple(block_map.shape),
     )
 
@@ -1057,7 +1094,7 @@ def shape_test(
 
     print(
         "[Shape Test] Alphas:",
-        model.get_all_alphas(),
+        alpha_values,
     )
 
     assert tuple(
@@ -1105,8 +1142,15 @@ def shape_test(
         4,
     )
 
+    assert set(
+        alpha_values.keys()
+    ) == {
+        "stem_alpha",
+    }
+
     print(
-        "[PASS] B2 train.py 与模型连接成功。",
+        "[PASS] B1模型连接成功，"
+        "当前没有启用TF-MBConv。",
         flush=True,
     )
 
@@ -1114,7 +1158,7 @@ def shape_test(
 
 
 # ============================================================
-# Print Final Result
+# 输出结果
 # ============================================================
 def print_final(
     result,
@@ -1198,7 +1242,7 @@ def print_final(
 
 
 # ============================================================
-# Main
+# 主函数
 # ============================================================
 def main() -> None:
     cfg = CONFIG
@@ -1239,7 +1283,7 @@ def main() -> None:
         and not HAS_MAMBA
     ):
         raise RuntimeError(
-            "mamba_ssm 导入失败。"
+            "mamba_ssm导入失败。"
         )
 
     root = Path(
@@ -1267,7 +1311,7 @@ def main() -> None:
         )
 
     print(
-        "[Protocol] 完整官方训练集。"
+        "[Protocol] 使用完整官方训练集。"
     )
 
     print(
@@ -1276,19 +1320,18 @@ def main() -> None:
 
     print(
         "[Protocol] 固定训练50轮，"
-        "结束后测试一次。"
+        "最后测试一次。"
     )
 
     print(
         "[Input] 直接读取Fbank，"
-        "不读取AST Token。"
+        "不使用AST Token。"
     )
 
     print(
-        "[Experiment] "
-        "DTF Stem + TF-MBConv×2 "
-        "+ Time-Mamba "
-        "+ Frequency-Attention"
+        "[Experiment] B1 DTF Stem"
+        " + No Class Weight"
+        " + Weak SpecAugment(80/16)"
     )
 
     save_dir = Path(
@@ -1302,12 +1345,12 @@ def main() -> None:
 
     last_checkpoint_path = (
         save_dir
-        / "last_b2_model.pth"
+        / "last_model.pth"
     )
 
     final_checkpoint_path = (
         save_dir
-        / "final_b2_model.pth"
+        / "final_model.pth"
     )
 
     history_path = (
@@ -1347,7 +1390,7 @@ def main() -> None:
     # --------------------------------------------------------
     # Model
     # --------------------------------------------------------
-    model = B2HybridModel(
+    model = DTFHybridModel(
         num_classes=4,
 
         stem_dim=cfg[
@@ -1445,22 +1488,12 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Class Weights
+    # Loss
     # --------------------------------------------------------
-    four_weights = build_four_weights(
+    class_weights = build_class_weights(
         train_dataset.class_counts,
         cfg,
-    ).to(device)
-
-    print(
-        "[Loss] four weights:",
-        np.round(
-            four_weights
-            .detach()
-            .cpu()
-            .numpy(),
-            6,
-        ).tolist(),
+        device,
     )
 
     # --------------------------------------------------------
@@ -1539,8 +1572,7 @@ def main() -> None:
     )
 
     print(
-        "B2: DTF STEM"
-        " -> TF-MBCONV x2"
+        "B1: DTF STEM"
         " -> TIME-MAMBA"
         " -> FREQUENCY-ATTENTION"
     )
@@ -1550,7 +1582,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Training
+    # 固定50轮训练
     # --------------------------------------------------------
     for epoch in range(
         1,
@@ -1589,7 +1621,7 @@ def main() -> None:
 
             use_amp=use_amp,
 
-            four_weights=four_weights,
+            class_weights=class_weights,
 
             cfg=cfg,
         )
@@ -1602,6 +1634,10 @@ def main() -> None:
         alpha_values = (
             model.get_all_alphas()
         )
+
+        stem_alpha = alpha_values[
+            "stem_alpha"
+        ]
 
         history_row = {
             "epoch": epoch,
@@ -1623,21 +1659,7 @@ def main() -> None:
             ),
 
             "stem_alpha": (
-                alpha_values[
-                    "stem_alpha"
-                ]
-            ),
-
-            "block_1_beta": (
-                alpha_values[
-                    "block_1_beta"
-                ]
-            ),
-
-            "block_2_beta": (
-                alpha_values[
-                    "block_2_beta"
-                ]
+                stem_alpha
             ),
 
             "seconds": elapsed_time,
@@ -1684,11 +1706,7 @@ def main() -> None:
             f"Train "
             f"{train_loss:.4f} | "
             f"StemAlpha "
-            f"{alpha_values['stem_alpha']:.4f} | "
-            f"Beta1 "
-            f"{alpha_values['block_1_beta']:.4f} | "
-            f"Beta2 "
-            f"{alpha_values['block_2_beta']:.4f} | "
+            f"{stem_alpha:.4f} | "
             f"LR "
             f"{current_learning_rates[0]:.8f}/"
             f"{current_learning_rates[1]:.8f}/"
@@ -1698,7 +1716,7 @@ def main() -> None:
         )
 
     # --------------------------------------------------------
-    # Final official test
+    # 官方测试集：训练结束后只测试一次
     # --------------------------------------------------------
     final_result = evaluate(
         test_loader,
@@ -1768,6 +1786,7 @@ def main() -> None:
     )
 
     print()
+
     print(
         "Last checkpoint:",
         last_checkpoint_path,
