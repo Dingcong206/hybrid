@@ -1,4 +1,5 @@
 import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,13 +16,13 @@ except Exception:
 
 
 # ============================================================
-# Feed Forward
+# Feed Forward Network
 # ============================================================
 class FeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
-        hidden_dim: int | None = None,
+        hidden_dim: Optional[int] = None,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
@@ -29,39 +30,26 @@ class FeedForward(nn.Module):
         hidden_dim = hidden_dim or dim * 2
 
         self.net = nn.Sequential(
-            nn.Linear(
-                dim,
-                hidden_dim,
-            ),
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
-            nn.Linear(
-                hidden_dim,
-                dim,
-            ),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 # ============================================================
-# Time Mamba Block
+# Time-Mamba Block
 # ============================================================
 class TimeMambaBlock(nn.Module):
     """
-    对每一个频率位置，沿时间轴进行 Mamba 建模。
+    对每一个频率位置，沿时间维度执行 Mamba。
 
     输入和输出：
-        [B * Fp, Tp, D]
+        [B * F, T, D]
     """
 
     def __init__(
@@ -74,9 +62,7 @@ class TimeMambaBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(
-            dim
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
         if HAS_MAMBA:
             self.sequence_model = Mamba(
@@ -85,12 +71,10 @@ class TimeMambaBlock(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
             )
-
             self.use_mamba = True
-
         else:
-            # 仅用于没有安装 mamba_ssm 时进行形状检查。
-            # 正式训练时应确保 HAS_MAMBA=True。
+            # 仅用于没有安装 mamba_ssm 时的形状测试。
+            # 正式训练时 train.py 会阻止使用该分支。
             self.sequence_model = nn.GRU(
                 input_size=dim,
                 hidden_size=dim // 2,
@@ -98,16 +82,11 @@ class TimeMambaBlock(nn.Module):
                 batch_first=True,
                 bidirectional=True,
             )
-
             self.use_mamba = False
 
-        self.dropout = nn.Dropout(
-            dropout
-        )
+        self.dropout = nn.Dropout(dropout)
 
-        self.norm2 = nn.LayerNorm(
-            dim
-        )
+        self.norm2 = nn.LayerNorm(dim)
 
         self.ffn = FeedForward(
             dim=dim,
@@ -115,45 +94,30 @@ class TimeMambaBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-
-        x_norm = self.norm1(
-            x
-        )
+        x_norm = self.norm1(x)
 
         if self.use_mamba:
-            x_out = self.sequence_model(
-                x_norm
-            )
+            sequence_output = self.sequence_model(x_norm)
         else:
-            x_out, _ = self.sequence_model(
-                x_norm
-            )
+            sequence_output, _ = self.sequence_model(x_norm)
 
-        x = residual + self.dropout(
-            x_out
-        )
-
-        x = x + self.ffn(
-            self.norm2(x)
-        )
+        x = residual + self.dropout(sequence_output)
+        x = x + self.ffn(self.norm2(x))
 
         return x
 
 
 # ============================================================
-# Frequency Attention Block
+# Frequency-Attention Block
 # ============================================================
 class FrequencyAttentionBlock(nn.Module):
     """
-    对每一个时间位置，沿频率轴进行多头注意力建模。
+    对每一个时间位置，沿频率维度执行多头注意力。
 
     输入和输出：
-        [B * Tp, Fp, D]
+        [B * T, F, D]
     """
 
     def __init__(
@@ -166,28 +130,21 @@ class FrequencyAttentionBlock(nn.Module):
 
         if dim % num_heads != 0:
             raise ValueError(
-                f"dim={dim} 必须能够被 "
-                f"num_heads={num_heads} 整除。"
+                f"dim={dim} 必须能够被 num_heads={num_heads} 整除。"
             )
 
-        self.norm1 = nn.LayerNorm(
-            dim
-        )
+        self.norm1 = nn.LayerNorm(dim)
 
-        self.attn = nn.MultiheadAttention(
+        self.attention = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
 
-        self.dropout = nn.Dropout(
-            dropout
-        )
+        self.dropout = nn.Dropout(dropout)
 
-        self.norm2 = nn.LayerNorm(
-            dim
-        )
+        self.norm2 = nn.LayerNorm(dim)
 
         self.ffn = FeedForward(
             dim=dim,
@@ -195,58 +152,46 @@ class FrequencyAttentionBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
+        x_norm = self.norm1(x)
 
-        x_norm = self.norm1(
-            x
-        )
-
-        attn_out, _ = self.attn(
+        attention_output, _ = self.attention(
             query=x_norm,
             key=x_norm,
             value=x_norm,
             need_weights=False,
         )
 
-        x = residual + self.dropout(
-            attn_out
-        )
-
-        x = x + self.ffn(
-            self.norm2(x)
-        )
+        x = residual + self.dropout(attention_output)
+        x = x + self.ffn(self.norm2(x))
 
         return x
 
 
 # ============================================================
-# Time-Frequency Encoder
+# Time-Mamba + Frequency-Attention Encoder
 # ============================================================
 class TimeFrequencyEncoder(nn.Module):
     """
-    串联式时频编码器。
-
     输入：
         [B, Fp * Tp, input_dim]
 
     默认：
         Fp = 12
         Tp = 79
-        Fp * Tp = 948
+        Token 数量 = 948
 
     流程：
-        输入投影
+        Input Projection
             ↓
         Time-Mamba
             ↓
         Frequency-Attention
             ↓
         Attention Pooling + Max Pooling
-            ↓
+
+    输出：
         [B, d_model]
     """
 
@@ -269,44 +214,30 @@ class TimeFrequencyEncoder(nn.Module):
         self.input_dim = input_dim
         self.d_model = d_model
 
-        self.freq_patches = (
-            freq_patches
-        )
-
-        self.time_patches = (
-            time_patches
-        )
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
 
         self.num_tokens = (
-            freq_patches
-            * time_patches
+            self.freq_patches
+            * self.time_patches
         )
 
-        self.final_feat_dim = (
-            d_model
-        )
+        self.final_feat_dim = d_model
 
-        # ====================================================
+        # ----------------------------------------------------
         # 输入投影
-        # ====================================================
-        self.input_proj = nn.Sequential(
-            nn.LayerNorm(
-                input_dim
-            ),
-            nn.Linear(
-                input_dim,
-                d_model,
-            ),
+        # ----------------------------------------------------
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, d_model),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
         )
 
-        # ====================================================
-        # 二维位置编码
-        # ====================================================
-        self.freq_pos = nn.Parameter(
+        # ----------------------------------------------------
+        # 二维时频位置编码
+        # ----------------------------------------------------
+        self.frequency_position = nn.Parameter(
             torch.zeros(
                 1,
                 freq_patches,
@@ -315,7 +246,7 @@ class TimeFrequencyEncoder(nn.Module):
             )
         )
 
-        self.time_pos = nn.Parameter(
+        self.time_position = nn.Parameter(
             torch.zeros(
                 1,
                 1,
@@ -324,13 +255,11 @@ class TimeFrequencyEncoder(nn.Module):
             )
         )
 
-        self.pos_dropout = nn.Dropout(
-            dropout
-        )
+        self.position_dropout = nn.Dropout(dropout)
 
-        # ====================================================
+        # ----------------------------------------------------
         # Time-Mamba
-        # ====================================================
+        # ----------------------------------------------------
         self.time_blocks = nn.ModuleList(
             [
                 TimeMambaBlock(
@@ -340,118 +269,94 @@ class TimeFrequencyEncoder(nn.Module):
                     expand=expand,
                     dropout=dropout,
                 )
-                for _ in range(
-                    time_depth
-                )
+                for _ in range(time_depth)
             ]
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Frequency-Attention
-        # ====================================================
-        self.freq_blocks = nn.ModuleList(
+        # ----------------------------------------------------
+        self.frequency_blocks = nn.ModuleList(
             [
                 FrequencyAttentionBlock(
                     dim=d_model,
                     num_heads=num_heads,
                     dropout=dropout,
                 )
-                for _ in range(
-                    freq_depth
-                )
+                for _ in range(freq_depth)
             ]
         )
 
-        # ====================================================
-        # Pooling
-        # ====================================================
-        pool_hidden = max(
+        # ----------------------------------------------------
+        # Attention + Max Pooling
+        # ----------------------------------------------------
+        pool_hidden_dim = max(
             64,
             d_model // 2,
         )
 
-        self.pool_score = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
+        self.pooling_score = nn.Sequential(
+            nn.LayerNorm(d_model),
             nn.Linear(
                 d_model,
-                pool_hidden,
+                pool_hidden_dim,
             ),
             nn.Tanh(),
             nn.Linear(
-                pool_hidden,
+                pool_hidden_dim,
                 1,
             ),
         )
 
-        self.pool_fusion = nn.Sequential(
-            nn.LayerNorm(
-                d_model * 2
-            ),
+        self.pooling_fusion = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
             nn.Linear(
                 d_model * 2,
                 d_model,
             ),
             nn.GELU(),
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
         )
 
-        self.output_norm = nn.LayerNorm(
-            d_model
-        )
+        self.output_norm = nn.LayerNorm(d_model)
 
         nn.init.trunc_normal_(
-            self.freq_pos,
+            self.frequency_position,
             std=0.02,
         )
 
         nn.init.trunc_normal_(
-            self.time_pos,
+            self.time_position,
             std=0.02,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(
-                "输入必须是三维张量 [B,N,D]，"
-                f"当前形状为 {tuple(x.shape)}。"
+                "TimeFrequencyEncoder 输入必须是 [B,N,D]，"
+                f"当前为 {tuple(x.shape)}。"
             )
 
-        (
-            batch_size,
-            num_tokens,
-            input_dim,
-        ) = x.shape
+        batch_size, num_tokens, input_dim = x.shape
 
         if num_tokens != self.num_tokens:
             raise ValueError(
-                f"Token数量错误：输入为{num_tokens}，"
-                f"模型要求"
-                f"{self.freq_patches}×"
-                f"{self.time_patches}="
-                f"{self.num_tokens}。"
+                f"Token 数量错误：输入={num_tokens}，"
+                f"模型要求={self.num_tokens}。"
             )
 
         if input_dim != self.input_dim:
             raise ValueError(
-                f"输入维度错误：输入为{input_dim}，"
-                f"模型要求{self.input_dim}。"
+                f"Token 维度错误：输入={input_dim}，"
+                f"模型要求={self.input_dim}。"
             )
 
         # [B,948,input_dim]
         # → [B,948,d_model]
-        x = self.input_proj(
-            x
-        )
+        x = self.input_projection(x)
 
         # [B,948,D]
-        # → [B,12,79,D]
+        # → [B,F,T,D]
         x = x.reshape(
             batch_size,
             self.freq_patches,
@@ -461,92 +366,92 @@ class TimeFrequencyEncoder(nn.Module):
 
         x = (
             x
-            + self.freq_pos
-            + self.time_pos
+            + self.frequency_position
+            + self.time_position
         )
 
-        x = self.pos_dropout(
-            x
-        )
+        x = self.position_dropout(x)
 
-        # ====================================================
+        # ----------------------------------------------------
         # Time-Mamba
-        # ====================================================
+        # 每一个频率位置单独沿时间建模
+        # ----------------------------------------------------
         for block in self.time_blocks:
-            time_seq = x.reshape(
+            time_sequence = x.reshape(
                 batch_size
                 * self.freq_patches,
                 self.time_patches,
                 self.d_model,
             )
 
-            time_seq = block(
-                time_seq
+            time_sequence = block(
+                time_sequence
             )
 
-            x = time_seq.reshape(
+            x = time_sequence.reshape(
                 batch_size,
                 self.freq_patches,
                 self.time_patches,
                 self.d_model,
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Frequency-Attention
-        # ====================================================
-        for block in self.freq_blocks:
-            freq_seq = x.permute(
+        # 每一个时间位置单独沿频率建模
+        # ----------------------------------------------------
+        for block in self.frequency_blocks:
+            frequency_sequence = x.permute(
                 0,
                 2,
                 1,
                 3,
             ).contiguous()
 
-            freq_seq = freq_seq.reshape(
+            frequency_sequence = frequency_sequence.reshape(
                 batch_size
                 * self.time_patches,
                 self.freq_patches,
                 self.d_model,
             )
 
-            freq_seq = block(
-                freq_seq
+            frequency_sequence = block(
+                frequency_sequence
             )
 
-            freq_seq = freq_seq.reshape(
+            frequency_sequence = frequency_sequence.reshape(
                 batch_size,
                 self.time_patches,
                 self.freq_patches,
                 self.d_model,
             )
 
-            x = freq_seq.permute(
+            x = frequency_sequence.permute(
                 0,
                 2,
                 1,
                 3,
             ).contiguous()
 
-        # ====================================================
+        # ----------------------------------------------------
         # Pooling
-        # ====================================================
+        # ----------------------------------------------------
         tokens = x.reshape(
             batch_size,
             self.num_tokens,
             self.d_model,
         )
 
-        attn_logits = self.pool_score(
+        attention_logits = self.pooling_score(
             tokens
         )
 
-        attn_weights = torch.softmax(
-            attn_logits,
+        attention_weights = torch.softmax(
+            attention_logits,
             dim=1,
         )
 
-        attn_feature = torch.sum(
-            tokens * attn_weights,
+        attention_feature = torch.sum(
+            tokens * attention_weights,
             dim=1,
         )
 
@@ -557,13 +462,13 @@ class TimeFrequencyEncoder(nn.Module):
 
         feature = torch.cat(
             [
-                attn_feature,
+                attention_feature,
                 max_feature,
             ],
             dim=-1,
         )
 
-        feature = self.pool_fusion(
+        feature = self.pooling_fusion(
             feature
         )
 
@@ -575,13 +480,13 @@ class TimeFrequencyEncoder(nn.Module):
 
 
 # ============================================================
-# SAME Padding Conv2d
+# Dynamic SAME Padding Conv2d
 # ============================================================
 class SamePadConv2d(nn.Module):
     """
-    支持偶数卷积核和任意步长的 SAME Padding。
+    支持偶数卷积核的动态 SAME Padding。
 
-    张量轴顺序：
+    输入张量顺序：
         [B, C, T, F]
     """
 
@@ -597,28 +502,19 @@ class SamePadConv2d(nn.Module):
     ) -> None:
         super().__init__()
 
-        if isinstance(
-            kernel_size,
-            int,
-        ):
+        if isinstance(kernel_size, int):
             kernel_size = (
                 kernel_size,
                 kernel_size,
             )
 
-        if isinstance(
-            stride,
-            int,
-        ):
+        if isinstance(stride, int):
             stride = (
                 stride,
                 stride,
             )
 
-        if isinstance(
-            dilation,
-            int,
-        ):
+        if isinstance(dilation, int):
             dilation = (
                 dilation,
                 dilation,
@@ -647,107 +543,152 @@ class SamePadConv2d(nn.Module):
             bias=bias,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        input_t = x.shape[-2]
-        input_f = x.shape[-1]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_time = x.shape[-2]
+        input_frequency = x.shape[-1]
 
-        kernel_t, kernel_f = (
+        kernel_time, kernel_frequency = (
             self.kernel_size
         )
 
-        stride_t, stride_f = (
+        stride_time, stride_frequency = (
             self.stride
         )
 
-        dilation_t, dilation_f = (
+        dilation_time, dilation_frequency = (
             self.dilation
         )
 
-        output_t = math.ceil(
-            input_t / stride_t
+        output_time = math.ceil(
+            input_time / stride_time
         )
 
-        output_f = math.ceil(
-            input_f / stride_f
+        output_frequency = math.ceil(
+            input_frequency / stride_frequency
         )
 
-        effective_kernel_t = (
-            dilation_t
-            * (kernel_t - 1)
+        effective_kernel_time = (
+            dilation_time
+            * (kernel_time - 1)
             + 1
         )
 
-        effective_kernel_f = (
-            dilation_f
-            * (kernel_f - 1)
+        effective_kernel_frequency = (
+            dilation_frequency
+            * (kernel_frequency - 1)
             + 1
         )
 
-        total_pad_t = max(
+        total_padding_time = max(
             (
-                output_t - 1
+                output_time - 1
             )
-            * stride_t
-            + effective_kernel_t
-            - input_t,
+            * stride_time
+            + effective_kernel_time
+            - input_time,
             0,
         )
 
-        total_pad_f = max(
+        total_padding_frequency = max(
             (
-                output_f - 1
+                output_frequency - 1
             )
-            * stride_f
-            + effective_kernel_f
-            - input_f,
+            * stride_frequency
+            + effective_kernel_frequency
+            - input_frequency,
             0,
         )
 
-        pad_top = (
-            total_pad_t // 2
+        padding_top = (
+            total_padding_time // 2
         )
 
-        pad_bottom = (
-            total_pad_t
-            - pad_top
+        padding_bottom = (
+            total_padding_time
+            - padding_top
         )
 
-        pad_left = (
-            total_pad_f // 2
+        padding_left = (
+            total_padding_frequency // 2
         )
 
-        pad_right = (
-            total_pad_f
-            - pad_left
+        padding_right = (
+            total_padding_frequency
+            - padding_left
         )
 
         x = F.pad(
             x,
             (
-                pad_left,
-                pad_right,
-                pad_top,
-                pad_bottom,
+                padding_left,
+                padding_right,
+                padding_top,
+                padding_bottom,
             ),
         )
 
-        return self.conv(
-            x
-        )
+        return self.conv(x)
 
 
 # ============================================================
-# DTF Time-Frequency Decoupled Stem
+# B0: No-TF Parameter-Matched Stem
+# ============================================================
+class NoTFStem(nn.Module):
+    """
+    单分支参数匹配基线。
+
+    DTF 每一层两个卷积核的面积：
+        6×3 + 3×6 = 36
+
+    No-TF 单分支卷积核：
+        6×6 = 36
+
+    输入：
+        [B,1,798,128]
+
+    输出：
+        [B,64,399,64]
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 64,
+    ) -> None:
+        super().__init__()
+
+        self.branch = nn.Sequential(
+            SamePadConv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=(6, 6),
+                stride=(2, 2),
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+
+            SamePadConv2d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=(6, 6),
+                stride=(1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.branch(x)
+
+
+# ============================================================
+# B1: DTF Time-Frequency Decoupled Stem
 # ============================================================
 class DTFStem(nn.Module):
     """
     DTF 时频解耦 Stem。
-
-    输入和输出：
-        [B, C, T, F]
 
     时间分支：
         kernel=(6,3)
@@ -755,23 +696,29 @@ class DTFStem(nn.Module):
     频率分支：
         kernel=(3,6)
 
-    融合方式：
+    融合：
         alpha * time_feature
-        + (1-alpha) * freq_feature
+        + (1-alpha) * frequency_feature
+
+    输入：
+        [B,1,798,128]
+
+    输出：
+        [B,64,399,64]
     """
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 64,
-        time_kernel=(6, 3),
-        freq_kernel=(3, 6),
+        time_kernel: Tuple[int, int] = (6, 3),
+        frequency_kernel: Tuple[int, int] = (3, 6),
     ) -> None:
         super().__init__()
 
-        # ====================================================
+        # ----------------------------------------------------
         # Time Branch
-        # ====================================================
+        # ----------------------------------------------------
         self.time_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
@@ -780,9 +727,7 @@ class DTFStem(nn.Module):
                 stride=(2, 2),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
 
             SamePadConv2d(
@@ -792,56 +737,46 @@ class DTFStem(nn.Module):
                 stride=(1, 1),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Frequency Branch
-        # ====================================================
-        self.freq_branch = nn.Sequential(
+        # ----------------------------------------------------
+        self.frequency_branch = nn.Sequential(
             SamePadConv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                kernel_size=freq_kernel,
+                kernel_size=frequency_kernel,
                 stride=(2, 2),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
 
             SamePadConv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
-                kernel_size=freq_kernel,
+                kernel_size=frequency_kernel,
                 stride=(1, 1),
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                out_channels
-            ),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
-        # sigmoid(0)=0.5
+        # sigmoid(0) = 0.5
         self.alpha_logit = nn.Parameter(
             torch.zeros(())
         )
 
-    def get_alpha_tensor(
-        self,
-    ) -> torch.Tensor:
+    def get_alpha_tensor(self) -> torch.Tensor:
         return torch.sigmoid(
             self.alpha_logit
         )
 
-    def get_alpha(
-        self,
-    ) -> float:
+    def get_alpha(self) -> float:
         return float(
             self.get_alpha_tensor()
             .detach()
@@ -849,65 +784,62 @@ class DTFStem(nn.Module):
             .item()
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        time_feature = self.time_branch(
-            x
-        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        time_feature = self.time_branch(x)
 
-        freq_feature = self.freq_branch(
+        frequency_feature = self.frequency_branch(
             x
         )
 
         if (
             time_feature.shape
-            != freq_feature.shape
+            != frequency_feature.shape
         ):
             raise RuntimeError(
-                "DTF两个分支输出尺寸不一致："
+                "DTF 两个分支输出尺寸不一致："
                 f"time={tuple(time_feature.shape)}, "
-                f"freq={tuple(freq_feature.shape)}"
+                f"frequency={tuple(frequency_feature.shape)}"
             )
 
         alpha = self.get_alpha_tensor()
 
-        x = (
-            alpha
-            * time_feature
+        output = (
+            alpha * time_feature
             + (
                 1.0 - alpha
-            )
-            * freq_feature
+            ) * frequency_feature
         )
 
-        return x
+        return output
 
 
 # ============================================================
-# DTF Fbank Frontend
+# Fbank Frontend
 # ============================================================
-class DTFFrontend(nn.Module):
+class FbankFrontend(nn.Module):
     """
+    frontend_type="no_tf"：
+        使用单分支 6×6 Stem。
+
+    frontend_type="dtf"：
+        使用 DTF 双分支 Stem。
+
     输入：
         [B,1,798,128]
 
-    DTF Stem：
+    Stem：
         [B,64,399,64]
 
-    Patch Downsampling：
+    Patch Map：
         [B,256,79,12]
 
-    转换为：
+    Tokens：
         [B,948,256]
-
-    948 = 12 × 79 个二维时频位置。
-    这里不使用任何 AST 模型或 AST Token。
     """
 
     def __init__(
         self,
+        frontend_type: str = "no_tf",
         in_channels: int = 1,
         stem_dim: int = 64,
         embed_dim: int = 256,
@@ -917,31 +849,45 @@ class DTFFrontend(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.embed_dim = (
-            embed_dim
+        frontend_type = (
+            frontend_type
+            .strip()
+            .lower()
         )
 
-        self.freq_patches = (
-            freq_patches
-        )
+        if frontend_type not in {
+            "no_tf",
+            "dtf",
+        }:
+            raise ValueError(
+                "frontend_type 必须为 "
+                "'no_tf' 或 'dtf'，"
+                f"当前为 {frontend_type!r}。"
+            )
 
-        self.time_patches = (
-            time_patches
-        )
+        self.frontend_type = frontend_type
+
+        self.embed_dim = embed_dim
+        self.freq_patches = freq_patches
+        self.time_patches = time_patches
 
         self.num_tokens = (
             freq_patches
             * time_patches
         )
 
-        self.stem = DTFStem(
-            in_channels=in_channels,
-            out_channels=stem_dim,
-            time_kernel=(6, 3),
-            freq_kernel=(3, 6),
-        )
+        if frontend_type == "no_tf":
+            self.stem = NoTFStem(
+                in_channels=in_channels,
+                out_channels=stem_dim,
+            )
+        else:
+            self.stem = DTFStem(
+                in_channels=in_channels,
+                out_channels=stem_dim,
+            )
 
-        # Stem输出为 [399,64]
+        # Stem 输出：[399,64]
         #
         # Time:
         # floor((399-5)/5)+1 = 79
@@ -957,19 +903,19 @@ class DTFFrontend(nn.Module):
                 padding=0,
                 bias=False,
             ),
-            nn.BatchNorm2d(
-                embed_dim
-            ),
+            nn.BatchNorm2d(embed_dim),
             nn.GELU(),
-            nn.Dropout2d(
-                dropout
-            ),
+            nn.Dropout2d(dropout),
         )
 
-    def get_alpha(
-        self,
-    ) -> float:
-        return self.stem.get_alpha()
+    def get_alpha(self) -> Optional[float]:
+        if isinstance(
+            self.stem,
+            DTFStem,
+        ):
+            return self.stem.get_alpha()
+
+        return None
 
     def forward(
         self,
@@ -978,30 +924,27 @@ class DTFFrontend(nn.Module):
     ):
         if x.ndim != 4:
             raise ValueError(
-                "DTFFrontend输入必须是"
-                "[B,C,T,F]，"
-                f"当前为{tuple(x.shape)}。"
+                "FbankFrontend 输入必须为 [B,C,T,F]，"
+                f"当前为 {tuple(x.shape)}。"
             )
 
         if x.shape[1] != 1:
             raise ValueError(
-                "Fbank输入通道数必须为1，"
-                f"当前为{x.shape[1]}。"
+                f"Fbank 通道数必须为1，当前为 {x.shape[1]}。"
             )
 
-        if tuple(
-            x.shape[-2:]
-        ) != (798, 128):
+        if tuple(x.shape[-2:]) != (
+            798,
+            128,
+        ):
             raise ValueError(
-                "Fbank尺寸必须为[798,128]，"
-                f"当前为{tuple(x.shape[-2:])}。"
+                "Fbank 尺寸必须为 [798,128]，"
+                f"当前为 {tuple(x.shape[-2:])}。"
             )
 
         # [B,1,798,128]
         # → [B,64,399,64]
-        stem_map = self.stem(
-            x
-        )
+        stem_map = self.stem(x)
 
         # [B,64,399,64]
         # → [B,256,79,12]
@@ -1009,24 +952,21 @@ class DTFFrontend(nn.Module):
             stem_map
         )
 
-        expected_map_shape = (
+        expected_shape = (
             self.time_patches,
             self.freq_patches,
         )
 
         if tuple(
             patch_map.shape[-2:]
-        ) != expected_map_shape:
+        ) != expected_shape:
             raise RuntimeError(
-                "DTF Patch Map尺寸错误："
+                "Patch Map 尺寸错误："
                 f"当前={tuple(patch_map.shape)}，"
-                f"要求空间尺寸="
-                f"{expected_map_shape}。"
+                f"要求空间尺寸={expected_shape}。"
             )
 
-        batch_size = (
-            patch_map.shape[0]
-        )
+        batch_size = patch_map.shape[0]
 
         # [B,D,T,F]
         # → [B,F,T,D]
@@ -1056,36 +996,30 @@ class DTFFrontend(nn.Module):
 
 
 # ============================================================
-# DTF Hybrid Model
+# Full Hybrid Model
 # ============================================================
-class DTFHybridModel(nn.Module):
+class FbankHybridModel(nn.Module):
     """
-    第一阶段模型：
+    完整结构：
 
         Fbank
-            ↓
-        DTF时频解耦Stem
-            ↓
+          ↓
+        No-TF Stem 或 DTF Stem
+          ↓
         Patch Downsampling
-            ↓
+          ↓
         Time-Mamba
-            ↓
+          ↓
         Frequency-Attention
-            ↓
+          ↓
         Attention + Max Pooling
-            ↓
+          ↓
         四分类
-
-    当前只实现Stem-TF。
-
-    暂时不加入：
-        TF-MBConv
-        Window Attention
-        Grid Attention
     """
 
     def __init__(
         self,
+        frontend_type: str = "no_tf",
         num_classes: int = 4,
         stem_dim: int = 64,
         d_model: int = 256,
@@ -1102,7 +1036,14 @@ class DTFHybridModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.frontend = DTFFrontend(
+        self.frontend_type = (
+            frontend_type
+            .strip()
+            .lower()
+        )
+
+        self.frontend = FbankFrontend(
+            frontend_type=self.frontend_type,
             in_channels=1,
             stem_dim=stem_dim,
             embed_dim=d_model,
@@ -1126,38 +1067,35 @@ class DTFHybridModel(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(
-                d_model
-            ),
-            nn.Dropout(
-                head_dropout
-            ),
+            nn.LayerNorm(d_model),
+            nn.Dropout(head_dropout),
             nn.Linear(
                 d_model,
                 num_classes,
             ),
         )
 
+    def get_frontend_alpha(
+        self,
+    ) -> Optional[float]:
+        return self.frontend.get_alpha()
+
     def get_dtf_alpha(
         self,
-    ) -> float:
-        return self.frontend.get_alpha()
+    ) -> Optional[float]:
+        return self.get_frontend_alpha()
 
     def extract_tokens(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.frontend(
-            x
-        )
+        return self.frontend(x)
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        tokens = self.frontend(
-            x
-        )
+        tokens = self.frontend(x)
 
         feature = self.encoder(
             tokens
@@ -1168,6 +1106,35 @@ class DTFHybridModel(nn.Module):
         )
 
         return logits
+
+
+# ============================================================
+# Compatibility Classes
+# ============================================================
+class DTFHybridModel(FbankHybridModel):
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ) -> None:
+        kwargs["frontend_type"] = "dtf"
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+
+
+class NoTFHybridModel(FbankHybridModel):
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ) -> None:
+        kwargs["frontend_type"] = "no_tf"
+        super().__init__(
+            *args,
+            **kwargs,
+        )
 
 
 # ============================================================
@@ -1184,21 +1151,6 @@ if __name__ == "__main__":
         else "cpu"
     )
 
-    model = DTFHybridModel(
-        num_classes=4,
-        stem_dim=64,
-        d_model=256,
-        freq_patches=12,
-        time_patches=79,
-        time_depth=1,
-        freq_depth=1,
-        num_heads=8,
-        dropout=0.15,
-        head_dropout=0.20,
-    ).to(
-        device
-    )
-
     dummy_input = torch.randn(
         2,
         1,
@@ -1207,100 +1159,110 @@ if __name__ == "__main__":
         device=device,
     )
 
-    model.eval()
+    for frontend_type in (
+        "no_tf",
+        "dtf",
+    ):
+        model = FbankHybridModel(
+            frontend_type=frontend_type,
+            num_classes=4,
+            stem_dim=64,
+            d_model=256,
+            freq_patches=12,
+            time_patches=79,
+            time_depth=1,
+            freq_depth=1,
+            num_heads=8,
+            dropout=0.15,
+            head_dropout=0.20,
+        ).to(device)
 
-    with torch.no_grad():
-        (
-            tokens,
-            stem_map,
-            patch_map,
-        ) = model.frontend(
-            dummy_input,
-            return_maps=True,
+        model.eval()
+
+        with torch.no_grad():
+            (
+                tokens,
+                stem_map,
+                patch_map,
+            ) = model.frontend(
+                dummy_input,
+                return_maps=True,
+            )
+
+            logits = model(
+                dummy_input
+            )
+
+        print()
+        print(
+            "Frontend:",
+            frontend_type,
         )
 
-        logits = model(
-            dummy_input
+        print(
+            "Input:",
+            tuple(dummy_input.shape),
         )
 
-    print(
-        "Device:",
-        device,
-    )
+        print(
+            "Stem Map:",
+            tuple(stem_map.shape),
+        )
 
-    print(
-        "Input:",
-        tuple(
-            dummy_input.shape
-        ),
-    )
+        print(
+            "Patch Map:",
+            tuple(patch_map.shape),
+        )
 
-    print(
-        "DTF Stem:",
-        tuple(
+        print(
+            "Tokens:",
+            tuple(tokens.shape),
+        )
+
+        print(
+            "Logits:",
+            tuple(logits.shape),
+        )
+
+        print(
+            "Alpha:",
+            model.get_frontend_alpha(),
+        )
+
+        assert tuple(
             stem_map.shape
-        ),
-    )
+        ) == (
+            2,
+            64,
+            399,
+            64,
+        )
 
-    print(
-        "Patch Map:",
-        tuple(
+        assert tuple(
             patch_map.shape
-        ),
-    )
+        ) == (
+            2,
+            256,
+            79,
+            12,
+        )
 
-    print(
-        "Tokens:",
-        tuple(
+        assert tuple(
             tokens.shape
-        ),
-    )
+        ) == (
+            2,
+            948,
+            256,
+        )
 
-    print(
-        "Logits:",
-        tuple(
+        assert tuple(
             logits.shape
-        ),
-    )
+        ) == (
+            2,
+            4,
+        )
 
+    print()
     print(
-        "DTF alpha:",
-        model.get_dtf_alpha(),
-    )
-
-    assert tuple(
-        stem_map.shape
-    ) == (
-        2,
-        64,
-        399,
-        64,
-    )
-
-    assert tuple(
-        patch_map.shape
-    ) == (
-        2,
-        256,
-        79,
-        12,
-    )
-
-    assert tuple(
-        tokens.shape
-    ) == (
-        2,
-        948,
-        256,
-    )
-
-    assert tuple(
-        logits.shape
-    ) == (
-        2,
-        4,
-    )
-
-    print(
-        "DTF model shape test passed."
+        "All shape tests passed."
     )

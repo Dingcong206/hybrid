@@ -12,73 +12,112 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     f1_score,
     recall_score,
 )
-from torch.utils.data import DataLoader, Dataset
 
-
-# ============================================================
-# 1. 项目路径与模型导入
-# ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from mymodels.model import (
-    HAS_MAMBA,
-    DTFHybridModel,
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
 )
 
 
 # ============================================================
-# 2. 配置
+# Project Import
+# ============================================================
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(
+        0,
+        str(PROJECT_ROOT),
+    )
+
+from mymodels.model import (
+    HAS_MAMBA,
+    FbankHybridModel,
+)
+
+
+# ============================================================
+# Configuration
 # ============================================================
 CONFIG = {
+    # --------------------------------------------------------
     # 数据目录
+    # --------------------------------------------------------
     "ROOT": (
         "/data/dingcong/hybrid/"
         "icbhi_official_fbank"
     ),
 
-    # 模型与训练记录保存目录
+    # --------------------------------------------------------
+    # 当前运行 B0：No-TF
+    #
+    # B0：
+    #   FRONTEND_TYPE = "no_tf"
+    #
+    # B1：
+    #   FRONTEND_TYPE = "dtf"
+    # --------------------------------------------------------
+    "FRONTEND_TYPE": "no_tf",
+
+    # B0 保存目录
     "SAVE_DIR": (
         "/data/dingcong/hybrid/"
-        "checkpoints_dtf_stem_hybrid"
+        "checkpoints_no_tf_baseline_seed42"
     ),
 
-    # 官方协议：完整训练集训练，最后测试一次
+    # B1 时应改成：
+    #
+    # "FRONTEND_TYPE": "dtf",
+    #
+    # "SAVE_DIR": (
+    #     "/data/dingcong/hybrid/"
+    #     "checkpoints_dtf_stem_seed42"
+    # ),
+
+    # --------------------------------------------------------
+    # Training
+    # --------------------------------------------------------
     "EPOCHS": 50,
 
-    # DataLoader
     "BATCH_SIZE": 8,
     "ACCUM_STEPS": 4,
     "NUM_WORKERS": 4,
 
-    # 环境
     "SEED": 42,
+
     "DEVICE": "cuda",
     "AMP": True,
+
     "REQUIRE_MAMBA": True,
 
+    # --------------------------------------------------------
     # Fbank
+    # --------------------------------------------------------
     "FBANK_FRAMES": 798,
     "FBANK_MELS": 128,
 
-    # DTF Stem
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
     "STEM_DIM": 64,
 
-    # Time-Mamba + Frequency-Attention
     "D_MODEL": 256,
+
     "FREQ_PATCHES": 12,
     "TIME_PATCHES": 79,
 
     "TIME_DEPTH": 1,
     "FREQ_DEPTH": 1,
+
     "NHEAD": 8,
 
     "D_STATE": 16,
@@ -88,7 +127,9 @@ CONFIG = {
     "DROPOUT": 0.15,
     "HEAD_DROPOUT": 0.20,
 
-    # 不同模块分别设置学习率
+    # --------------------------------------------------------
+    # Learning Rate
+    # --------------------------------------------------------
     "FRONTEND_LR": 3e-4,
     "ENCODER_LR": 1e-4,
     "CLASSIFIER_LR": 3e-4,
@@ -98,45 +139,44 @@ CONFIG = {
     "MIN_CLASSIFIER_LR": 3e-6,
 
     "WARMUP_EPOCHS": 3,
+
     "WEIGHT_DECAY": 1e-2,
     "GRAD_CLIP": 2.0,
 
-    # 四分类损失
-    # 第一阶段先以四分类为主，避免辅助损失干扰 DTF 消融
-    "FOUR_LOSS_WEIGHT": 1.0,
-    "BINARY_LOSS_WEIGHT": 0.0,
-    "SUBTYPE_LOSS_WEIGHT": 0.0,
-
+    # --------------------------------------------------------
+    # Loss
+    # --------------------------------------------------------
     "LABEL_SMOOTHING": 0.0,
 
-    # 类别权重
     "FOUR_WEIGHT_POWER": 0.50,
     "FOUR_WEIGHT_MAX": 2.20,
 
-    "SUBTYPE_WEIGHT_POWER": 0.50,
-    "SUBTYPE_WEIGHT_MAX": 2.00,
-
+    # --------------------------------------------------------
     # SpecAugment
+    # --------------------------------------------------------
     "USE_SPECAUGMENT": True,
+
     "TIME_MASK_MAX": 160,
     "FREQ_MASK_MAX": 48,
 
-    # 每多少个 batch 打印一次
+    # --------------------------------------------------------
+    # Logging
+    # --------------------------------------------------------
     "PRINT_INTERVAL": 50,
 }
 
 
 # ============================================================
-# 3. 随机种子
+# Random Seed
 # ============================================================
-def set_seed(seed):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # 输入尺寸固定，开启 benchmark 可以提高卷积速度
+    # 与前面的 DTF Stem 实验保持一致
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
@@ -145,43 +185,51 @@ def set_seed(seed):
         torch.backends.cudnn.allow_tf32 = True
 
     try:
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision(
+            "high"
+        )
     except AttributeError:
         pass
 
 
 # ============================================================
-# 4. AMP
+# AMP Scaler
 # ============================================================
-def make_scaler(enabled):
+def make_scaler(enabled: bool):
     try:
         return torch.amp.GradScaler(
             "cuda",
             enabled=enabled,
         )
-    except (AttributeError, TypeError):
+    except (
+        AttributeError,
+        TypeError,
+    ):
         return torch.cuda.amp.GradScaler(
             enabled=enabled,
         )
 
 
 # ============================================================
-# 5. Warmup + Cosine 学习率
+# Warmup + Cosine Learning Rate
 # ============================================================
 def set_epoch_lrs(
     optimizer,
     base_lrs,
     min_lrs,
-    epoch,
-    total_epochs,
-    warmup_epochs,
+    epoch: int,
+    total_epochs: int,
+    warmup_epochs: int,
 ):
     if epoch <= warmup_epochs:
         scale = (
             0.20
             + 0.80
             * epoch
-            / max(warmup_epochs, 1)
+            / max(
+                warmup_epochs,
+                1,
+            )
         )
 
         current_lrs = [
@@ -191,12 +239,14 @@ def set_epoch_lrs(
 
     else:
         cosine_total = max(
-            total_epochs - warmup_epochs,
+            total_epochs
+            - warmup_epochs,
             1,
         )
 
         cosine_step = min(
-            epoch - warmup_epochs,
+            epoch
+            - warmup_epochs,
             cosine_total,
         )
 
@@ -211,55 +261,61 @@ def set_epoch_lrs(
 
         current_lrs = [
             min_lr
-            + (base_lr - min_lr)
+            + (
+                base_lr
+                - min_lr
+            )
             * cosine_ratio
             for base_lr, min_lr
-            in zip(base_lrs, min_lrs)
+            in zip(
+                base_lrs,
+                min_lrs,
+            )
         ]
 
-    for group, current_lr in zip(
+    for parameter_group, current_lr in zip(
         optimizer.param_groups,
         current_lrs,
     ):
-        group["lr"] = float(current_lr)
+        parameter_group["lr"] = float(
+            current_lr
+        )
 
     return current_lrs
 
 
 # ============================================================
-# 6. SpecAugment
+# SpecAugment
 # ============================================================
 def apply_specaugment(
-    fbank,
-    time_mask_max,
-    freq_mask_max,
-):
+    fbank: torch.Tensor,
+    time_mask_max: int,
+    frequency_mask_max: int,
+) -> torch.Tensor:
     """
     输入：
-        [T, F]
+        [T,F]
 
-    使用当前频谱均值作为遮挡值。
+    使用当前频谱的平均值作为遮挡值。
     """
 
     x = fbank.clone()
 
     time_frames = x.shape[0]
-    freq_bins = x.shape[1]
+    frequency_bins = x.shape[1]
 
     mask_value = x.mean()
 
     # --------------------------------------------------------
-    # 时间遮挡
+    # Time Mask
     # --------------------------------------------------------
     if time_mask_max > 0:
-        max_width = min(
-            time_mask_max,
-            time_frames,
-        )
-
         width = random.randint(
             0,
-            max_width,
+            min(
+                time_mask_max,
+                time_frames,
+            ),
         )
 
         if width > 0:
@@ -274,23 +330,21 @@ def apply_specaugment(
             ] = mask_value
 
     # --------------------------------------------------------
-    # 频率遮挡
+    # Frequency Mask
     # --------------------------------------------------------
-    if freq_mask_max > 0:
-        max_width = min(
-            freq_mask_max,
-            freq_bins,
-        )
-
+    if frequency_mask_max > 0:
         width = random.randint(
             0,
-            max_width,
+            min(
+                frequency_mask_max,
+                frequency_bins,
+            ),
         )
 
         if width > 0:
             start = random.randint(
                 0,
-                freq_bins - width,
+                frequency_bins - width,
             )
 
             x[
@@ -302,40 +356,52 @@ def apply_specaugment(
 
 
 # ============================================================
-# 7. Fbank Dataset
+# Fbank Dataset
 # ============================================================
 class FbankDataset(Dataset):
     """
-    从 CSV 的 fbank_path 读取：
+    CSV 中读取：
+        fbank_path
+        label
 
-        [798, 128]
+    单个 Fbank：
+        [798,128]
 
     返回：
-
-        x: [1, 798, 128]
-        y: 标量标签
+        x = [1,798,128]
+        y = scalar
     """
 
     def __init__(
         self,
         csv_path,
         cfg,
-        training=False,
-    ):
+        training: bool = False,
+    ) -> None:
         super().__init__()
 
-        self.csv_path = Path(csv_path)
+        self.csv_path = Path(
+            csv_path
+        )
+
         self.cfg = cfg
         self.training = training
 
+        self.expected_shape = (
+            cfg["FBANK_FRAMES"],
+            cfg["FBANK_MELS"],
+        )
+
         if not self.csv_path.exists():
             raise FileNotFoundError(
-                f"CSV不存在：{self.csv_path}"
+                f"CSV 不存在：{self.csv_path}"
             )
 
-        self.df = pd.read_csv(
+        self.dataframe = pd.read_csv(
             self.csv_path
-        ).reset_index(drop=True)
+        ).reset_index(
+            drop=True
+        )
 
         required_columns = {
             "fbank_path",
@@ -344,40 +410,48 @@ class FbankDataset(Dataset):
 
         missing_columns = (
             required_columns
-            - set(self.df.columns)
+            - set(
+                self.dataframe.columns
+            )
         )
 
         if missing_columns:
             raise ValueError(
-                f"{self.csv_path}缺少列："
+                f"{self.csv_path} 缺少列："
                 f"{sorted(missing_columns)}"
             )
 
-        self.df["label"] = (
-            self.df["label"].astype(int)
+        self.dataframe["label"] = (
+            self.dataframe[
+                "label"
+            ].astype(int)
         )
 
-        self.labels = self.df[
+        self.labels = self.dataframe[
             "label"
-        ].to_numpy(dtype=np.int64)
+        ].to_numpy(
+            dtype=np.int64
+        )
 
         invalid_labels = np.unique(
             self.labels[
-                (self.labels < 0)
-                | (self.labels > 3)
+                (
+                    self.labels < 0
+                )
+                |
+                (
+                    self.labels > 3
+                )
             ]
         )
 
-        if len(invalid_labels) > 0:
+        if len(
+            invalid_labels
+        ) > 0:
             raise ValueError(
-                f"发现非法标签："
+                "发现非法标签："
                 f"{invalid_labels.tolist()}"
             )
-
-        self.expected_shape = (
-            cfg["FBANK_FRAMES"],
-            cfg["FBANK_MELS"],
-        )
 
         self.class_counts = np.bincount(
             self.labels,
@@ -386,7 +460,7 @@ class FbankDataset(Dataset):
 
         print(
             f"[FbankDataset] "
-            f"samples={len(self.df)} | "
+            f"samples={len(self.dataframe)} | "
             f"counts={self.class_counts.tolist()} | "
             f"shape={self.expected_shape} | "
             f"training={self.training} | "
@@ -394,10 +468,15 @@ class FbankDataset(Dataset):
             flush=True,
         )
 
-    def __len__(self):
-        return len(self.df)
+    def __len__(self) -> int:
+        return len(
+            self.dataframe
+        )
 
-    def resolve_path(self, raw_path):
+    def resolve_path(
+        self,
+        raw_path,
+    ) -> Path:
         fbank_path = Path(
             str(raw_path)
         )
@@ -414,11 +493,16 @@ class FbankDataset(Dataset):
             return relative_path
 
         raise FileNotFoundError(
-            f"Fbank文件不存在：{raw_path}"
+            f"Fbank 文件不存在：{raw_path}"
         )
 
-    def __getitem__(self, index):
-        row = self.df.iloc[index]
+    def __getitem__(
+        self,
+        index,
+    ):
+        row = self.dataframe.iloc[
+            index
+        ]
 
         fbank_path = self.resolve_path(
             row["fbank_path"]
@@ -429,16 +513,20 @@ class FbankDataset(Dataset):
             allow_pickle=False,
         )
 
-        if tuple(fbank.shape) != self.expected_shape:
+        if tuple(
+            fbank.shape
+        ) != self.expected_shape:
             raise ValueError(
-                f"Fbank尺寸错误：{fbank_path}\n"
+                f"Fbank 尺寸错误：{fbank_path}\n"
                 f"当前={tuple(fbank.shape)}，"
                 f"要求={self.expected_shape}"
             )
 
-        if not np.isfinite(fbank).all():
+        if not np.isfinite(
+            fbank
+        ).all():
             raise ValueError(
-                f"Fbank包含NaN或Inf："
+                "Fbank 包含 NaN 或 Inf："
                 f"{fbank_path}"
             )
 
@@ -457,12 +545,12 @@ class FbankDataset(Dataset):
                 time_mask_max=self.cfg[
                     "TIME_MASK_MAX"
                 ],
-                freq_mask_max=self.cfg[
+                frequency_mask_max=self.cfg[
                     "FREQ_MASK_MAX"
                 ],
             )
 
-        # [T,F] → [C,T,F]
+        # [T,F] → [1,T,F]
         x = x.unsqueeze(0)
 
         y = torch.tensor(
@@ -474,49 +562,57 @@ class FbankDataset(Dataset):
 
 
 # ============================================================
-# 8. DataLoader
+# DataLoader
 # ============================================================
 def make_loader(
     dataset,
     cfg,
     device,
-    shuffle,
+    shuffle: bool,
 ):
     workers = int(
         cfg["NUM_WORKERS"]
     )
 
-    loader_args = {
+    loader_arguments = {
         "dataset": dataset,
-        "batch_size": cfg["BATCH_SIZE"],
+
+        "batch_size": cfg[
+            "BATCH_SIZE"
+        ],
+
         "shuffle": shuffle,
+
         "num_workers": workers,
+
         "pin_memory": (
             device.type == "cuda"
         ),
+
         "persistent_workers": (
             workers > 0
         ),
+
         "drop_last": False,
     }
 
     if workers > 0:
-        loader_args[
+        loader_arguments[
             "prefetch_factor"
         ] = 2
 
     return DataLoader(
-        **loader_args
+        **loader_arguments
     )
 
 
 # ============================================================
-# 9. 类别权重
+# Four-Class Weights
 # ============================================================
 def build_four_weights(
     class_counts,
     cfg,
-):
+) -> torch.Tensor:
     counts = np.asarray(
         class_counts,
         dtype=np.float64,
@@ -549,54 +645,16 @@ def build_four_weights(
     )
 
 
-def build_subtype_weights(
-    class_counts,
-    cfg,
-):
-    counts = np.asarray(
-        class_counts[1:4],
-        dtype=np.float64,
-    )
-
-    weights = np.power(
-        counts.max()
-        / np.maximum(
-            counts,
-            1.0,
-        ),
-        cfg[
-            "SUBTYPE_WEIGHT_POWER"
-        ],
-    )
-
-    weights = np.clip(
-        weights,
-        1.0,
-        cfg[
-            "SUBTYPE_WEIGHT_MAX"
-        ],
-    )
-
-    return torch.tensor(
-        weights,
-        dtype=torch.float32,
-    )
-
-
 # ============================================================
-# 10. 损失函数
+# Loss
 # ============================================================
 def calculate_loss(
-    logits,
-    labels,
-    four_weights,
-    subtype_weights,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    four_weights: torch.Tensor,
     cfg,
-):
-    # --------------------------------------------------------
-    # 四分类主损失
-    # --------------------------------------------------------
-    four_loss = F.cross_entropy(
+) -> torch.Tensor:
+    return F.cross_entropy(
         logits,
         labels,
         weight=four_weights,
@@ -605,86 +663,9 @@ def calculate_loss(
         ],
     )
 
-    # --------------------------------------------------------
-    # Normal / Abnormal 辅助损失
-    # --------------------------------------------------------
-    binary_logits = torch.stack(
-        [
-            logits[:, 0],
-            torch.logsumexp(
-                logits[:, 1:4],
-                dim=1,
-            ),
-        ],
-        dim=1,
-    )
-
-    binary_target = (
-        labels > 0
-    ).long()
-
-    binary_loss = F.cross_entropy(
-        binary_logits,
-        binary_target,
-    )
-
-    # --------------------------------------------------------
-    # Crackle / Wheeze / Both 辅助损失
-    # --------------------------------------------------------
-    abnormal_mask = labels > 0
-
-    if abnormal_mask.any():
-        subtype_logits = logits[
-            abnormal_mask,
-            1:4,
-        ]
-
-        subtype_target = (
-            labels[
-                abnormal_mask
-            ]
-            - 1
-        )
-
-        subtype_loss = F.cross_entropy(
-            subtype_logits,
-            subtype_target,
-            weight=subtype_weights,
-            label_smoothing=cfg[
-                "LABEL_SMOOTHING"
-            ],
-        )
-
-    else:
-        subtype_loss = torch.zeros(
-            (),
-            device=logits.device,
-            dtype=logits.dtype,
-        )
-
-    total_loss = (
-        cfg["FOUR_LOSS_WEIGHT"]
-        * four_loss
-        + cfg[
-            "BINARY_LOSS_WEIGHT"
-        ]
-        * binary_loss
-        + cfg[
-            "SUBTYPE_LOSS_WEIGHT"
-        ]
-        * subtype_loss
-    )
-
-    return {
-        "total": total_loss,
-        "four": four_loss,
-        "binary": binary_loss,
-        "subtype": subtype_loss,
-    }
-
 
 # ============================================================
-# 11. 单轮训练
+# Train One Epoch
 # ============================================================
 def train_one_epoch(
     loader,
@@ -692,9 +673,8 @@ def train_one_epoch(
     optimizer,
     device,
     scaler,
-    use_amp,
+    use_amp: bool,
     four_weights,
-    subtype_weights,
     cfg,
 ):
     model.train()
@@ -703,12 +683,10 @@ def train_one_epoch(
         set_to_none=True
     )
 
-    sums = {
-        "total": 0.0,
-        "four": 0.0,
-        "binary": 0.0,
-        "subtype": 0.0,
-    }
+    total_loss = 0.0
+    total_batches = len(loader)
+
+    epoch_start_time = time.time()
 
     trainable_parameters = [
         parameter
@@ -716,12 +694,6 @@ def train_one_epoch(
         in model.parameters()
         if parameter.requires_grad
     ]
-
-    total_batches = len(
-        loader
-    )
-
-    epoch_start = time.time()
 
     print(
         f"[TRAIN] "
@@ -731,9 +703,10 @@ def train_one_epoch(
         flush=True,
     )
 
-    for batch_index, (x, y) in enumerate(
-        loader
-    ):
+    for batch_index, (
+        x,
+        y,
+    ) in enumerate(loader):
         x = x.to(
             device,
             non_blocking=True,
@@ -748,20 +721,17 @@ def train_one_epoch(
             device_type=device.type,
             enabled=use_amp,
         ):
-            logits = model(
-                x
-            )
+            logits = model(x)
 
-            losses = calculate_loss(
+            loss = calculate_loss(
                 logits=logits,
                 labels=y,
                 four_weights=four_weights,
-                subtype_weights=subtype_weights,
                 cfg=cfg,
             )
 
             backward_loss = (
-                losses["total"]
+                loss
                 / cfg["ACCUM_STEPS"]
             )
 
@@ -769,26 +739,23 @@ def train_one_epoch(
             backward_loss
         ).backward()
 
-        for key in sums:
-            sums[key] += float(
-                losses[key]
-                .detach()
-                .item()
-            )
+        total_loss += float(
+            loss.detach().item()
+        )
 
-        completed = (
+        completed_batches = (
             batch_index + 1
         )
 
-        should_step = (
-            completed
+        should_update = (
+            completed_batches
             % cfg["ACCUM_STEPS"]
             == 0
-            or completed
+            or completed_batches
             == total_batches
         )
 
-        if should_step:
+        if should_update:
             scaler.unscale_(
                 optimizer
             )
@@ -809,32 +776,30 @@ def train_one_epoch(
             )
 
         if (
-            completed == 1
-            or completed
-            % cfg[
-                "PRINT_INTERVAL"
-            ]
+            completed_batches == 1
+            or completed_batches
+            % cfg["PRINT_INTERVAL"]
             == 0
-            or completed
+            or completed_batches
             == total_batches
         ):
-            elapsed = (
+            elapsed_time = (
                 time.time()
-                - epoch_start
+                - epoch_start_time
             )
 
             average_batch_time = (
-                elapsed
-                / completed
+                elapsed_time
+                / completed_batches
             )
 
-            eta_seconds = (
+            remaining_seconds = (
                 total_batches
-                - completed
+                - completed_batches
             ) * average_batch_time
 
             if device.type == "cuda":
-                allocated = (
+                allocated_memory = (
                     torch.cuda
                     .memory_allocated(
                         device
@@ -842,7 +807,7 @@ def train_one_epoch(
                     / 1024 ** 3
                 )
 
-                reserved = (
+                reserved_memory = (
                     torch.cuda
                     .memory_reserved(
                         device
@@ -850,60 +815,59 @@ def train_one_epoch(
                     / 1024 ** 3
                 )
             else:
-                allocated = 0.0
-                reserved = 0.0
+                allocated_memory = 0.0
+                reserved_memory = 0.0
 
             print(
                 f"  Batch "
-                f"{completed:04d}/"
+                f"{completed_batches:04d}/"
                 f"{total_batches} | "
-                f"Loss "
-                f"{losses['total'].item():.4f} | "
-                f"Four "
-                f"{losses['four'].item():.4f} | "
+                f"Loss {loss.item():.4f} | "
                 f"ETA "
-                f"{eta_seconds / 60:.1f}min | "
+                f"{remaining_seconds / 60:.1f}min | "
                 f"GPU "
-                f"{allocated:.2f}/"
-                f"{reserved:.2f}GB",
+                f"{allocated_memory:.2f}/"
+                f"{reserved_memory:.2f}GB",
                 flush=True,
             )
 
-    divisor = max(
-        total_batches,
-        1,
+    return (
+        total_loss
+        / max(
+            total_batches,
+            1,
+        )
     )
-
-    return {
-        key: value / divisor
-        for key, value
-        in sums.items()
-    }
 
 
 # ============================================================
-# 12. ICBHI 指标
+# ICBHI Metrics
 # ============================================================
 def calculate_metrics(
     y_true,
     y_pred,
 ):
-    cm = confusion_matrix(
+    confusion = confusion_matrix(
         y_true,
         y_pred,
-        labels=[0, 1, 2, 3],
+        labels=[
+            0,
+            1,
+            2,
+            3,
+        ],
     )
 
     normal_total = max(
         int(
-            cm[0].sum()
+            confusion[0].sum()
         ),
         1,
     )
 
     abnormal_total = max(
         int(
-            cm[1:].sum()
+            confusion[1:].sum()
         ),
         1,
     )
@@ -911,7 +875,7 @@ def calculate_metrics(
     specificity = (
         100.0
         * float(
-            cm[0, 0]
+            confusion[0, 0]
         )
         / normal_total
     )
@@ -919,9 +883,9 @@ def calculate_metrics(
     sensitivity = (
         100.0
         * float(
-            cm[1, 1]
-            + cm[2, 2]
-            + cm[3, 3]
+            confusion[1, 1]
+            + confusion[2, 2]
+            + confusion[3, 3]
         )
         / abnormal_total
     )
@@ -934,7 +898,12 @@ def calculate_metrics(
     recalls = recall_score(
         y_true,
         y_pred,
-        labels=[0, 1, 2, 3],
+        labels=[
+            0,
+            1,
+            2,
+            3,
+        ],
         average=None,
         zero_division=0,
     )
@@ -952,9 +921,7 @@ def calculate_metrics(
     )
 
     return {
-        "score": float(
-            score
-        ),
+        "score": float(score),
 
         "sp": float(
             specificity
@@ -987,18 +954,21 @@ def calculate_metrics(
             minlength=4,
         ),
 
-        "four_cm": cm,
+        "four_cm": confusion,
 
         "binary_cm": confusion_matrix(
             binary_true,
             binary_pred,
-            labels=[0, 1],
+            labels=[
+                0,
+                1,
+            ],
         ),
     }
 
 
 # ============================================================
-# 13. 测试集评估
+# Test Evaluation
 # ============================================================
 @torch.no_grad()
 def evaluate(
@@ -1017,9 +987,7 @@ def evaluate(
             non_blocking=True,
         )
 
-        logits = model(
-            x
-        )
+        logits = model(x)
 
         predictions = torch.argmax(
             logits,
@@ -1049,7 +1017,7 @@ def evaluate(
 
 
 # ============================================================
-# 14. 模型连接测试
+# Shape Test
 # ============================================================
 @torch.no_grad()
 def shape_test(
@@ -1071,45 +1039,55 @@ def shape_test(
         device
     )
 
-    tokens = model.extract_tokens(
-        x
+    (
+        tokens,
+        stem_map,
+        patch_map,
+    ) = model.frontend(
+        x,
+        return_maps=True,
     )
 
-    logits = model(
-        x
+    logits = model(x)
+
+    print(
+        "[Shape Test] Frontend:",
+        model.frontend_type,
     )
 
     print(
         "[Shape Test] Fbank:",
-        tuple(
-            x.shape
-        ),
+        tuple(x.shape),
+    )
+
+    print(
+        "[Shape Test] Stem Map:",
+        tuple(stem_map.shape),
+    )
+
+    print(
+        "[Shape Test] Patch Map:",
+        tuple(patch_map.shape),
     )
 
     print(
         "[Shape Test] Tokens:",
-        tuple(
-            tokens.shape
-        ),
+        tuple(tokens.shape),
     )
 
     print(
         "[Shape Test] Logits:",
-        tuple(
-            logits.shape
-        ),
+        tuple(logits.shape),
     )
 
     print(
         "[Shape Test] Labels:",
-        tuple(
-            y.shape
-        ),
+        tuple(y.shape),
     )
 
     print(
-        "[Shape Test] DTF alpha:",
-        model.get_dtf_alpha(),
+        "[Shape Test] Alpha:",
+        model.get_frontend_alpha(),
     )
 
     assert tuple(
@@ -1118,6 +1096,22 @@ def shape_test(
         1,
         798,
         128,
+    )
+
+    assert tuple(
+        stem_map.shape[1:]
+    ) == (
+        64,
+        399,
+        64,
+    )
+
+    assert tuple(
+        patch_map.shape[1:]
+    ) == (
+        256,
+        79,
+        12,
     )
 
     assert tuple(
@@ -1134,7 +1128,7 @@ def shape_test(
     )
 
     print(
-        "[PASS] train.py与DTF模型连接成功。",
+        "[PASS] train.py 与模型连接成功。",
         flush=True,
     )
 
@@ -1142,15 +1136,24 @@ def shape_test(
 
 
 # ============================================================
-# 15. 输出最终测试结果
+# Print Final Result
 # ============================================================
 def print_final(
     result,
-):
+) -> None:
     print()
-    print("=" * 80)
-    print("FINAL OFFICIAL TEST RESULT")
-    print("=" * 80)
+
+    print(
+        "=" * 80
+    )
+
+    print(
+        "FINAL OFFICIAL TEST RESULT"
+    )
+
+    print(
+        "=" * 80
+    )
 
     print(
         f"ICBHI Score: "
@@ -1217,9 +1220,9 @@ def print_final(
 
 
 # ============================================================
-# 16. 主函数
+# Main
 # ============================================================
-def main():
+def main() -> None:
     cfg = CONFIG
 
     set_seed(
@@ -1258,7 +1261,7 @@ def main():
         and not HAS_MAMBA
     ):
         raise RuntimeError(
-            "mamba_ssm导入失败，"
+            "mamba_ssm 导入失败，"
             "不能进行正式训练。"
         )
 
@@ -1296,13 +1299,17 @@ def main():
 
     print(
         "[Protocol] 固定训练轮数，"
-        "训练完成后测试一次。"
+        "结束后测试一次。"
     )
 
     print(
-        "[Input] 直接读取Fbank，"
-        "不读取tokens_path，"
-        "不加载任何AST权重。"
+        "[Input] 直接读取 Fbank，"
+        "不读取 AST Token。"
+    )
+
+    print(
+        "[Experiment] Frontend:",
+        cfg["FRONTEND_TYPE"],
     )
 
     save_dir = Path(
@@ -1314,14 +1321,14 @@ def main():
         exist_ok=True,
     )
 
-    last_path = (
+    last_checkpoint_path = (
         save_dir
-        / "last_dtf_stem_model.pth"
+        / "last_model.pth"
     )
 
-    final_path = (
+    final_checkpoint_path = (
         save_dir
-        / "final_dtf_stem_model.pth"
+        / "final_model.pth"
     )
 
     history_path = (
@@ -1329,39 +1336,43 @@ def main():
         / "training_history.csv"
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # Dataset
-    # ========================================================
-    train_set = FbankDataset(
+    # --------------------------------------------------------
+    train_dataset = FbankDataset(
         train_csv,
         cfg,
         training=True,
     )
 
-    test_set = FbankDataset(
+    test_dataset = FbankDataset(
         test_csv,
         cfg,
         training=False,
     )
 
     train_loader = make_loader(
-        train_set,
+        train_dataset,
         cfg,
         device,
         shuffle=True,
     )
 
     test_loader = make_loader(
-        test_set,
+        test_dataset,
         cfg,
         device,
         shuffle=False,
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # Model
-    # ========================================================
-    model = DTFHybridModel(
+    # --------------------------------------------------------
+    model = FbankHybridModel(
+        frontend_type=cfg[
+            "FRONTEND_TYPE"
+        ],
+
         num_classes=4,
 
         stem_dim=cfg[
@@ -1411,9 +1422,7 @@ def main():
         expand=cfg[
             "EXPAND"
         ],
-    ).to(
-        device
-    )
+    ).to(device)
 
     shape_test(
         train_loader,
@@ -1444,22 +1453,13 @@ def main():
         f"{trainable_parameters:,}"
     )
 
-    # ========================================================
-    # 类别权重
-    # ========================================================
+    # --------------------------------------------------------
+    # Class Weights
+    # --------------------------------------------------------
     four_weights = build_four_weights(
-        train_set.class_counts,
+        train_dataset.class_counts,
         cfg,
-    ).to(
-        device
-    )
-
-    subtype_weights = build_subtype_weights(
-        train_set.class_counts,
-        cfg,
-    ).to(
-        device
-    )
+    ).to(device)
 
     print(
         "[Loss] four weights:",
@@ -1472,20 +1472,9 @@ def main():
         ).tolist(),
     )
 
-    print(
-        "[Loss] subtype weights:",
-        np.round(
-            subtype_weights
-            .detach()
-            .cpu()
-            .numpy(),
-            6,
-        ).tolist(),
-    )
-
-    # ========================================================
+    # --------------------------------------------------------
     # Optimizer
-    # ========================================================
+    # --------------------------------------------------------
     optimizer = torch.optim.AdamW(
         [
             {
@@ -1494,6 +1483,7 @@ def main():
                     .frontend
                     .parameters()
                 ),
+
                 "lr": cfg[
                     "FRONTEND_LR"
                 ],
@@ -1505,6 +1495,7 @@ def main():
                     .encoder
                     .parameters()
                 ),
+
                 "lr": cfg[
                     "ENCODER_LR"
                 ],
@@ -1516,6 +1507,7 @@ def main():
                     .classifier
                     .parameters()
                 ),
+
                 "lr": cfg[
                     "CLASSIFIER_LR"
                 ],
@@ -1527,13 +1519,13 @@ def main():
         ],
     )
 
-    base_lrs = [
+    base_learning_rates = [
         cfg["FRONTEND_LR"],
         cfg["ENCODER_LR"],
         cfg["CLASSIFIER_LR"],
     ]
 
-    min_lrs = [
+    minimum_learning_rates = [
         cfg["MIN_FRONTEND_LR"],
         cfg["MIN_ENCODER_LR"],
         cfg["MIN_CLASSIFIER_LR"],
@@ -1551,90 +1543,101 @@ def main():
     history = []
 
     print()
-    print("=" * 90)
     print(
-        "DTF STEM → TIME-MAMBA "
-        "→ FREQUENCY-ATTENTION TRAINING"
+        "=" * 90
     )
-    print("=" * 90)
 
-    # ========================================================
-    # 固定轮数训练
-    # ========================================================
+    print(
+        f"{cfg['FRONTEND_TYPE'].upper()} STEM"
+        " -> TIME-MAMBA"
+        " -> FREQUENCY-ATTENTION TRAINING"
+    )
+
+    print(
+        "=" * 90
+    )
+
+    # --------------------------------------------------------
+    # Fixed-Epoch Training
+    # --------------------------------------------------------
     for epoch in range(
         1,
         cfg["EPOCHS"] + 1,
     ):
-        epoch_start = time.time()
+        epoch_start_time = time.time()
 
-        current_lrs = set_epoch_lrs(
+        current_learning_rates = set_epoch_lrs(
             optimizer=optimizer,
-            base_lrs=base_lrs,
-            min_lrs=min_lrs,
+
+            base_lrs=base_learning_rates,
+
+            min_lrs=minimum_learning_rates,
+
             epoch=epoch,
+
             total_epochs=cfg[
                 "EPOCHS"
             ],
+
             warmup_epochs=cfg[
                 "WARMUP_EPOCHS"
             ],
         )
 
-        train_result = train_one_epoch(
+        train_loss = train_one_epoch(
             loader=train_loader,
+
             model=model,
+
             optimizer=optimizer,
+
             device=device,
+
             scaler=scaler,
+
             use_amp=use_amp,
+
             four_weights=four_weights,
-            subtype_weights=subtype_weights,
+
             cfg=cfg,
         )
 
-        elapsed = (
+        elapsed_time = (
             time.time()
-            - epoch_start
+            - epoch_start_time
         )
 
-        current_alpha = (
-            model.get_dtf_alpha()
+        alpha = (
+            model
+            .get_frontend_alpha()
         )
 
         history_row = {
             "epoch": epoch,
 
-            "total_loss": train_result[
-                "total"
+            "train_loss": (
+                train_loss
+            ),
+
+            "frontend_lr": (
+                current_learning_rates[0]
+            ),
+
+            "encoder_lr": (
+                current_learning_rates[1]
+            ),
+
+            "classifier_lr": (
+                current_learning_rates[2]
+            ),
+
+            "frontend_type": cfg[
+                "FRONTEND_TYPE"
             ],
 
-            "four_loss": train_result[
-                "four"
-            ],
+            "alpha": alpha,
 
-            "binary_loss": train_result[
-                "binary"
-            ],
-
-            "subtype_loss": train_result[
-                "subtype"
-            ],
-
-            "frontend_lr": current_lrs[
-                0
-            ],
-
-            "encoder_lr": current_lrs[
-                1
-            ],
-
-            "classifier_lr": current_lrs[
-                2
-            ],
-
-            "dtf_alpha": current_alpha,
-
-            "seconds": elapsed,
+            "seconds": elapsed_time,
         }
 
         history.append(
@@ -1664,11 +1667,19 @@ def main():
                     cfg
                 ),
 
-                "dtf_alpha": (
-                    current_alpha
-                ),
+                "frontend_type": cfg[
+                    "FRONTEND_TYPE"
+                ],
+
+                "alpha": alpha,
             },
-            last_path,
+            last_checkpoint_path,
+        )
+
+        alpha_text = (
+            "N/A"
+            if alpha is None
+            else f"{alpha:.4f}"
         )
 
         print(
@@ -1676,22 +1687,20 @@ def main():
             f"{epoch:03d}/"
             f"{cfg['EPOCHS']} | "
             f"Train "
-            f"{train_result['total']:.4f} | "
-            f"Four "
-            f"{train_result['four']:.4f} | "
+            f"{train_loss:.4f} | "
             f"Alpha "
-            f"{current_alpha:.4f} | "
+            f"{alpha_text} | "
             f"LR "
-            f"{current_lrs[0]:.8f}/"
-            f"{current_lrs[1]:.8f}/"
-            f"{current_lrs[2]:.8f} | "
-            f"{elapsed:.1f}s",
+            f"{current_learning_rates[0]:.8f}/"
+            f"{current_learning_rates[1]:.8f}/"
+            f"{current_learning_rates[2]:.8f} | "
+            f"{elapsed_time:.1f}s",
             flush=True,
         )
 
-    # ========================================================
-    # 训练完成后，测试一次
-    # ========================================================
+    # --------------------------------------------------------
+    # Official Test: only once after training
+    # --------------------------------------------------------
     final_result = evaluate(
         test_loader,
         model,
@@ -1716,8 +1725,13 @@ def main():
                 cfg
             ),
 
-            "dtf_alpha": (
-                model.get_dtf_alpha()
+            "frontend_type": cfg[
+                "FRONTEND_TYPE"
+            ],
+
+            "alpha": (
+                model
+                .get_frontend_alpha()
             ),
 
             "test_score": final_result[
@@ -1744,11 +1758,9 @@ def main():
                 "recalls"
             ].tolist(),
 
-            "test_pred_counts": (
-                final_result[
-                    "pred_counts"
-                ].tolist()
-            ),
+            "test_pred_counts": final_result[
+                "pred_counts"
+            ].tolist(),
 
             "test_four_cm": final_result[
                 "four_cm"
@@ -1758,18 +1770,18 @@ def main():
                 "binary_cm"
             ].tolist(),
         },
-        final_path,
+        final_checkpoint_path,
     )
 
     print()
     print(
         "Last checkpoint:",
-        last_path,
+        last_checkpoint_path,
     )
 
     print(
         "Final checkpoint:",
-        final_path,
+        final_checkpoint_path,
     )
 
     print(
